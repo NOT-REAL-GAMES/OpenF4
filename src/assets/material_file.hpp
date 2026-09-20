@@ -18,6 +18,7 @@ namespace empire::assets
         float alphaCutoff = 0.0f;
         bool grayscaleToPalette = false;
         bool twoSided = false;
+        bool decal = false;
     };
 
     [[nodiscard]] MaterialInfo loadMaterial(std::span<const std::byte> bytes);

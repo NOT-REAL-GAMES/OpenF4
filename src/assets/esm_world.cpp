@@ -1,6 +1,7 @@
 #include "assets/esm_world.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -30,6 +31,8 @@ namespace empire::assets
         constexpr std::uint32_t txst = fourCc('T', 'X', 'S', 'T');
         constexpr std::uint32_t ltex = fourCc('L', 'T', 'E', 'X');
         constexpr std::uint32_t mswp = fourCc('M', 'S', 'W', 'P');
+        constexpr std::uint32_t scol = fourCc('S', 'C', 'O', 'L');
+        constexpr std::uint32_t stat = fourCc('S', 'T', 'A', 'T');
         constexpr std::uint32_t compressedFlag = 0x00040000;
         constexpr std::uint32_t deletedFlag = 0x00000020;
         constexpr std::uint32_t disabledFlag = 0x00000800;
@@ -101,15 +104,20 @@ namespace empire::assets
         std::string stringValue(std::span<const std::byte> bytes)
         {
             const char* begin = reinterpret_cast<const char*>(bytes.data());
-            std::size_t size = bytes.size();
-            while (size > 0 && begin[size - 1] == '\0')
-                --size;
+            std::size_t size = 0;
+            while (size < bytes.size() && begin[size] != '\0')
+                ++size;
             std::string result(begin, size);
             std::replace(result.begin(), result.end(), '/', '\\');
             std::transform(result.begin(), result.end(), result.begin(), [](unsigned char value) {
                 return static_cast<char>(std::tolower(value));
             });
             return result;
+        }
+
+        bool isExplicitLodProxy(std::string_view editorId)
+        {
+            return editorId.ends_with("lod");
         }
 
         std::string canonicalMaterialPath(std::string_view value)
@@ -132,8 +140,9 @@ namespace empire::assets
         class Parser
         {
         public:
-            explicit Parser(const std::filesystem::path& path)
-                : mStream(path, std::ios::binary)
+            explicit Parser(const std::filesystem::path& path,
+                std::uint32_t selectedWorld = 0)
+                : mStream(path, std::ios::binary), mSelectedWorld(selectedWorld)
             {
                 if (!mStream)
                     throw std::runtime_error("Unable to open ESM: " + path.string());
@@ -144,7 +153,9 @@ namespace empire::assets
 
             ExteriorWorld parse()
             {
+                mWorld.worldFormId = mSelectedWorld;
                 parseEntries(mFileSize, {});
+                expandStaticCollections();
                 return std::move(mWorld);
             }
 
@@ -152,14 +163,24 @@ namespace empire::assets
             struct Context
             {
                 std::uint32_t topLevel = 0;
-                bool commonwealth = false;
+                bool selectedWorld = false;
                 std::uint32_t cellId = 0;
+            };
+
+            struct ParsedCell
+            {
+                CellCoord coord{};
+                std::uint16_t flags = 0;
+                float waterHeight = 0.0f;
+                bool exterior = false;
             };
 
             std::ifstream mStream;
             std::uint64_t mFileSize = 0;
             ExteriorWorld mWorld;
-            std::unordered_map<std::uint32_t, CellCoord> mCells;
+            std::uint32_t mSelectedWorld = 0;
+            std::unordered_map<std::uint32_t, ParsedCell> mCells;
+            std::unordered_set<std::uint32_t> mLodProxyBases;
 
             std::uint64_t position()
             {
@@ -199,7 +220,7 @@ namespace empire::assets
             static bool modelGroup(std::uint32_t type)
             {
                 constexpr std::array types{
-                    fourCc('S', 'T', 'A', 'T'), fourCc('M', 'S', 'T', 'T'),
+                    stat, fourCc('M', 'S', 'T', 'T'),
                     fourCc('A', 'C', 'T', 'I'), fourCc('T', 'R', 'E', 'E'),
                     fourCc('F', 'L', 'O', 'R'), fourCc('F', 'U', 'R', 'N'),
                     fourCc('D', 'O', 'O', 'R'), fourCc('C', 'O', 'N', 'T'),
@@ -210,7 +231,7 @@ namespace empire::assets
             static bool interestingTopLevel(std::uint32_t type)
             {
                 return type == wrld || type == txst || type == ltex || type == mswp
-                    || modelGroup(type);
+                    || type == scol || modelGroup(type);
             }
 
             void parseEntries(std::uint64_t end, Context context)
@@ -234,14 +255,14 @@ namespace empire::assets
                         }
                         else if (context.topLevel == wrld && groupType == 1)
                         {
-                            child.commonwealth = header.flags == commonwealthFormId;
-                            enter = child.commonwealth;
+                            child.selectedWorld = header.flags == mSelectedWorld;
+                            enter = child.selectedWorld;
                         }
-                        else if (context.topLevel == wrld && !context.commonwealth)
+                        else if (context.topLevel == wrld && !context.selectedWorld)
                             enter = false;
-                        else if (context.commonwealth && (groupType == 2 || groupType == 3))
+                        else if (context.selectedWorld && (groupType == 2 || groupType == 3))
                             enter = false;
-                        if (context.commonwealth && (groupType == 6 || groupType == 8 || groupType == 9))
+                        if (context.selectedWorld && (groupType == 6 || groupType == 8 || groupType == 9))
                             child.cellId = header.flags;
                         if (enter)
                             parseEntries(groupEnd, child);
@@ -252,11 +273,20 @@ namespace empire::assets
                     const std::uint64_t recordEnd = position() + header.dataSize;
                     if (recordEnd > end || recordEnd > mFileSize)
                         throw std::runtime_error("ESM record exceeds its containing group");
+                    if (context.topLevel == wrld && header.type == wrld
+                        && mSelectedWorld == 0)
+                    {
+                        mSelectedWorld = header.formId;
+                        mWorld.worldFormId = header.formId;
+                    }
                     const bool wanted = (modelGroup(context.topLevel) && header.type == context.topLevel)
+                        || (context.topLevel == wrld && header.type == wrld
+                            && header.formId == mSelectedWorld)
+                        || (context.topLevel == scol && header.type == scol)
                         || (context.topLevel == txst && header.type == txst)
                         || (context.topLevel == ltex && header.type == ltex)
                         || (context.topLevel == mswp && header.type == mswp)
-                        || (context.commonwealth && (header.type == cell || header.type == refr
+                        || (context.selectedWorld && (header.type == cell || header.type == refr
                             || header.type == land));
                     if (wanted)
                         parseRecord(header, context);
@@ -289,6 +319,14 @@ namespace empire::assets
                 const auto bytes = recordData(header);
                 Subrecords fields(bytes);
                 Subrecords::Value field;
+                if (header.type == wrld)
+                {
+                    while (fields.next(field))
+                        if (field.type == fourCc('N', 'A', 'M', '4')
+                            && field.data.size() >= sizeof(float))
+                            mWorld.defaultWaterHeight = valueAt<float>(field.data, 0);
+                    return;
+                }
                 if (header.type == mswp)
                 {
                     MaterialSwapRecord materialSwap;
@@ -318,12 +356,57 @@ namespace empire::assets
                     mWorld.materialSwaps[header.formId] = std::move(materialSwap);
                     return;
                 }
+                if (header.type == scol)
+                {
+                    std::uint32_t pendingBase = 0;
+                    auto& parts = mWorld.staticCollections[header.formId];
+                    while (fields.next(field))
+                    {
+                        if (field.type == fourCc('E', 'D', 'I', 'D')
+                            && isExplicitLodProxy(stringValue(field.data)))
+                            mLodProxyBases.insert(header.formId);
+                        else if (field.type == fourCc('M', 'O', 'D', 'L'))
+                            mWorld.models[header.formId] = stringValue(field.data);
+                        else if (field.type == fourCc('O', 'N', 'A', 'M') && field.data.size() >= 4)
+                            pendingBase = valueAt<std::uint32_t>(field.data, 0);
+                        else if (field.type == fourCc('D', 'A', 'T', 'A')
+                            && field.data.size() >= 28 && pendingBase != 0)
+                        {
+                            for (std::size_t offset = 0; offset + 28 <= field.data.size(); offset += 28)
+                            {
+                                StaticCollectionPart part;
+                                part.baseObject = pendingBase;
+                                for (int index = 0; index < 3; ++index)
+                                    part.position[index]
+                                        = valueAt<float>(field.data, offset + index * 4);
+                                for (int index = 0; index < 3; ++index)
+                                    part.rotation[index]
+                                        = valueAt<float>(field.data, offset + 12 + index * 4);
+                                part.scale = valueAt<float>(field.data, offset + 24);
+                                parts.push_back(part);
+                            }
+                            pendingBase = 0;
+                        }
+                    }
+                    return;
+                }
                 if (modelGroup(context.topLevel))
                 {
                     while (fields.next(field))
                     {
-                        if (field.type == fourCc('M', 'O', 'D', 'L'))
+                        if (field.type == fourCc('E', 'D', 'I', 'D')
+                            && isExplicitLodProxy(stringValue(field.data)))
+                            mLodProxyBases.insert(header.formId);
+                        else if (field.type == fourCc('M', 'O', 'D', 'L'))
                             mWorld.models[header.formId] = stringValue(field.data);
+                        else if (context.topLevel == stat
+                            && field.type == fourCc('M', 'N', 'A', 'M')
+                            && field.data.size() >= 4 * 260)
+                        {
+                            auto& lods = mWorld.modelLods[header.formId];
+                            for (std::size_t index = 0; index < lods.size(); ++index)
+                                lods[index] = stringValue(field.data.subspan(index * 260, 260));
+                        }
                         else if (field.type == fourCc('M', 'O', 'D', 'S')
                             && field.data.size() >= 4)
                             mWorld.baseMaterialSwaps[header.formId]
@@ -340,6 +423,8 @@ namespace empire::assets
                             texture.diffuse = stringValue(field.data);
                         else if (field.type == fourCc('T', 'X', '0', '1'))
                             texture.normal = stringValue(field.data);
+                        else if (field.type == fourCc('M', 'N', 'A', 'M'))
+                            texture.material = stringValue(field.data);
                     }
                     mWorld.textureSets[header.formId] = std::move(texture);
                     return;
@@ -348,16 +433,42 @@ namespace empire::assets
                 {
                     while (fields.next(field))
                         if (field.type == fourCc('T', 'N', 'A', 'M') && field.data.size() >= 4)
-                            mWorld.landscapeTextures[header.formId] = valueAt<std::uint32_t>(field.data, 0);
+                            mWorld.landscapeTextures[header.formId]
+                                = valueAt<std::uint32_t>(field.data, 0);
+                        else if (field.type == fourCc('B', 'N', 'A', 'M'))
+                            mWorld.landscapeMaterials[header.formId] = stringValue(field.data);
                     return;
                 }
                 if (header.type == cell)
                 {
+                    ParsedCell parsed;
                     while (fields.next(field))
                     {
                         if (field.type == fourCc('X', 'C', 'L', 'C') && field.data.size() >= 8)
-                            mCells[header.formId] = {
-                                valueAt<std::int32_t>(field.data, 0), valueAt<std::int32_t>(field.data, 4)};
+                        {
+                            parsed.coord = {valueAt<std::int32_t>(field.data, 0),
+                                valueAt<std::int32_t>(field.data, 4)};
+                            parsed.exterior = true;
+                        }
+                        else if (field.type == fourCc('D', 'A', 'T', 'A')
+                            && field.data.size() >= sizeof(std::uint16_t))
+                            parsed.flags = valueAt<std::uint16_t>(field.data, 0);
+                        else if (field.type == fourCc('X', 'C', 'L', 'W')
+                            && field.data.size() >= sizeof(float))
+                            parsed.waterHeight = valueAt<float>(field.data, 0);
+                    }
+                    if (parsed.exterior)
+                    {
+                        mCells[header.formId] = parsed;
+                        constexpr std::uint16_t hasWater = 0x0002;
+                        if ((parsed.flags & hasWater) != 0)
+                        {
+                            const bool explicitHeight = parsed.waterHeight != 0.0f
+                                && std::isfinite(parsed.waterHeight)
+                                && std::abs(parsed.waterHeight) < 1.0e30f;
+                            mWorld.waterHeights[parsed.coord] = explicitHeight
+                                ? parsed.waterHeight : mWorld.defaultWaterHeight;
+                        }
                     }
                     return;
                 }
@@ -370,7 +481,8 @@ namespace empire::assets
                         return;
                     PlacedReference reference;
                     reference.formId = header.formId;
-                    reference.cell = cellPosition->second;
+                    reference.instanceId = header.formId;
+                    reference.cell = cellPosition->second.coord;
                     while (fields.next(field))
                     {
                         if (field.type == fourCc('N', 'A', 'M', 'E') && field.data.size() >= 4)
@@ -394,7 +506,7 @@ namespace empire::assets
                 if (header.type == land)
                 {
                     LandscapeCell landscape;
-                    landscape.cell = cellPosition->second;
+                    landscape.cell = cellPosition->second.coord;
                     while (fields.next(field))
                     {
                         if (field.type == fourCc('V', 'H', 'G', 'T')
@@ -414,6 +526,18 @@ namespace empire::assets
                                 }
                             }
                             landscape.hasHeights = true;
+                        }
+                        else if (field.type == fourCc('V', 'C', 'L', 'R')
+                            && field.data.size() >= landscape.colors.size() * 3)
+                        {
+                            for (std::size_t index = 0; index < landscape.colors.size(); ++index)
+                            {
+                                landscape.colors[index] = {
+                                    valueAt<std::uint8_t>(field.data, index * 3),
+                                    valueAt<std::uint8_t>(field.data, index * 3 + 1),
+                                    valueAt<std::uint8_t>(field.data, index * 3 + 2)};
+                            }
+                            landscape.hasColors = true;
                         }
                         else if ((field.type == fourCc('B', 'T', 'X', 'T')
                                      || field.type == fourCc('A', 'T', 'X', 'T'))
@@ -444,6 +568,73 @@ namespace empire::assets
                     if (landscape.hasHeights)
                         mWorld.landscapes[landscape.cell] = std::move(landscape);
                 }
+            }
+
+            void expandStaticCollections()
+            {
+                std::vector<PlacedReference> expanded;
+                expanded.reserve(mWorld.references.size());
+                const auto hasDistantModel = [&](std::uint32_t baseObject) {
+                    const auto found = mWorld.modelLods.find(baseObject);
+                    return found != mWorld.modelLods.end()
+                        && std::ranges::any_of(found->second,
+                            [](const std::string& path) { return !path.empty(); });
+                };
+                for (const auto& reference : mWorld.references)
+                {
+                    if (mLodProxyBases.contains(reference.baseObject))
+                        continue;
+                    const auto collection = mWorld.staticCollections.find(reference.baseObject);
+                    if (collection == mWorld.staticCollections.end()
+                        || mWorld.models.contains(reference.baseObject))
+                    {
+                        auto placed = reference;
+                        placed.replacesDistantLod = collection != mWorld.staticCollections.end()
+                            || hasDistantModel(reference.baseObject);
+                        expanded.push_back(placed);
+                        continue;
+                    }
+                    std::uint32_t partIndex = 0;
+                    for (const auto& part : collection->second)
+                    {
+                        if (mLodProxyBases.contains(part.baseObject))
+                            continue;
+                        if (!mWorld.models.contains(part.baseObject)
+                            && !mWorld.modelLods.contains(part.baseObject))
+                            continue;
+                        PlacedReference placed = reference;
+                        placed.instanceId = (static_cast<std::uint64_t>(++partIndex) << 32u)
+                            | reference.formId;
+                        placed.baseObject = part.baseObject;
+                        std::ranges::copy(part.position, placed.localPosition);
+                        std::ranges::copy(part.rotation, placed.localRotation);
+                        placed.localScale = part.scale;
+                        placed.hasLocalTransform = true;
+                        placed.replacesDistantLod = true;
+
+                        const float cx = std::cos(reference.rotation[0]);
+                        const float sx = std::sin(reference.rotation[0]);
+                        const float cy = std::cos(reference.rotation[1]);
+                        const float sy = std::sin(reference.rotation[1]);
+                        const float cz = std::cos(reference.rotation[2]);
+                        const float sz = std::sin(reference.rotation[2]);
+                        const float x = part.position[0] * reference.scale;
+                        const float y = part.position[1] * reference.scale;
+                        const float z = part.position[2] * reference.scale;
+                        const float worldX = reference.position[0]
+                            + cy * cz * x + (sx * sy * cz - cx * sz) * y
+                            + (cx * sy * cz + sx * sz) * z;
+                        const float worldY = reference.position[1]
+                            + cy * sz * x + (sx * sy * sz + cx * cz) * y
+                            + (cx * sy * sz - sx * cz) * z;
+                        constexpr float exteriorCellSize = 4096.0f;
+                        placed.cell = {
+                            static_cast<std::int32_t>(std::floor(worldX / exteriorCellSize)),
+                            static_cast<std::int32_t>(std::floor(worldY / exteriorCellSize))};
+                        expanded.push_back(placed);
+                    }
+                }
+                mWorld.references = std::move(expanded);
             }
         };
     }
@@ -491,6 +682,15 @@ namespace empire::assets
 
     ExteriorWorld loadCommonwealth(const std::filesystem::path& esmPath)
     {
-        return Parser(esmPath).parse();
+        ExteriorWorld world = Parser(esmPath, commonwealthFormId).parse();
+        world.defaultLandscapeTexture = 0x000AB07E;
+        return world;
+    }
+
+    ExteriorWorld loadExteriorWorld(const std::filesystem::path& esmPath)
+    {
+        ExteriorWorld world = Parser(esmPath).parse();
+        world.defaultLandscapeTexture = 0x000AB07E;
+        return world;
     }
 }

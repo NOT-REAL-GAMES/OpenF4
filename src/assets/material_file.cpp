@@ -59,7 +59,7 @@ namespace empire::assets
             const bool alphaTest = reader.read<std::uint8_t>() != 0;
             material.alphaCutoff = alphaTest ? alphaThreshold : (alphaBlend ? 1.0f / 255.0f : 0.0f);
             reader.skip(4); // Depth and screen-space reflection flags.
-            reader.skip(1); // Decal.
+            material.decal = reader.read<std::uint8_t>() != 0;
             material.twoSided = reader.read<std::uint8_t>() != 0;
             reader.skip(4); // Decal fade, non-occluder, refraction flags.
             reader.skip(4); // Refraction power.

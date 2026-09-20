@@ -45,9 +45,23 @@ namespace empire::assets
     struct PlacedReference
     {
         std::uint32_t formId = 0;
+        std::uint64_t instanceId = 0;
         std::uint32_t baseObject = 0;
         std::uint32_t materialSwap = 0;
         CellCoord cell;
+        float position[3]{};
+        float rotation[3]{};
+        float scale = 1.0f;
+        float localPosition[3]{};
+        float localRotation[3]{};
+        float localScale = 1.0f;
+        bool hasLocalTransform = false;
+        bool replacesDistantLod = false;
+    };
+
+    struct StaticCollectionPart
+    {
+        std::uint32_t baseObject = 0;
         float position[3]{};
         float rotation[3]{};
         float scale = 1.0f;
@@ -56,6 +70,13 @@ namespace empire::assets
     struct LandscapeCell
     {
         static constexpr std::size_t side = 33;
+
+        struct Color
+        {
+            std::uint8_t r = 255;
+            std::uint8_t g = 255;
+            std::uint8_t b = 255;
+        };
 
         struct TextureLayer
         {
@@ -74,24 +95,34 @@ namespace empire::assets
 
         CellCoord cell;
         std::array<float, side * side> heights{};
+        std::array<Color, side * side> colors{};
         std::array<std::uint32_t, 4> baseTextures{};
         std::vector<TextureLayer> textureLayers;
         bool hasHeights = false;
+        bool hasColors = false;
     };
 
     struct TextureSetRecord
     {
         std::string diffuse;
         std::string normal;
+        std::string material;
     };
 
     struct ExteriorWorld
     {
+        std::uint32_t worldFormId = 0;
+        std::uint32_t defaultLandscapeTexture = 0;
+        float defaultWaterHeight = 0.0f;
+        std::map<CellCoord, float> waterHeights;
         std::unordered_map<std::uint32_t, std::string> models;
+        std::unordered_map<std::uint32_t, std::array<std::string, 4>> modelLods;
+        std::unordered_map<std::uint32_t, std::vector<StaticCollectionPart>> staticCollections;
         std::unordered_map<std::uint32_t, std::uint32_t> baseMaterialSwaps;
         std::unordered_map<std::uint32_t, MaterialSwapRecord> materialSwaps;
         std::unordered_map<std::uint32_t, TextureSetRecord> textureSets;
         std::unordered_map<std::uint32_t, std::uint32_t> landscapeTextures;
+        std::unordered_map<std::uint32_t, std::string> landscapeMaterials;
         std::map<CellCoord, LandscapeCell> landscapes;
         std::vector<PlacedReference> references;
 
@@ -99,4 +130,5 @@ namespace empire::assets
     };
 
     [[nodiscard]] ExteriorWorld loadCommonwealth(const std::filesystem::path& esmPath);
+    [[nodiscard]] ExteriorWorld loadExteriorWorld(const std::filesystem::path& esmPath);
 }

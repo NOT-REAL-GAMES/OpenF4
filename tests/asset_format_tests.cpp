@@ -1,8 +1,17 @@
 #include "assets/dds_texture.hpp"
+#include "assets/dem_import.hpp"
+#include "assets/esm_editor.hpp"
 #include "assets/esm_world.hpp"
 #include "assets/material_file.hpp"
 
+#include <geotiffio.h>
+#include <geovalues.h>
+#include <tiffio.h>
+#include <xtiffio.h>
+
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -96,7 +105,7 @@ namespace
         append(bytes, std::uint32_t{});
         append(bytes, std::uint8_t{128});
         for (int index = 0; index < 11; ++index)
-            append(bytes, static_cast<std::uint8_t>(index == 0 || index == 6));
+            append(bytes, static_cast<std::uint8_t>(index == 0 || index == 5 || index == 6));
         append(bytes, 0.0f);
         append(bytes, std::uint8_t{});
         append(bytes, 0.0f);
@@ -119,6 +128,7 @@ namespace
         require(material.grayscaleTexture == "textures\\test_palette.dds", "BGSM palette path failed");
         require(material.grayscaleToPalette, "BGSM palette flag failed");
         require(material.twoSided, "BGSM two-sided flag failed");
+        require(material.decal, "BGSM decal flag failed");
         require(std::abs(material.alphaCutoff - 128.0f / 255.0f) < 0.001f,
             "BGSM alpha-test threshold failed");
         require(std::abs(material.grayscaleToPaletteScale - 0.75f) < 0.001f,
@@ -148,6 +158,9 @@ namespace
     void testExteriorWorld()
     {
         constexpr std::uint32_t baseId = 0x100;
+        constexpr std::uint32_t collectionId = 0x101;
+        constexpr std::uint32_t lodProxyId = 0x102;
+        constexpr std::uint32_t combinedCollectionId = 0x103;
         constexpr std::uint32_t cellId = 0x200;
         constexpr std::uint32_t ltexId = 0x300;
         constexpr std::uint32_t overlayLtexId = 0x301;
@@ -158,9 +171,21 @@ namespace
         const std::string_view model = "architecture\\test.nif\0";
         subrecord(modelData, fourCc('M', 'O', 'D', 'L'),
             {reinterpret_cast<const std::byte*>(model.data()), model.size()});
+        std::array<char, 4 * 260> lodPaths{};
+        const std::string_view lodModel = "architecture\\test_lod.nif";
+        std::memcpy(lodPaths.data() + 3 * 260, lodModel.data(), lodModel.size());
+        subrecord(modelData, fourCc('M', 'N', 'A', 'M'),
+            {reinterpret_cast<const std::byte*>(lodPaths.data()), lodPaths.size()});
         std::array<std::byte, 4> baseSwapBytes{};
         std::memcpy(baseSwapBytes.data(), &baseSwapId, 4);
         subrecord(modelData, fourCc('M', 'O', 'D', 'S'), baseSwapBytes);
+
+        std::vector<std::byte> lodProxyData;
+        const std::string_view lodProxyEditorId = "Cambridge49_Bld02LOD\0";
+        subrecord(lodProxyData, fourCc('E', 'D', 'I', 'D'),
+            {reinterpret_cast<const std::byte*>(lodProxyEditorId.data()), lodProxyEditorId.size()});
+        subrecord(lodProxyData, fourCc('M', 'O', 'D', 'L'),
+            {reinterpret_cast<const std::byte*>(model.data()), model.size()});
 
         const auto makeSwap = [](std::string_view editorId, std::string_view original,
                                   std::string_view replacement, float paletteRow) {
@@ -185,10 +210,32 @@ namespace
         const std::string_view diffuse = "textures\\land_d.dds\0";
         subrecord(txstData, fourCc('T', 'X', '0', '0'),
             {reinterpret_cast<const std::byte*>(diffuse.data()), diffuse.size()});
+        const std::string_view terrainMaterial = "materials\\landscape\\land.bgsm\0";
+        subrecord(txstData, fourCc('M', 'N', 'A', 'M'),
+            {reinterpret_cast<const std::byte*>(terrainMaterial.data()), terrainMaterial.size()});
         std::vector<std::byte> ltexData;
         std::array<std::byte, 4> txstBytes{};
         std::memcpy(txstBytes.data(), &txstId, 4);
         subrecord(ltexData, fourCc('T', 'N', 'A', 'M'), txstBytes);
+        const std::string_view directTerrainMaterial = "materials\\landscape\\direct.bgsm\0";
+        subrecord(ltexData, fourCc('B', 'N', 'A', 'M'),
+            {reinterpret_cast<const std::byte*>(directTerrainMaterial.data()),
+                directTerrainMaterial.size()});
+        std::vector<std::byte> worldData;
+
+        std::vector<std::byte> collectionData;
+        std::array<std::byte, 4> partBaseBytes{};
+        std::memcpy(partBaseBytes.data(), &baseId, 4);
+        subrecord(collectionData, fourCc('O', 'N', 'A', 'M'), partBaseBytes);
+        std::array<float, 14> partTransform{
+            100, 200, 300, 0, 0, 0.5f, 2.0f,
+            -100, -200, 0, 0, 0, -0.75f, 1.5f};
+        subrecord(collectionData, fourCc('D', 'A', 'T', 'A'),
+            {reinterpret_cast<const std::byte*>(partTransform.data()), sizeof(partTransform)});
+        auto combinedCollectionData = collectionData;
+        const std::string_view combinedModel = "scol\\fallout4.esm\\cm00000103.nif\0";
+        subrecord(combinedCollectionData, fourCc('M', 'O', 'D', 'L'),
+            {reinterpret_cast<const std::byte*>(combinedModel.data()), combinedModel.size()});
 
         std::vector<std::byte> cellData;
         std::array<std::int32_t, 2> coordinates{2, -3};
@@ -201,14 +248,34 @@ namespace
         std::array<std::byte, 4> referenceSwapBytes{};
         std::memcpy(referenceSwapBytes.data(), &referenceSwapId, 4);
         subrecord(referenceData, fourCc('X', 'M', 'S', 'P'), referenceSwapBytes);
-        std::array<float, 6> transform{10, 20, 30, 0, 0, 0};
+        std::array<float, 6> transform{8202, -12268, 30, 0, 0, 0};
         subrecord(referenceData, fourCc('D', 'A', 'T', 'A'),
+            {reinterpret_cast<const std::byte*>(transform.data()), sizeof(transform)});
+        std::vector<std::byte> collectionReferenceData;
+        std::memcpy(baseBytes.data(), &collectionId, 4);
+        subrecord(collectionReferenceData, fourCc('N', 'A', 'M', 'E'), baseBytes);
+        subrecord(collectionReferenceData, fourCc('D', 'A', 'T', 'A'),
+            {reinterpret_cast<const std::byte*>(transform.data()), sizeof(transform)});
+        std::vector<std::byte> combinedCollectionReferenceData;
+        std::memcpy(baseBytes.data(), &combinedCollectionId, 4);
+        subrecord(combinedCollectionReferenceData, fourCc('N', 'A', 'M', 'E'), baseBytes);
+        subrecord(combinedCollectionReferenceData, fourCc('D', 'A', 'T', 'A'),
+            {reinterpret_cast<const std::byte*>(transform.data()), sizeof(transform)});
+        std::vector<std::byte> lodProxyReferenceData;
+        std::memcpy(baseBytes.data(), &lodProxyId, 4);
+        subrecord(lodProxyReferenceData, fourCc('N', 'A', 'M', 'E'), baseBytes);
+        subrecord(lodProxyReferenceData, fourCc('D', 'A', 'T', 'A'),
             {reinterpret_cast<const std::byte*>(transform.data()), sizeof(transform)});
         std::vector<std::byte> landData;
         std::vector<std::byte> heights;
         append(heights, 10.0f);
         appendZeros(heights, 1089);
         subrecord(landData, fourCc('V', 'H', 'G', 'T'), heights);
+        std::vector<std::byte> colors(33 * 33 * 3, std::byte{0xFF});
+        colors[0] = std::byte{0x12};
+        colors[1] = std::byte{0x34};
+        colors[2] = std::byte{0x56};
+        subrecord(landData, fourCc('V', 'C', 'L', 'R'), colors);
         std::array<std::byte, 8> baseTexture{};
         std::memcpy(baseTexture.data(), &ltexId, 4);
         subrecord(landData, fourCc('B', 'T', 'X', 'T'), baseTexture);
@@ -225,8 +292,19 @@ namespace
 
         std::vector<std::byte> cellChildren;
         const auto reference = record(fourCc('R', 'E', 'F', 'R'), 0x500, referenceData);
+        const auto collectionReference = record(
+            fourCc('R', 'E', 'F', 'R'), 0x501, collectionReferenceData);
+        const auto combinedCollectionReference = record(
+            fourCc('R', 'E', 'F', 'R'), 0x503, combinedCollectionReferenceData);
+        const auto lodProxyReference = record(
+            fourCc('R', 'E', 'F', 'R'), 0x502, lodProxyReferenceData);
         const auto landscape = record(fourCc('L', 'A', 'N', 'D'), 0x600, landData);
         cellChildren.insert(cellChildren.end(), reference.begin(), reference.end());
+        cellChildren.insert(
+            cellChildren.end(), collectionReference.begin(), collectionReference.end());
+        cellChildren.insert(cellChildren.end(), combinedCollectionReference.begin(),
+            combinedCollectionReference.end());
+        cellChildren.insert(cellChildren.end(), lodProxyReference.begin(), lodProxyReference.end());
         cellChildren.insert(cellChildren.end(), landscape.begin(), landscape.end());
         std::vector<std::byte> worldChildren = record(fourCc('C', 'E', 'L', 'L'), cellId, cellData);
         const auto temporary = group(cellId, 9, cellChildren);
@@ -239,24 +317,83 @@ namespace
         const auto referenceSwap = record(
             fourCc('M', 'S', 'W', 'P'), referenceSwapId, referenceSwapData);
         swapChildren.insert(swapChildren.end(), referenceSwap.begin(), referenceSwap.end());
+        std::vector<std::byte> commonwealthChildren = record(
+            fourCc('W', 'R', 'L', 'D'), 0x3C, worldData);
+        const auto worldGroup = group(0x3C, 1, worldChildren);
+        commonwealthChildren.insert(
+            commonwealthChildren.end(), worldGroup.begin(), worldGroup.end());
+        auto staticChildren = record(fourCc('S', 'T', 'A', 'T'), baseId, modelData);
+        const auto lodProxy = record(fourCc('S', 'T', 'A', 'T'), lodProxyId, lodProxyData);
+        staticChildren.insert(staticChildren.end(), lodProxy.begin(), lodProxy.end());
+        auto collectionChildren = record(
+            fourCc('S', 'C', 'O', 'L'), collectionId, collectionData);
+        const auto combinedCollection = record(
+            fourCc('S', 'C', 'O', 'L'), combinedCollectionId, combinedCollectionData);
+        collectionChildren.insert(
+            collectionChildren.end(), combinedCollection.begin(), combinedCollection.end());
         for (const auto& top : {
-            group(fourCc('S', 'T', 'A', 'T'), 0, record(fourCc('S', 'T', 'A', 'T'), baseId, modelData)),
+            group(fourCc('S', 'T', 'A', 'T'), 0, staticChildren),
+            group(fourCc('S', 'C', 'O', 'L'), 0, collectionChildren),
             group(fourCc('M', 'S', 'W', 'P'), 0, swapChildren),
             group(fourCc('T', 'X', 'S', 'T'), 0, record(fourCc('T', 'X', 'S', 'T'), txstId, txstData)),
             group(fourCc('L', 'T', 'E', 'X'), 0, record(fourCc('L', 'T', 'E', 'X'), ltexId, ltexData)),
-            group(fourCc('W', 'R', 'L', 'D'), 0, group(0x3C, 1, worldChildren))})
+            group(fourCc('W', 'R', 'L', 'D'), 0, commonwealthChildren)})
             file.insert(file.end(), top.begin(), top.end());
         const auto path = std::filesystem::temp_directory_path() / "empire-esm-world-test.esm";
         std::ofstream output(path, std::ios::binary | std::ios::trunc);
         output.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
         output.close();
         const auto world = empire::assets::loadCommonwealth(path);
+        const auto selectedWorld = empire::assets::loadExteriorWorld(path);
         std::filesystem::remove(path);
+        require(world.worldFormId == 0x3Cu && selectedWorld.worldFormId == 0x3Cu
+                && selectedWorld.landscapes.contains({2, -3}),
+            "Generic ESM worldspace selection failed");
         require(world.models.at(baseId) == "architecture\\test.nif", "ESM model failed");
+        require(world.models.at(combinedCollectionId)
+                == "scol\\fallout4.esm\\cm00000103.nif",
+            "ESM combined SCOL model failed");
+        require(world.models.contains(lodProxyId), "ESM LOD proxy model was not parsed");
+        require(world.modelLods.at(baseId)[3] == "architecture\\test_lod.nif",
+            "ESM STAT MNAM LOD failed");
         require(world.baseMaterialSwaps.at(baseId) == baseSwapId, "ESM base MODS failed");
-        require(world.references.size() == 1, "ESM reference failed");
+        require(world.references.size() == 4, "ESM reference or SCOL expansion failed");
+        require(std::ranges::none_of(world.references, [](const auto& reference) {
+            return reference.formId == 0x502;
+        }), "Explicit EDID LOD proxy reference was not filtered");
         require(world.references.front().materialSwap == referenceSwapId, "ESM reference XMSP failed");
         require(world.references.front().cell == empire::assets::CellCoord{2, -3}, "ESM cell failed");
+        require(world.references.front().replacesDistantLod,
+            "ESM MNAM reference was not marked as a distant replacement");
+        const auto& collectionPart = world.references[1];
+        require(collectionPart.baseObject == baseId && collectionPart.hasLocalTransform,
+            "ESM SCOL part was not expanded");
+        require(collectionPart.instanceId == (std::uint64_t{1} << 32u | 0x501u)
+                && collectionPart.localPosition[0] == 100.0f
+                && collectionPart.localRotation[2] == 0.5f
+                && collectionPart.localScale == 2.0f,
+            "ESM SCOL part transform failed");
+        require(collectionPart.cell == empire::assets::CellCoord{2, -3}
+                && collectionPart.replacesDistantLod,
+            "ESM SCOL part replacement cell failed");
+        const auto& secondCollectionPart = world.references[2];
+        require(secondCollectionPart.instanceId == (std::uint64_t{2} << 32u | 0x501u)
+                && secondCollectionPart.localPosition[0] == -100.0f
+                && secondCollectionPart.localRotation[2] == -0.75f
+                && secondCollectionPart.localScale == 1.5f
+                && secondCollectionPart.cell == empire::assets::CellCoord{1, -4},
+            "ESM SCOL placement array was not fully expanded");
+        const auto& combinedCollectionReferenceResult = world.references[3];
+        require(combinedCollectionReferenceResult.baseObject == combinedCollectionId
+                && !combinedCollectionReferenceResult.hasLocalTransform
+                && combinedCollectionReferenceResult.replacesDistantLod,
+            "ESM combined SCOL was expanded instead of using its canonical model");
+        require(world.textureSets.at(txstId).material == "materials\\landscape\\land.bgsm",
+            "ESM TXST material path failed");
+        require(world.landscapeMaterials.at(ltexId) == "materials\\landscape\\direct.bgsm",
+            "ESM LTEX material path failed");
+        require(world.defaultLandscapeTexture == 0x000AB07E,
+            "Commonwealth default LAND texture changed");
         const auto swapped = world.materialSwaps.at(referenceSwapId).resolve(
             "C:/Fallout4/Data/materials/vehicles/car.bgsm");
         require(swapped.matched && swapped.path == "vehicles\\red.bgsm",
@@ -275,6 +412,199 @@ namespace
             "ESM LAND VTXT failed");
         require(std::abs(world.landscapes.at({2, -3}).heights[0] - 80.0f) < 0.001f,
             "ESM LAND height failed");
+        const auto& color = world.landscapes.at({2, -3}).colors[0];
+        require(world.landscapes.at({2, -3}).hasColors
+                && color.r == 0x12 && color.g == 0x34 && color.b == 0x56,
+            "ESM LAND vertex color failed");
+    }
+
+    void testEditableLandscape()
+    {
+        auto editable = empire::assets::createEditableLandscape();
+        for (std::size_t y = 0; y < editable.side; ++y)
+        {
+            for (std::size_t x = 0; x < editable.side; ++x)
+                editable.height(x, y) = static_cast<float>(x + y) * 8.0f;
+        }
+
+        const auto path = std::filesystem::temp_directory_path() / "empire-editable-landscape-test.esm";
+        empire::assets::saveEditableLandscape(path, editable);
+        const auto loaded = empire::assets::loadEditableLandscape(path);
+        require(loaded.heights == editable.heights, "Editable ESM VHGT round trip failed");
+
+        const auto center = loaded.cell({0, 0});
+        const auto west = loaded.cell({-1, 0});
+        const auto south = loaded.cell({0, -1});
+        const auto southwest = loaded.cell({-1, -1});
+        require(west.heights[32] == center.heights[0],
+            "Editable ESM east/west seam diverged");
+        require(south.heights[32 * 33] == center.heights[0],
+            "Editable ESM north/south seam diverged");
+        require(southwest.heights[32 * 33 + 32] == center.heights[0],
+            "Editable ESM four-cell corner diverged");
+
+        auto expanded = loaded;
+        require(expanded.addCell({2, 0}) && expanded.addCell({3, 0}),
+            "Editable landscape did not create missing cells");
+        require(expanded.cellForms.at({2, 0})
+                == empire::assets::EditableLandscape::CellForms{0x01000813u, 0x01000814u}
+                && expanded.cellForms.at({3, 0})
+                == empire::assets::EditableLandscape::CellForms{0x01000815u, 0x01000816u},
+            "Expanded editable CELL/LAND FormIDs were not stable");
+        const auto firstAdded = expanded.cell({2, 0});
+        const auto secondAdded = expanded.cell({3, 0});
+        for (std::size_t y = 0; y < 33; ++y)
+        {
+            require(firstAdded.heights[y * 33] == loaded.height(96, y + 32),
+                "New CELL did not preserve its existing shared edge");
+            require(firstAdded.heights[y * 33 + 32] == secondAdded.heights[y * 33],
+                "Two dynamically created CELLs diverged at their seam");
+        }
+        empire::assets::saveEditableLandscape(path, expanded);
+        require(empire::assets::loadEditableLandscape(path) == expanded,
+            "Expanded editable ESM did not reload semantically");
+
+        auto unquantized = editable;
+        unquantized.height(20, 20) += 1.0f;
+        bool rejected = false;
+        try
+        {
+            empire::assets::saveEditableLandscape(path, unquantized);
+        }
+        catch (const std::runtime_error&)
+        {
+            rejected = true;
+        }
+        require(rejected, "Editable ESM accepted an unquantized height");
+
+        auto excessiveDelta = editable;
+        excessiveDelta.height(20, 20) += 128.0f * 8.0f;
+        rejected = false;
+        try
+        {
+            empire::assets::saveEditableLandscape(path, excessiveDelta);
+        }
+        catch (const std::runtime_error&)
+        {
+            rejected = true;
+        }
+        require(rejected, "Editable ESM accepted an out-of-range VHGT delta");
+
+        std::fstream corrupt(path, std::ios::binary | std::ios::in | std::ios::out);
+        corrupt.seekp(-1, std::ios::end);
+        corrupt.put('\x7f');
+        corrupt.close();
+        rejected = false;
+        try
+        {
+            (void)empire::assets::loadEditableLandscape(path);
+        }
+        catch (const std::runtime_error&)
+        {
+            rejected = true;
+        }
+        std::filesystem::remove(path);
+        require(rejected, "Editable ESM accepted corrupt VHGT trailing data");
+    }
+
+    void writeDemFixture(const std::filesystem::path& path, int west, int north,
+        float elevation)
+    {
+        constexpr std::uint32_t side = 3612;
+        TIFF* image = XTIFFOpen(path.string().c_str(), "w");
+        require(image != nullptr, "Could not create DEM GeoTIFF fixture");
+        const auto close = [&] { XTIFFClose(image); };
+        TIFFSetField(image, TIFFTAG_IMAGEWIDTH, side);
+        TIFFSetField(image, TIFFTAG_IMAGELENGTH, side);
+        TIFFSetField(image, TIFFTAG_SAMPLESPERPIXEL, 1);
+        TIFFSetField(image, TIFFTAG_BITSPERSAMPLE, 32);
+        TIFFSetField(image, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+        TIFFSetField(image, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+        TIFFSetField(image, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+        // One row per strip keeps the fixture compact while allowing the importer to skip
+        // directly over the six-pixel USGS collar.
+        TIFFSetField(image, TIFFTAG_ROWSPERSTRIP, 1);
+        TIFFSetField(image, TIFFTAG_COMPRESSION, COMPRESSION_ADOBE_DEFLATE);
+        TIFFSetField(image, TIFFTAG_PREDICTOR, PREDICTOR_FLOATINGPOINT);
+        constexpr double step = 1.0 / 3600.0;
+        const std::array scale{step, step, 0.0};
+        const std::array tie{0.0, 0.0, 0.0,
+            static_cast<double>(west) - 6.0 * step,
+            static_cast<double>(north) + 6.0 * step, 0.0};
+        TIFFSetField(image, TIFFTAG_GEOPIXELSCALE,
+            static_cast<std::uint16_t>(scale.size()), scale.data());
+        TIFFSetField(image, TIFFTAG_GEOTIEPOINTS,
+            static_cast<std::uint16_t>(tie.size()), tie.data());
+
+        GTIF* geo = GTIFNew(image);
+        if (!geo)
+        {
+            close();
+            throw std::runtime_error("Could not create DEM GeoTIFF keys");
+        }
+        GTIFKeySet(geo, GTModelTypeGeoKey, TYPE_SHORT, 1, ModelTypeGeographic);
+        GTIFKeySet(geo, GTRasterTypeGeoKey, TYPE_SHORT, 1, RasterPixelIsArea);
+        GTIFKeySet(geo, GeographicTypeGeoKey, TYPE_SHORT, 1, 4269);
+        const bool wroteKeys = GTIFWriteKeys(geo) != 0;
+        GTIFFree(geo);
+        if (!wroteKeys)
+        {
+            close();
+            throw std::runtime_error("Could not write DEM GeoTIFF keys");
+        }
+        std::vector<float> row(side, elevation);
+        for (std::uint32_t y = 0; y < side; ++y)
+        {
+            if (TIFFWriteScanline(image, row.data(), y, 0) < 0)
+            {
+                close();
+                throw std::runtime_error("Could not write DEM GeoTIFF fixture pixels");
+            }
+        }
+        close();
+    }
+
+    void testDemImportPlan()
+    {
+        const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+        const auto directory = std::filesystem::temp_directory_path()
+            / ("empire-dem-import-test-" + std::to_string(nonce));
+        std::filesystem::create_directories(directory);
+        struct Cleanup
+        {
+            std::filesystem::path path;
+            ~Cleanup()
+            {
+                std::error_code ignored;
+                std::filesystem::remove_all(path, ignored);
+            }
+        } cleanup{directory};
+        const std::array paths{
+            directory / "n42w074.tif", directory / "n41w075.tif",
+            directory / "n42w075.tif", directory / "n41w074.tif"};
+        writeDemFixture(paths[0], -74, 42, 10.0f);
+        writeDemFixture(paths[1], -75, 41, 20.0f);
+        writeDemFixture(paths[2], -75, 42, 30.0f);
+        writeDemFixture(paths[3], -74, 41, 40.0f);
+
+        const auto summary = empire::assets::inspectDemLandscape(
+            directory / "NYC.esm", paths);
+        require(summary.cellCount == 10'906'969,
+            "DEM true-scale projected CELL count changed");
+        require(summary.shards.size() == 12,
+            "DEM was not divided into the expected spatial shards");
+        require(summary.minimumCell.x <= 0 && summary.maximumCell.x >= 0
+                && summary.minimumCell.y <= 0 && summary.maximumCell.y >= 0,
+            "Times Square is not inside the imported CELL footprint");
+        require(std::ranges::all_of(summary.shards, [](const auto& shard) {
+                return shard.cellCount > 0
+                    && shard.cellCount <= empire::assets::maxDemCellsPerEsm;
+            }), "DEM terrain shard exceeded 1,048,576 CELLs");
+        require(summary.widthMeters > 170'000.0 && summary.widthMeters < 172'000.0
+                && summary.heightMeters > 223'000.0 && summary.heightMeters < 225'000.0,
+            "DEM true-scale projected dimensions changed");
+        require(summary.btrDirectory == directory / "NYC.btr",
+            "DEM BTR output directory changed");
     }
 }
 
@@ -284,6 +614,8 @@ try
     testMaterialPalette();
     testDdsMips();
     testExteriorWorld();
+    testEditableLandscape();
+    testDemImportPlan();
     std::cout << "Asset format tests passed\n";
     return 0;
 }

@@ -1,12 +1,18 @@
 #include "assets/nif_model.hpp"
 
 #include <NifFile.hpp>
+#include <ExtraData.hpp>
 #include <Shaders.hpp>
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <istream>
 #include <stdexcept>
+#include <unordered_map>
+
+#include <glm/ext/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 namespace empire::assets
 {
@@ -36,6 +42,14 @@ namespace empire::assets
             return {value.x, value.z, value.y};
         }
 
+        glm::mat4 convertTransform(const glm::mat4& bethesda)
+        {
+            glm::mat4 swap(1.0f);
+            swap[1] = {0.0f, 0.0f, 1.0f, 0.0f};
+            swap[2] = {0.0f, 1.0f, 0.0f, 0.0f};
+            return swap * bethesda * swap;
+        }
+
         bool renderableShape(const nifly::NiShape& shape)
         {
             std::string name = shape.name.get();
@@ -59,6 +73,38 @@ namespace empire::assets
             throw std::runtime_error("NIF parser rejected the model");
 
         ModelGeometry result;
+        auto& header = file.GetHeader();
+        for (std::uint32_t block = 0; block < header.GetNumBlocks(); ++block)
+        {
+            if (auto* parents = header.GetBlock<nifly::BSConnectPointParents>(block))
+            {
+                for (const auto& point : parents->connectPoints)
+                {
+                    glm::mat4 root(1.0f);
+                    nifly::MatTransform rootTransform;
+                    const std::string rootName = point.root.get();
+                    if (!rootName.empty()
+                        && file.GetNodeTransformToGlobal(rootName, rootTransform))
+                        root = rootTransform.ToGLMMatrix<glm::mat4>();
+                    glm::quat rotation(point.rotation.w, point.rotation.x,
+                        point.rotation.y, point.rotation.z);
+                    if (glm::length(rotation) <= 0.0f)
+                        rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+                    else
+                        rotation = glm::normalize(rotation);
+                    glm::mat4 local = glm::translate(glm::mat4(1.0f),
+                        glm::vec3(point.translation.x, point.translation.y,
+                            point.translation.z))
+                        * glm::mat4_cast(rotation);
+                    local = glm::scale(local, glm::vec3(point.scale));
+                    result.attachmentPoints.push_back(ModelGeometry::ConnectionPoint{
+                        point.variableName.get(), convertTransform(root * local)});
+                }
+            }
+            if (auto* children = header.GetBlock<nifly::BSConnectPointChildren>(block))
+                for (const auto& target : children->targets)
+                    result.attachmentTargets.push_back(target.get());
+        }
         for (nifly::NiShape* shape : file.GetShapes())
         {
             if (!renderableShape(*shape))
@@ -71,7 +117,72 @@ namespace empire::assets
                 continue;
             const auto* normals = file.GetNormalsForShape(shape);
             const auto* uvs = file.GetUvsForShape(shape);
-            const nifly::MatTransform transform = globalTransform(file, shape);
+            const auto* colors = file.GetColorsForShape(shape);
+            const bool skinned = shape->IsSkinned();
+            const nifly::MatTransform transform = skinned
+                ? nifly::MatTransform{} : globalTransform(file, shape);
+            std::vector<std::uint32_t> boneMap;
+            std::vector<glm::uvec4> vertexBones(positions->size());
+            std::vector<glm::vec4> vertexWeights(positions->size());
+            if (skinned)
+            {
+                std::vector<std::string> boneNames;
+                file.GetShapeBoneList(shape, boneNames);
+                if (boneNames.empty())
+                    throw std::runtime_error("Skinned NIF shape has no bone list");
+                boneMap.reserve(boneNames.size());
+                for (std::uint32_t localBone = 0; localBone < boneNames.size(); ++localBone)
+                {
+                    nifly::MatTransform skinToBone;
+                    if (!file.GetShapeTransformSkinToBone(shape, localBone, skinToBone))
+                        throw std::runtime_error("Skinned NIF shape has no bind transform");
+                    const std::string& name = boneNames[localBone];
+                    const auto existing = std::ranges::find_if(result.skinBones,
+                        [&](const ModelSkinBone& bone) { return bone.name == name; });
+                    std::uint32_t globalBone = 0;
+                    if (existing == result.skinBones.end())
+                    {
+                        if (result.skinBones.size() >= 256)
+                            throw std::runtime_error("Skinned NIF exceeds 256 bones");
+                        globalBone = static_cast<std::uint32_t>(result.skinBones.size());
+                        result.skinBones.push_back({name,
+                            convertTransform(skinToBone.ToGLMMatrix<glm::mat4>())});
+                    }
+                    else
+                        globalBone = static_cast<std::uint32_t>(existing - result.skinBones.begin());
+                    boneMap.push_back(globalBone);
+
+                    std::unordered_map<std::uint16_t, float> weights;
+                    file.GetShapeBoneWeights(shape, localBone, weights);
+                    for (const auto& [vertexIndex, weight] : weights)
+                    {
+                        if (vertexIndex >= positions->size() || !std::isfinite(weight) || weight <= 0.0f)
+                            continue;
+                        auto& values = vertexWeights[vertexIndex];
+                        glm::length_t slot = 0;
+                        for (glm::length_t candidate = 1; candidate < values.length(); ++candidate)
+                            if (values[candidate] < values[slot])
+                                slot = candidate;
+                        if (weight > values[slot])
+                        {
+                            values[slot] = weight;
+                            vertexBones[vertexIndex][slot] = globalBone;
+                        }
+                    }
+                }
+                for (std::size_t vertex = 0; vertex < vertexWeights.size(); ++vertex)
+                {
+                    const float sum = vertexWeights[vertex].x + vertexWeights[vertex].y
+                        + vertexWeights[vertex].z + vertexWeights[vertex].w;
+                    if (sum > 0.0f)
+                        vertexWeights[vertex] /= sum;
+                    else
+                    {
+                        vertexBones[vertex].x = boneMap.front();
+                        vertexWeights[vertex].x = 1.0f;
+                    }
+                }
+            }
             ModelSurface surface;
             surface.vertices.reserve(positions->size());
             if (nifly::NiShader* shader = file.GetShader(shape))
@@ -83,6 +194,9 @@ namespace empire::assets
                     if (!rootMaterial.empty())
                         surface.materialPath = rootMaterial;
                 }
+                if (const auto* property = dynamic_cast<const nifly::BSShaderProperty*>(shader))
+                    surface.decal = (property->shaderFlags1
+                        & (nifly::SLSF1_DECAL | nifly::SLSF1_DYNAMIC_DECAL)) != 0;
             }
             file.GetTextureSlot(shape, surface.diffuseTexture, 0);
             file.GetTextureSlot(shape, surface.normalTexture, 1);
@@ -97,7 +211,21 @@ namespace empire::assets
                 glm::vec2 uv{};
                 if (uvs && index < uvs->size())
                     uv = {(*uvs)[index].u, (*uvs)[index].v};
-                surface.vertices.push_back({convert(position), normal, uv});
+                render::SourceVertex vertex;
+                vertex.position = convert(position);
+                vertex.normal = normal;
+                vertex.uv = uv;
+                if (skinned)
+                {
+                    vertex.boneIndices = vertexBones[index];
+                    vertex.boneWeights = vertexWeights[index];
+                }
+                if (colors && index < colors->size())
+                {
+                    const auto& color = (*colors)[index];
+                    vertex.color = {color.r, color.g, color.b, color.a};
+                }
+                surface.vertices.push_back(vertex);
             }
             surface.indices.reserve(triangles.size() * 3);
             for (const auto& triangle : triangles)

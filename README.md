@@ -28,6 +28,7 @@ VulkanSceneGraph or inherit the previous engine's frame graph and synchronizatio
 - Bethesda references use the original scalar ZYX conversion, `(X,Z,Y)` intermediate space,
   Y/Z quaternion swap, and the final world-X shader flip
 - Editor marker, collision, occlusion, previs, precombined, and helper-mesh filtering
+- EMPIRE-owned 3x3 ESM landscape creation, sculpting, undo/redo, and atomic save
 
 The default scene opens the Commonwealth at a dense exterior cell, renders LAND first,
 then streams nearby placed objects. Models and textures are cached and reused across
@@ -56,13 +57,38 @@ build/bin/RelWithDebInfo/empire.exe --model "meshes\architecture\example.nif"
 build/bin/RelWithDebInfo/empire.exe --cell 1 1 --radius 0
 build/bin/RelWithDebInfo/empire.exe --cell 1 1 --max-objects 100 --benchmark 130
 build/bin/RelWithDebInfo/empire.exe --land-only
+build/bin/RelWithDebInfo/empire.exe --editor "mods\EmpireWorld.esm"
+build/bin/RelWithDebInfo/empire.exe "C:\Games\Fallout 4\Data\Fallout4.esm"
+build/bin/RelWithDebInfo/empire.exe --import-dem "mods\NYC.esm" `
+  "USGS_1_n41w075_20221115.tif" "USGS_1_n41w074_20260820.tif" `
+  "USGS_1_n42w074_20241010.tif" "USGS_1_n42w075_20240925.tif"
 ```
+
+Passing exactly one `.esm` path selects that master in read-only world mode. EMPIRE DEM
+overlays stream nearby LAND and their baked level-32 BTR tiles; use `--editor` explicitly
+to sculpt. Other masters stream the first exterior worldspace contained in that file.
+Master dependency merging is not performed yet.
+
+Place `--bake-btr` immediately after `--import-dem` to bake sharded level-32 distant
+terrain after the ESM masters finish. Imported exterior cells use a zero-meter sea-level
+water plane by default. The DEM editor keeps a 9-by-9 CELL window resident around the
+camera and displays that water plane while editing.
+
+Use `--inspect-dem` with the same arguments to validate inputs and print shard sizes
+without writing the multi-gigabyte import.
 
 Set `FALLOUT4_PATH` when Fallout 4 is outside the usual Steam folders. It may point to the
 game root or directly to `Data`.
 
 Controls are `WASD`, `Space`/`C`, mouse look, left Shift for fast movement, and Escape to
 release or recapture the mouse.
+
+Editor controls are `1` raise, `2` lower, `3` smooth, `4` flatten, left-drag to sculpt,
+mouse wheel for radius, Shift+wheel for strength, `Ctrl+Z`/`Ctrl+Y` for history, and
+`Ctrl+S` to save. Entering an exterior cell not yet present in the editor ESM creates and
+persists it automatically. Editor ESM files are intentionally EMPIRE-only for now.
+The DEM importer accepts the four contiguous USGS one-arc-second NAD83 tiles in any order,
+uses true Fallout scale, and writes spatial terrain masters capped at 1,048,576 cells each.
 
 ## Synchronization Policy
 

@@ -21,13 +21,25 @@ namespace empire::render
             const auto finite3 = [](const glm::vec3& value) {
                 return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
             };
-            if (!finite3(vertex.position) || !finite3(vertex.normal)
-                || !std::isfinite(vertex.uv.x) || !std::isfinite(vertex.uv.y)
-                || !std::isfinite(vertex.blendWeights.x) || !std::isfinite(vertex.blendWeights.y)
-                || !std::isfinite(vertex.blendWeights.z) || !std::isfinite(vertex.blendWeights.w)
+            const auto finite4 = [](const glm::vec4& value) {
+                return std::isfinite(value.x) && std::isfinite(value.y)
+                    && std::isfinite(value.z) && std::isfinite(value.w);
+            };
+            if (!finite3(vertex.position)
                 || std::max({std::abs(vertex.position.x), std::abs(vertex.position.y),
                     std::abs(vertex.position.z)}) > 10'000'000.0f)
-                throw std::invalid_argument("Mesh contains a non-finite or unbounded vertex");
+                throw std::invalid_argument("Mesh contains a non-finite or unbounded position");
+            if (!finite3(vertex.normal))
+                throw std::invalid_argument("Mesh contains a non-finite normal");
+            if (!std::isfinite(vertex.uv.x) || !std::isfinite(vertex.uv.y))
+                throw std::invalid_argument("Mesh contains a non-finite texture coordinate");
+            if (!finite4(vertex.blendWeights) || !finite4(vertex.blendWeightsExtra))
+                throw std::invalid_argument("Mesh contains non-finite blend weights");
+            if (!finite4(vertex.color))
+                throw std::invalid_argument("Mesh contains a non-finite vertex color");
+            if (!finite4(vertex.boneWeights)
+                || glm::any(glm::greaterThan(vertex.boneIndices, glm::uvec4(255))))
+                throw std::invalid_argument("Mesh contains invalid skin weights");
         }
 
         PackedMesh result;
@@ -68,14 +80,35 @@ namespace empire::render
                 const SourceVertex& vertex = vertices[sourceIndex];
                 const float normalLength = glm::length(vertex.normal);
                 glm::vec4 weights = glm::max(vertex.blendWeights, glm::vec4(0.0f));
-                const float weightSum = weights.x + weights.y + weights.z + weights.w;
-                weights = weightSum > 0.0f
-                    ? weights / weightSum : glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+                glm::vec4 extraWeights = glm::max(vertex.blendWeightsExtra, glm::vec4(0.0f));
+                glm::vec4 boneWeights = glm::max(vertex.boneWeights, glm::vec4(0.0f));
+                const float weightSum = weights.x + weights.y + weights.z + weights.w
+                    + extraWeights.x + extraWeights.y + extraWeights.z + extraWeights.w;
+                if (weightSum <= 0.0f)
+                    weights = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+                const float boneWeightSum = boneWeights.x + boneWeights.y
+                    + boneWeights.z + boneWeights.w;
+                if (boneWeightSum > 0.0f)
+                    boneWeights /= boneWeightSum;
+                const auto packUnorm4x8 = [](const glm::vec4& value) {
+                    std::uint32_t packed = 0;
+                    for (glm::length_t component = 0; component < value.length(); ++component)
+                    {
+                        const auto byte = static_cast<std::uint32_t>(std::lround(
+                            std::clamp(value[component], 0.0f, 1.0f) * 255.0f));
+                        packed |= byte << (component * 8);
+                    }
+                    return packed;
+                };
                 result.vertices.push_back({
                     glm::vec4(vertex.position, 1.0f),
-                    glm::vec4(normalLength > 0.0f
-                        ? vertex.normal / normalLength : glm::vec3(0.0f, 1.0f, 0.0f), weights.x),
-                    glm::vec4(vertex.uv, weights.y, weights.z)
+                    normalLength > 0.0f
+                        ? vertex.normal / normalLength : glm::vec3(0.0f, 1.0f, 0.0f),
+                    packUnorm4x8(weights), vertex.uv, packUnorm4x8(extraWeights),
+                    packUnorm4x8(glm::clamp(vertex.color, glm::vec4(0.0f), glm::vec4(1.0f))),
+                    vertex.boneIndices.x | (vertex.boneIndices.y << 8)
+                        | (vertex.boneIndices.z << 16) | (vertex.boneIndices.w << 24),
+                    packUnorm4x8(boneWeights)
                 });
                 meshletMinimum = glm::min(meshletMinimum, vertex.position);
                 meshletMaximum = glm::max(meshletMaximum, vertex.position);
@@ -164,24 +197,68 @@ namespace empire::render
 
     MeshRange appendMesh(PackedMesh& destination, PackedMesh source)
     {
+        const bool destinationEmpty = destination.meshlets.empty();
         MeshRange range;
+        range.vertexOffset = static_cast<std::uint32_t>(destination.vertices.size());
+        range.vertexCount = static_cast<std::uint32_t>(source.vertices.size());
+        range.indexOffset = static_cast<std::uint32_t>(destination.indices.size());
+        range.indexCount = static_cast<std::uint32_t>(source.indices.size());
         range.meshletOffset = static_cast<std::uint32_t>(destination.meshlets.size());
         range.meshletCount = static_cast<std::uint32_t>(source.meshlets.size());
         range.bounds = source.bounds;
-        const std::uint32_t vertexOffset = static_cast<std::uint32_t>(destination.vertices.size());
-        const std::uint32_t indexOffset = static_cast<std::uint32_t>(destination.indices.size());
         for (auto& meshlet : source.meshlets)
         {
-            meshlet.vertexOffset += vertexOffset;
-            meshlet.indexOffset += indexOffset;
+            meshlet.vertexOffset += range.vertexOffset;
+            meshlet.indexOffset += range.indexOffset;
         }
         destination.vertices.insert(destination.vertices.end(),
             std::make_move_iterator(source.vertices.begin()), std::make_move_iterator(source.vertices.end()));
         destination.indices.insert(destination.indices.end(), source.indices.begin(), source.indices.end());
         destination.meshlets.insert(destination.meshlets.end(),
             std::make_move_iterator(source.meshlets.begin()), std::make_move_iterator(source.meshlets.end()));
-        if (range.meshletOffset == 0)
+        if (destinationEmpty)
             destination.bounds = range.bounds;
+        else if (range.meshletCount != 0)
+        {
+            const glm::vec3 destinationCenter(destination.bounds);
+            const glm::vec3 sourceCenter(range.bounds);
+            const float destinationRadius = destination.bounds.w;
+            const float sourceRadius = range.bounds.w;
+            const glm::vec3 offset = sourceCenter - destinationCenter;
+            const float distance = glm::length(offset);
+            if (destinationRadius < distance + sourceRadius)
+            {
+                if (sourceRadius >= distance + destinationRadius)
+                    destination.bounds = range.bounds;
+                else if (distance > 0.0f)
+                {
+                    const float radius = (distance + destinationRadius + sourceRadius) * 0.5f;
+                    destination.bounds = glm::vec4(
+                        destinationCenter + offset * ((radius - destinationRadius) / distance),
+                        radius);
+                }
+            }
+        }
         return range;
+    }
+
+    bool detail::fixedTopologyReplacement(const MeshRange& range,
+        std::span<const GpuMeshlet> currentMeshlets, const PackedMesh& replacement)
+    {
+        if (range.vertexCount != replacement.vertices.size()
+            || range.indexCount != replacement.indices.size()
+            || range.meshletCount != replacement.meshlets.size()
+            || static_cast<std::uint64_t>(range.meshletOffset) + range.meshletCount
+                > currentMeshlets.size())
+            return false;
+        for (std::size_t i = 0; i < replacement.meshlets.size(); ++i)
+        {
+            const auto& previous = currentMeshlets[range.meshletOffset + i];
+            const auto& next = replacement.meshlets[i];
+            if (next.vertexCount != previous.vertexCount
+                || next.triangleCount != previous.triangleCount)
+                return false;
+        }
+        return true;
     }
 }

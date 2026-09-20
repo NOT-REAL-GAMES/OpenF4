@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -14,7 +15,6 @@
 #include <string_view>
 #include <vector>
 
-#include <glm/gtc/type_ptr.hpp>
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/ext/matrix_transform.hpp>
 #include <shaderc/shaderc.hpp>
@@ -33,9 +33,9 @@ namespace empire::render
 #version 460
 layout(local_size_x = 64) in;
 
-struct Vertex { vec4 position; vec4 normalAndColor; vec4 texCoord; };
+struct Vertex { vec4 position; vec3 normal; uint blendWeights; vec2 texCoord; uint blendWeightsExtra; uint color; uint boneIndices; uint boneWeights; uvec2 padding; };
 struct Meshlet { uint vertexOffset; uint indexOffset; uint vertexCount; uint triangleCount; vec4 sphere; uint materialIndex; uint padding0; uint padding1; uint padding2; };
-struct Instance { mat4 transform; vec4 bounds; vec4 lodRange; uvec4 meshletRange; };
+struct Instance { mat4 transform; vec4 bounds; vec4 lodRange; uvec4 meshletRange; uvec4 skinRange; };
 
 layout(std430, binding = 0) readonly buffer Vertices { Vertex vertices[]; };
 layout(std430, binding = 1) readonly buffer Indices { uint indices[]; };
@@ -49,6 +49,7 @@ layout(std140, binding = 7) uniform Camera {
     mat4 lightViewProjection;
     vec4 planes[6];
     vec4 cameraPosition;
+    vec4 worldOrigin;
     uvec4 counts;
 } camera;
 
@@ -60,20 +61,33 @@ void main()
 
     uvec2 source = sources[sourceIndex];
     Instance instance = instances[source.x];
+    if (instance.meshletRange.z == 0)
+        return;
     Meshlet meshlet = meshlets[source.y];
-    vec3 center = (instance.transform * vec4(meshlet.sphere.xyz, 1.0)).xyz;
-    center.x = -center.x;
-    float scale = max(length(instance.transform[0].xyz),
-        max(length(instance.transform[1].xyz), length(instance.transform[2].xyz)));
-    float radius = meshlet.sphere.w * scale;
-    for (uint plane = 0; plane < 6; ++plane) {
-        if (dot(camera.planes[plane].xyz, center) + camera.planes[plane].w < -radius)
+    if (instance.meshletRange.w == 0) {
+        vec3 center;
+        float radius;
+        if (instance.skinRange.y != 0) {
+            center = instance.bounds.xyz - camera.worldOrigin.xyz;
+            radius = instance.bounds.w;
+        } else {
+            center = (instance.transform * vec4(meshlet.sphere.xyz, 1.0)).xyz;
+            center.x = -center.x;
+            center -= camera.worldOrigin.xyz;
+            float scale = max(length(instance.transform[0].xyz),
+                max(length(instance.transform[1].xyz), length(instance.transform[2].xyz)));
+            radius = meshlet.sphere.w * scale;
+        }
+        for (uint plane = 0; plane < 6; ++plane) {
+            if (dot(camera.planes[plane].xyz, center) + camera.planes[plane].w < -radius)
+                return;
+        }
+
+        float distanceToCamera = distance(camera.cameraPosition.xz, center.xz);
+        if (distanceToCamera + radius < instance.lodRange.x
+            || distanceToCamera - radius > instance.lodRange.w)
             return;
     }
-
-    float distanceToCamera = distance(camera.cameraPosition.xyz, center);
-    if (distanceToCamera < instance.lodRange.x || distanceToCamera > instance.lodRange.w)
-        return;
 
     uint destination = atomicAdd(command[0], 1);
     if (destination < camera.counts.y)
@@ -88,9 +102,12 @@ void main()
 layout(local_size_x = 32) in;
 layout(triangles, max_vertices = 64, max_primitives = 124) out;
 
-struct Vertex { vec4 position; vec4 normalAndColor; vec4 texCoord; };
+struct Vertex { vec4 position; vec3 normal; uint blendWeights; vec2 texCoord; uint blendWeightsExtra; uint color; uint boneIndices; uint boneWeights; uvec2 padding; };
 struct Meshlet { uint vertexOffset; uint indexOffset; uint vertexCount; uint triangleCount; vec4 sphere; uint materialIndex; uint padding0; uint padding1; uint padding2; };
-struct Instance { mat4 transform; vec4 bounds; vec4 lodRange; uvec4 meshletRange; };
+struct Instance { mat4 transform; vec4 bounds; vec4 lodRange; uvec4 meshletRange; uvec4 skinRange; };
+struct Material { vec4 baseColor; uvec4 textureIndices; vec4 parameters; uvec4 extraTextureIndices; };
+
+layout(constant_id = 0) const uint decalPass = 0;
 
 layout(std430, binding = 0) readonly buffer Vertices { Vertex vertices[]; };
 layout(std430, binding = 1) readonly buffer Indices { uint indices[]; };
@@ -104,8 +121,11 @@ layout(std140, binding = 7) uniform Camera {
     mat4 lightViewProjection;
     vec4 planes[6];
     vec4 cameraPosition;
+    vec4 worldOrigin;
     uvec4 counts;
 } camera;
+layout(std430, binding = 9) readonly buffer Materials { Material materials[]; };
+layout(std430, binding = 10) readonly buffer SkinMatrices { mat4 skinMatrices[]; };
 
 layout(location = 0) out vec3 fragmentNormal[];
 layout(location = 1) out flat uint fragmentInstance[];
@@ -113,29 +133,66 @@ layout(location = 2) out vec3 fragmentWorldPosition[];
 layout(location = 3) out vec2 fragmentTexCoord[];
 layout(location = 4) out flat uint fragmentMaterial[];
 layout(location = 5) out vec4 fragmentBlendWeights[];
+layout(location = 6) out vec4 fragmentBlendWeightsExtra[];
+layout(location = 7) out vec4 fragmentColor[];
 
 void main()
 {
     uvec2 candidate = visible[gl_WorkGroupID.x];
     Instance instance = instances[candidate.x];
     Meshlet meshlet = meshlets[candidate.y];
+    bool decal = materials[meshlet.materialIndex].parameters.w > 0.5;
+    if (decal != (decalPass != 0)) {
+        SetMeshOutputsEXT(0, 0);
+        return;
+    }
     SetMeshOutputsEXT(meshlet.vertexCount, meshlet.triangleCount);
 
     for (uint vertexIndex = gl_LocalInvocationIndex;
          vertexIndex < meshlet.vertexCount; vertexIndex += gl_WorkGroupSize.x) {
         Vertex vertex = vertices[meshlet.vertexOffset + vertexIndex];
-        vec4 world = instance.transform * vertex.position;
-        world.x = -world.x;
-        gl_MeshVerticesEXT[vertexIndex].gl_Position = camera.viewProjection * world;
-        vec3 worldNormal = mat3(instance.transform) * vertex.normalAndColor.xyz;
-        worldNormal.x = -worldNormal.x;
+        vec4 localPosition = vertex.position;
+        vec3 localNormal = vertex.normal;
+        vec4 skinWeights = unpackUnorm4x8(vertex.boneWeights);
+        float skinWeightSum = dot(skinWeights, vec4(1.0));
+        if (instance.skinRange.y != 0 && skinWeightSum > 0.0) {
+            skinWeights /= skinWeightSum;
+            uvec4 joints = uvec4(vertex.boneIndices & 255u,
+                (vertex.boneIndices >> 8) & 255u,
+                (vertex.boneIndices >> 16) & 255u,
+                (vertex.boneIndices >> 24) & 255u);
+            joints = min(joints, uvec4(instance.skinRange.y - 1u));
+            uint first = instance.skinRange.x;
+            mat4 skin = skinMatrices[first + joints.x] * skinWeights.x
+                + skinMatrices[first + joints.y] * skinWeights.y
+                + skinMatrices[first + joints.z] * skinWeights.z
+                + skinMatrices[first + joints.w] * skinWeights.w;
+            localPosition = skin * vertex.position;
+            localNormal = mat3(skin) * vertex.normal;
+        }
+        vec4 world = instance.transform * localPosition;
+        vec3 worldNormal = localNormal;
+        if (instance.meshletRange.w != 0) {
+            vec2 viewportSize = max(vec2(camera.counts.zw), vec2(1.0));
+            vec2 clip = vec2(vertex.position.x / viewportSize.x * 2.0 - 1.0,
+                1.0 - vertex.position.y / viewportSize.y * 2.0);
+            gl_MeshVerticesEXT[vertexIndex].gl_Position =
+                vec4(clip, vertex.position.z, 1.0);
+        } else {
+            world.x = -world.x;
+            world.xyz -= camera.worldOrigin.xyz;
+            gl_MeshVerticesEXT[vertexIndex].gl_Position = camera.viewProjection * world;
+            worldNormal = mat3(instance.transform) * localNormal;
+            worldNormal.x = -worldNormal.x;
+        }
         fragmentNormal[vertexIndex] = normalize(worldNormal);
         fragmentInstance[vertexIndex] = candidate.x;
         fragmentWorldPosition[vertexIndex] = world.xyz;
-        fragmentTexCoord[vertexIndex] = vertex.texCoord.xy;
+        fragmentTexCoord[vertexIndex] = vertex.texCoord;
         fragmentMaterial[vertexIndex] = meshlet.materialIndex;
-        vec3 blend = vec3(vertex.normalAndColor.w, vertex.texCoord.zw);
-        fragmentBlendWeights[vertexIndex] = vec4(blend, max(0.0, 1.0 - dot(blend, vec3(1.0))));
+        fragmentBlendWeights[vertexIndex] = unpackUnorm4x8(vertex.blendWeights);
+        fragmentBlendWeightsExtra[vertexIndex] = unpackUnorm4x8(vertex.blendWeightsExtra);
+        fragmentColor[vertexIndex] = unpackUnorm4x8(vertex.color);
     }
     for (uint primitiveIndex = gl_LocalInvocationIndex;
          primitiveIndex < meshlet.triangleCount; primitiveIndex += gl_WorkGroupSize.x) {
@@ -150,8 +207,8 @@ void main()
 #version 460
 #extension GL_EXT_nonuniform_qualifier : require
 
-struct Instance { mat4 transform; vec4 bounds; vec4 lodRange; uvec4 meshletRange; };
-struct Material { vec4 baseColor; uvec4 textureIndices; vec4 parameters; };
+struct Instance { mat4 transform; vec4 bounds; vec4 lodRange; uvec4 meshletRange; uvec4 skinRange; };
+struct Material { vec4 baseColor; uvec4 textureIndices; vec4 parameters; uvec4 extraTextureIndices; };
 layout(std430, binding = 3) readonly buffer Instances { Instance instances[]; };
 layout(std430, binding = 9) readonly buffer Materials { Material materials[]; };
 layout(std140, binding = 7) uniform Camera {
@@ -159,10 +216,11 @@ layout(std140, binding = 7) uniform Camera {
     mat4 lightViewProjection;
     vec4 planes[6];
     vec4 cameraPosition;
+    vec4 worldOrigin;
     uvec4 counts;
 } camera;
 layout(binding = 8) uniform sampler2DShadow shadowMap;
-layout(binding = 10) uniform sampler2D diffuseTextures[4096];
+layout(binding = 11) uniform sampler2D diffuseTextures[];
 
 layout(location = 0) in vec3 fragmentNormal;
 layout(location = 1) in flat uint fragmentInstance;
@@ -170,26 +228,35 @@ layout(location = 2) in vec3 fragmentWorldPosition;
 layout(location = 3) in vec2 fragmentTexCoord;
 layout(location = 4) in flat uint fragmentMaterial;
 layout(location = 5) in vec4 fragmentBlendWeights;
+layout(location = 6) in vec4 fragmentBlendWeightsExtra;
+layout(location = 7) in vec4 fragmentColor;
 layout(location = 0) out vec4 outputColor;
 
-float hash12(vec2 point)
+float interleavedGradientNoise(vec2 pixel)
 {
-    vec3 p3 = fract(vec3(point.xyx) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
+    return fract(52.9829189 * fract(
+        0.06711056 * pixel.x + 0.00583715 * pixel.y));
 }
 
 void main()
 {
     Instance instance = instances[fragmentInstance];
-    float distanceToCamera = distance(camera.cameraPosition.xyz, instance.bounds.xyz);
+    Material material = materials[fragmentMaterial];
+    if (instance.meshletRange.w != 0) {
+        outputColor = material.baseColor;
+        return;
+    }
+    float distanceToCamera = distance(
+        camera.cameraPosition.xz, fragmentWorldPosition.xz);
     float fadeIn = instance.lodRange.y <= instance.lodRange.x
         ? step(instance.lodRange.x, distanceToCamera)
         : smoothstep(instance.lodRange.x, instance.lodRange.y, distanceToCamera);
     float fadeOut = instance.lodRange.w <= instance.lodRange.z
         ? 1.0 - step(instance.lodRange.z, distanceToCamera)
         : 1.0 - smoothstep(instance.lodRange.z, instance.lodRange.w, distanceToCamera);
-    if (hash12(gl_FragCoord.xy) > fadeIn * fadeOut)
+    float noise = interleavedGradientNoise(gl_FragCoord.xy);
+    if ((fadeIn < 1.0 && noise < 1.0 - fadeIn)
+        || (fadeOut < 1.0 && noise > fadeOut))
         discard;
 
     vec3 normal = normalize(fragmentNormal);
@@ -208,30 +275,67 @@ void main()
         shadow /= 9.0;
     }
     float diffuse = max(dot(normal, lightDirection), 0.0) * mix(0.3, 1.0, shadow);
-    Material material = materials[fragmentMaterial];
+    bool terrain = material.parameters.z > 0.5 && material.parameters.z < 1.5;
+    bool terrainLod = material.parameters.z > 1.5 && material.parameters.z < 2.5;
+    bool water = material.parameters.z > 2.5;
     vec4 textureSample;
-    if (material.parameters.z > 0.5) {
+    if (water) {
+        textureSample = vec4(1.0);
+    } else if (terrain) {
         vec4 weights = max(fragmentBlendWeights, vec4(0.0));
-        weights /= max(dot(weights, vec4(1.0)), 0.0001);
+        vec4 extraWeights = max(fragmentBlendWeightsExtra, vec4(0.0));
+        float weightSum = dot(weights, vec4(1.0)) + dot(extraWeights, vec4(1.0));
+        if (weightSum > 0.0001) {
+            weights /= weightSum;
+            extraWeights /= weightSum;
+        } else {
+            weights = vec4(1.0, 0.0, 0.0, 0.0);
+        }
         textureSample =
             texture(diffuseTextures[nonuniformEXT(material.textureIndices.x)], fragmentTexCoord) * weights.x
             + texture(diffuseTextures[nonuniformEXT(material.textureIndices.y)], fragmentTexCoord) * weights.y
             + texture(diffuseTextures[nonuniformEXT(material.textureIndices.z)], fragmentTexCoord) * weights.z
-            + texture(diffuseTextures[nonuniformEXT(material.textureIndices.w)], fragmentTexCoord) * weights.w;
+            + texture(diffuseTextures[nonuniformEXT(material.textureIndices.w)], fragmentTexCoord) * weights.w
+            + texture(diffuseTextures[nonuniformEXT(material.extraTextureIndices.x)], fragmentTexCoord) * extraWeights.x
+            + texture(diffuseTextures[nonuniformEXT(material.extraTextureIndices.y)], fragmentTexCoord) * extraWeights.y
+            + texture(diffuseTextures[nonuniformEXT(material.extraTextureIndices.z)], fragmentTexCoord) * extraWeights.z
+            + texture(diffuseTextures[nonuniformEXT(material.extraTextureIndices.w)], fragmentTexCoord) * extraWeights.w;
     } else {
         textureSample = texture(
             diffuseTextures[nonuniformEXT(material.textureIndices.x)], fragmentTexCoord);
     }
-    if (material.parameters.y > 0.0 && textureSample.a < material.parameters.y)
+    float opacity = (terrainLod || water)
+        ? 1.0 : textureSample.a * material.baseColor.a * fragmentColor.a;
+    if (material.parameters.y > 0.0 && opacity < material.parameters.y)
         discard;
     vec3 sampled = textureSample.rgb;
-    if (material.textureIndices.w != 0u && material.textureIndices.z != 0u) {
+    if (!terrain && material.textureIndices.w != 0u && material.textureIndices.z != 0u) {
         float gray = dot(sampled, vec3(0.333333));
         sampled = textureLod(diffuseTextures[nonuniformEXT(material.textureIndices.z)],
             vec2(gray, 1.0 - material.parameters.x), 0.0).rgb;
     }
-    vec3 base = sampled * material.baseColor.rgb;
-    outputColor = vec4(base * (0.18 + diffuse * 0.82), 1.0);
+    vec3 base = sampled * material.baseColor.rgb * fragmentColor.rgb;
+    vec3 color;
+    if (water) {
+        vec3 viewDirection = normalize(camera.cameraPosition.xyz - fragmentWorldPosition);
+        vec3 absolutePosition = fragmentWorldPosition + camera.worldOrigin.xyz;
+        vec3 waterNormal = normalize(vec3(
+            sin(absolutePosition.x * 0.0021) * 0.06,
+            1.0,
+            cos(absolutePosition.z * 0.0017) * 0.06));
+        float fresnel = pow(1.0 - clamp(dot(waterNormal, viewDirection), 0.0, 1.0), 5.0);
+        float highlight = pow(max(dot(reflect(-lightDirection, waterNormal),
+            viewDirection), 0.0), 96.0);
+        color = mix(vec3(0.025, 0.10, 0.14), vec3(0.28, 0.46, 0.58),
+            0.12 + fresnel * 0.78) + highlight * 0.45;
+    } else {
+        color = base * (terrainLod
+            ? 0.1 + max(dot(normal, lightDirection), 0.0)
+            : 0.18 + diffuse * 0.82);
+    }
+    if (terrainLod)
+        color *= color * color + 1.0;
+    outputColor = vec4(color, opacity);
 }
 )";
 
@@ -242,28 +346,58 @@ void main()
 layout(local_size_x = 32) in;
 layout(triangles, max_vertices = 64, max_primitives = 124) out;
 
-struct Vertex { vec4 position; vec4 normalAndColor; vec4 texCoord; };
+struct Vertex { vec4 position; vec3 normal; uint blendWeights; vec2 texCoord; uint blendWeightsExtra; uint color; uint boneIndices; uint boneWeights; uvec2 padding; };
 struct Meshlet { uint vertexOffset; uint indexOffset; uint vertexCount; uint triangleCount; vec4 sphere; uint materialIndex; uint padding0; uint padding1; uint padding2; };
-struct Instance { mat4 transform; vec4 bounds; vec4 lodRange; uvec4 meshletRange; };
+struct Instance { mat4 transform; vec4 bounds; vec4 lodRange; uvec4 meshletRange; uvec4 skinRange; };
 layout(std430, binding = 0) readonly buffer Vertices { Vertex vertices[]; };
 layout(std430, binding = 1) readonly buffer Indices { uint indices[]; };
 layout(std430, binding = 2) readonly buffer Meshlets { Meshlet meshlets[]; };
 layout(std430, binding = 3) readonly buffer Instances { Instance instances[]; };
 layout(std430, binding = 5) readonly buffer Visible { uvec2 visible[]; };
-layout(push_constant) uniform ShadowPush { mat4 lightViewProjection; } shadow;
+layout(std140, binding = 7) uniform Camera {
+    mat4 viewProjection;
+    mat4 lightViewProjection;
+    vec4 planes[6];
+    vec4 cameraPosition;
+    vec4 worldOrigin;
+    uvec4 counts;
+} camera;
+layout(std430, binding = 10) readonly buffer SkinMatrices { mat4 skinMatrices[]; };
 
 void main()
 {
     uvec2 candidate = visible[gl_WorkGroupID.x];
     Instance instance = instances[candidate.x];
     Meshlet meshlet = meshlets[candidate.y];
+    if (instance.meshletRange.w != 0) {
+        SetMeshOutputsEXT(0, 0);
+        return;
+    }
     SetMeshOutputsEXT(meshlet.vertexCount, meshlet.triangleCount);
     for (uint vertexIndex = gl_LocalInvocationIndex;
          vertexIndex < meshlet.vertexCount; vertexIndex += gl_WorkGroupSize.x) {
         Vertex vertex = vertices[meshlet.vertexOffset + vertexIndex];
-        vec4 world = instance.transform * vertex.position;
+        vec4 localPosition = vertex.position;
+        vec4 skinWeights = unpackUnorm4x8(vertex.boneWeights);
+        float skinWeightSum = dot(skinWeights, vec4(1.0));
+        if (instance.skinRange.y != 0 && skinWeightSum > 0.0) {
+            skinWeights /= skinWeightSum;
+            uvec4 joints = uvec4(vertex.boneIndices & 255u,
+                (vertex.boneIndices >> 8) & 255u,
+                (vertex.boneIndices >> 16) & 255u,
+                (vertex.boneIndices >> 24) & 255u);
+            joints = min(joints, uvec4(instance.skinRange.y - 1u));
+            uint first = instance.skinRange.x;
+            mat4 skin = skinMatrices[first + joints.x] * skinWeights.x
+                + skinMatrices[first + joints.y] * skinWeights.y
+                + skinMatrices[first + joints.z] * skinWeights.z
+                + skinMatrices[first + joints.w] * skinWeights.w;
+            localPosition = skin * vertex.position;
+        }
+        vec4 world = instance.transform * localPosition;
         world.x = -world.x;
-        gl_MeshVerticesEXT[vertexIndex].gl_Position = shadow.lightViewProjection * world;
+        world.xyz -= camera.worldOrigin.xyz;
+        gl_MeshVerticesEXT[vertexIndex].gl_Position = camera.lightViewProjection * world;
     }
     for (uint primitiveIndex = gl_LocalInvocationIndex;
          primitiveIndex < meshlet.triangleCount; primitiveIndex += gl_WorkGroupSize.x) {
@@ -279,6 +413,11 @@ void main()
             if (result != VK_SUCCESS)
                 throw std::runtime_error(std::string(operation) + " failed with Vulkan error "
                     + std::to_string(result));
+        }
+
+        VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment)
+        {
+            return alignment == 0 ? value : (value + alignment - 1) / alignment * alignment;
         }
 
         struct Buffer
@@ -303,7 +442,13 @@ void main()
             VkImageView view = VK_NULL_HANDLE;
             VmaAllocation allocation = VK_NULL_HANDLE;
             VkDeviceMemory sparseMemory = VK_NULL_HANDLE;
+            std::vector<VkSparseImageMemoryBind> imageBinds;
+            std::vector<VkSparseMemoryBind> opaqueBinds;
+            VkDeviceSize virtualBytes = 0;
+            VkDeviceSize residentBytes = 0;
+            std::uint32_t firstResidentMip = 0;
             bool sparse = false;
+            bool sparseBound = false;
         };
 
         struct alignas(16) GpuInstance
@@ -312,6 +457,7 @@ void main()
             glm::vec4 bounds{};
             glm::vec4 lodRange{};
             glm::uvec4 meshletRange{};
+            glm::uvec4 skinRange{};
         };
 
         struct alignas(16) GpuMaterial
@@ -319,6 +465,7 @@ void main()
             glm::vec4 baseColor{1.0f};
             glm::uvec4 textureIndices{};
             glm::vec4 parameters{};
+            glm::uvec4 extraTextureIndices{};
         };
 
         struct alignas(16) CameraData
@@ -327,24 +474,27 @@ void main()
             glm::mat4 lightViewProjection{1.0f};
             std::array<glm::vec4, 6> planes{};
             glm::vec4 cameraPosition{};
+            glm::vec4 worldOrigin{};
             glm::uvec4 counts{};
         };
 
-        static_assert(sizeof(GpuVertex) == 48);
+        static_assert(sizeof(GpuVertex) == 64);
         static_assert(sizeof(GpuMeshlet) == 48);
-        static_assert(sizeof(GpuInstance) == 112);
-        static_assert(sizeof(GpuMaterial) == 48);
-        static_assert(sizeof(CameraData) == 256);
+        static_assert(sizeof(GpuInstance) == 128);
+        static_assert(sizeof(GpuMaterial) == 64);
+        static_assert(sizeof(CameraData) == 272);
 
         static GpuMaterial makeGpuMaterial(const SceneMaterial& material)
         {
             if (material.terrain)
                 return {material.baseColor, material.terrainTextures,
-                    glm::vec4(0.0f, 0.0f, 1.0f, 0.0f)};
+                    glm::vec4(0.0f, 0.0f, 1.0f, 0.0f), material.terrainTexturesExtra};
             return {material.baseColor,
                 glm::uvec4(material.diffuseTexture, material.normalTexture,
                     material.grayscaleTexture, material.grayscaleToPalette ? 1u : 0u),
-                glm::vec4(material.grayscaleToPaletteScale, material.alphaCutoff, 0.0f, 0.0f)};
+                glm::vec4(material.grayscaleToPaletteScale, material.alphaCutoff,
+                    material.water ? 3.0f : (material.terrainLod ? 2.0f : 0.0f),
+                    material.decal ? 1.0f : 0.0f), {}};
         }
 
         std::vector<std::uint32_t> compileShader(
@@ -388,11 +538,14 @@ void main()
             VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
             VkFence fence = VK_NULL_HANDLE;
             VkSemaphore acquired = VK_NULL_HANDLE;
+            VkSemaphore sparseReady = VK_NULL_HANDLE;
             VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
             Buffer uniform;
             Buffer visible;
             Buffer indirect;
+            std::vector<Buffer> retiredUploads;
             bool submitted = false;
+            std::uint64_t descriptorGeneration = 0;
         };
 
         SDL_Window* window = nullptr;
@@ -421,6 +574,7 @@ void main()
         VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
         VkPipeline computePipeline = VK_NULL_HANDLE;
         VkPipeline graphicsPipeline = VK_NULL_HANDLE;
+        VkPipeline decalPipeline = VK_NULL_HANDLE;
         VkPipeline shadowPipeline = VK_NULL_HANDLE;
         VkQueryPool queryPool = VK_NULL_HANDLE;
         PFN_vkCmdDrawMeshTasksIndirectEXT drawMeshTasksIndirect = nullptr;
@@ -431,6 +585,7 @@ void main()
         Buffer instances;
         Buffer sources;
         Buffer materials;
+        Buffer skinMatrices;
         DepthTarget shadowTarget;
         VkSampler shadowSampler = VK_NULL_HANDLE;
         VkSampler textureSampler = VK_NULL_HANDLE;
@@ -446,6 +601,25 @@ void main()
         std::uint32_t meshletCount = 0;
         std::uint32_t instanceCount = 0;
         std::uint32_t materialCount = 0;
+        std::vector<GpuInstance> instanceData;
+        std::vector<GpuMeshlet> meshletData;
+        std::vector<GpuVertex> pendingVertices;
+        std::vector<std::uint32_t> pendingIndices;
+        std::vector<GpuMeshlet> pendingMeshlets;
+        std::vector<GpuInstance> pendingInstances;
+        std::vector<std::uint32_t> pendingInstanceUpdates;
+        std::vector<glm::uvec2> pendingSources;
+        std::vector<GpuMaterial> pendingMaterials;
+        std::vector<SceneTexture> pendingTextures;
+        struct MeshPatch
+        {
+            MeshRange range;
+            PackedMesh mesh;
+        };
+        std::vector<MeshPatch> pendingMeshPatches;
+        std::vector<glm::mat4> skinData{glm::mat4(1.0f)};
+        bool skinDataDirty = false;
+        std::uint64_t descriptorGeneration = 1;
         float timestampPeriod = 1.0f;
         std::string gpuName;
         RendererStats rendererStats;
@@ -487,6 +661,8 @@ void main()
                 vkDestroyQueryPool(device, queryPool, nullptr);
             if (graphicsPipeline)
                 vkDestroyPipeline(device, graphicsPipeline, nullptr);
+            if (decalPipeline)
+                vkDestroyPipeline(device, decalPipeline, nullptr);
             if (shadowPipeline)
                 vkDestroyPipeline(device, shadowPipeline, nullptr);
             if (computePipeline)
@@ -499,17 +675,22 @@ void main()
                 vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
             for (auto& frame : frames)
             {
+                for (auto& upload : frame.retiredUploads)
+                    destroyBuffer(upload);
                 destroyBuffer(frame.indirect);
                 destroyBuffer(frame.visible);
                 destroyBuffer(frame.uniform);
                 if (frame.acquired)
                     vkDestroySemaphore(device, frame.acquired, nullptr);
+                if (frame.sparseReady)
+                    vkDestroySemaphore(device, frame.sparseReady, nullptr);
                 if (frame.fence)
                     vkDestroyFence(device, frame.fence, nullptr);
             }
             destroyBuffer(sources);
             destroyBuffer(instances);
             destroyBuffer(materials);
+            destroyBuffer(skinMatrices);
             destroyBuffer(meshlets);
             destroyBuffer(indices);
             destroyBuffer(vertices);
@@ -774,6 +955,11 @@ void main()
             return true;
         }
 
+        static VkDeviceSize streamingBufferCapacity(VkDeviceSize populatedSize)
+        {
+            return std::max<VkDeviceSize>(populatedSize * 2, 256);
+        }
+
         void uploadBytes(Buffer& destination, VkDeviceSize offset, const void* data, VkDeviceSize size)
         {
             if (size == 0)
@@ -944,7 +1130,7 @@ void main()
         void replaceDescriptorPool(std::uint32_t capacity)
         {
             const std::array sizes{
-                VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, frameCount * 8},
+                VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, frameCount * 9},
                 VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frameCount},
                 VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     frameCount * (capacity + 1)}
@@ -989,7 +1175,7 @@ void main()
 
         void createDescriptorResources(std::uint32_t initialTextureCount)
         {
-            std::array<VkDescriptorSetLayoutBinding, 11> bindings{};
+            std::array<VkDescriptorSetLayoutBinding, 12> bindings{};
             for (std::uint32_t index = 0; index < 7; ++index)
             {
                 bindings[index].binding = index;
@@ -1010,13 +1196,17 @@ void main()
             bindings[9].binding = 9;
             bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             bindings[9].descriptorCount = 1;
-            bindings[9].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            bindings[9].stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
             bindings[10].binding = 10;
-            bindings[10].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            bindings[10].descriptorCount = maxSceneTextures;
-            bindings[10].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            bindings[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[10].descriptorCount = 1;
+            bindings[10].stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT;
+            bindings[11].binding = 11;
+            bindings[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            bindings[11].descriptorCount = maxSceneTextures;
+            bindings[11].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
             std::array<VkDescriptorBindingFlags, bindings.size()> bindingFlags{};
-            bindingFlags[10] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
+            bindingFlags[11] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
                 | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
             VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo{
                 VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
@@ -1034,11 +1224,6 @@ void main()
             VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
             pipelineLayoutInfo.setLayoutCount = 1;
             pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
-            VkPushConstantRange pushConstant{};
-            pushConstant.stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT;
-            pushConstant.size = sizeof(glm::mat4);
-            pipelineLayoutInfo.pushConstantRangeCount = 1;
-            pipelineLayoutInfo.pPushConstantRanges = &pushConstant;
             check(vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout),
                 "vkCreatePipelineLayout");
         }
@@ -1054,8 +1239,8 @@ void main()
         {
             if (mesh.meshlets.empty() || sceneInstances.empty())
                 throw std::runtime_error("The renderer needs at least one meshlet and one instance");
-            std::vector<GpuInstance> gpuInstances;
-            gpuInstances.reserve(sceneInstances.size());
+            instanceData.clear();
+            instanceData.reserve(sceneInstances.size());
             std::vector<GpuMaterial> gpuMaterials;
             if (sceneMaterials.empty())
                 gpuMaterials.push_back({glm::vec4(0.7f, 0.72f, 0.68f, 1.0f), glm::uvec4(0), {}});
@@ -1076,8 +1261,10 @@ void main()
                     throw std::runtime_error("Scene instance meshlet range is out of bounds");
                 glm::vec4 worldBounds = source.bounds;
                 worldBounds.x = -worldBounds.x;
-                gpuInstances.push_back({source.transform, worldBounds, source.lodRange,
-                    glm::uvec4(meshletOffset, rangeMeshletCount, 0, 0)});
+                instanceData.push_back({source.transform, worldBounds, source.lodRange,
+                    glm::uvec4(meshletOffset, rangeMeshletCount, source.active ? 1u : 0u,
+                        source.overlay ? 1u : 0u),
+                    glm::uvec4(source.skinOffset, source.skinCount, 0u, 0u)});
                 sceneMinimum = glm::min(sceneMinimum, glm::vec3(worldBounds) - worldBounds.w);
                 sceneMaximum = glm::max(sceneMaximum, glm::vec3(worldBounds) + worldBounds.w);
             }
@@ -1087,7 +1274,7 @@ void main()
             candidateSources.reserve(sceneInstances.size() * mesh.meshlets.size());
             for (std::uint32_t instanceIndex = 0; instanceIndex < sceneInstances.size(); ++instanceIndex)
             {
-                const auto& range = gpuInstances[instanceIndex].meshletRange;
+                const auto& range = instanceData[instanceIndex].meshletRange;
                 for (std::uint32_t meshletIndex = range.x; meshletIndex < range.x + range.y; ++meshletIndex)
                     candidateSources.emplace_back(instanceIndex, meshletIndex);
             }
@@ -1095,34 +1282,40 @@ void main()
             vertexCount = static_cast<std::uint32_t>(mesh.vertices.size());
             indexCount = static_cast<std::uint32_t>(mesh.indices.size());
             meshletCount = static_cast<std::uint32_t>(mesh.meshlets.size());
-            instanceCount = static_cast<std::uint32_t>(gpuInstances.size());
+            meshletData = mesh.meshlets;
+            instanceCount = static_cast<std::uint32_t>(instanceData.size());
             materialCount = static_cast<std::uint32_t>(gpuMaterials.size());
             rendererStats.sourceCandidates = candidateCount;
 
-            vertices = createBuffer(byteSize(std::span(mesh.vertices)),
+            vertices = createBuffer(streamingBufferCapacity(byteSize(std::span(mesh.vertices))),
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                     | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            indices = createBuffer(byteSize(std::span(mesh.indices)),
+            indices = createBuffer(streamingBufferCapacity(byteSize(std::span(mesh.indices))),
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                     | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            meshlets = createBuffer(byteSize(std::span(mesh.meshlets)),
+            meshlets = createBuffer(streamingBufferCapacity(byteSize(std::span(mesh.meshlets))),
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                     | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            instances = createBuffer(byteSize(std::span(gpuInstances)),
+            instances = createBuffer(streamingBufferCapacity(byteSize(std::span(instanceData))),
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                     | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            sources = createBuffer(byteSize(std::span(candidateSources)),
+            sources = createBuffer(streamingBufferCapacity(byteSize(std::span(candidateSources))),
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                     | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            materials = createBuffer(byteSize(std::span(gpuMaterials)),
+            materials = createBuffer(streamingBufferCapacity(byteSize(std::span(gpuMaterials))),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                    | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            skinMatrices = createBuffer(streamingBufferCapacity(byteSize(std::span(skinData))),
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                     | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
 
-            const std::array destinations{&vertices, &indices, &meshlets, &instances, &sources, &materials};
+            const std::array destinations{
+                &vertices, &indices, &meshlets, &instances, &sources, &materials, &skinMatrices};
             const std::array sizes{
                 byteSize(std::span(mesh.vertices)), byteSize(std::span(mesh.indices)),
-                byteSize(std::span(mesh.meshlets)), byteSize(std::span(gpuInstances)),
-                byteSize(std::span(candidateSources)), byteSize(std::span(gpuMaterials))
+                byteSize(std::span(mesh.meshlets)), byteSize(std::span(instanceData)),
+                byteSize(std::span(candidateSources)), byteSize(std::span(gpuMaterials)),
+                byteSize(std::span(skinData))
             };
             std::array<VkDeviceSize, destinations.size()> offsets{};
             VkDeviceSize totalSize = 0;
@@ -1135,8 +1328,9 @@ void main()
             Buffer staging = createBuffer(totalSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
             const std::array sourceData{
                 static_cast<const void*>(mesh.vertices.data()), static_cast<const void*>(mesh.indices.data()),
-                static_cast<const void*>(mesh.meshlets.data()), static_cast<const void*>(gpuInstances.data()),
-                static_cast<const void*>(candidateSources.data()), static_cast<const void*>(gpuMaterials.data())
+                static_cast<const void*>(mesh.meshlets.data()), static_cast<const void*>(instanceData.data()),
+                static_cast<const void*>(candidateSources.data()), static_cast<const void*>(gpuMaterials.data()),
+                static_cast<const void*>(skinData.data())
             };
             for (std::size_t index = 0; index < sizes.size(); ++index)
                 std::memcpy(static_cast<std::byte*>(staging.mapped) + offsets[index], sourceData[index], sizes[index]);
@@ -1178,7 +1372,7 @@ void main()
             {
                 frame.uniform = createBuffer(sizeof(CameraData), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
                 frame.visible = createBuffer(
-                    std::max<VkDeviceSize>(candidateCount * sizeof(glm::uvec2), sizeof(glm::uvec2)),
+                    streamingBufferCapacity(candidateCount * sizeof(glm::uvec2)),
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
                 frame.indirect = createBuffer(sizeof(VkDrawMeshTasksIndirectCommandEXT),
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT
@@ -1189,6 +1383,8 @@ void main()
                 check(vkCreateFence(device, &fenceInfo, nullptr, &frame.fence), "vkCreateFence");
                 VkSemaphoreCreateInfo semaphoreInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
                 check(vkCreateSemaphore(device, &semaphoreInfo, nullptr, &frame.acquired), "vkCreateSemaphore");
+                check(vkCreateSemaphore(device, &semaphoreInfo, nullptr, &frame.sparseReady),
+                    "vkCreateSemaphore sparse-ready");
             }
         }
 
@@ -1265,7 +1461,17 @@ void main()
             throw std::runtime_error("No compatible Vulkan memory type was found");
         }
 
-        TextureTarget createTextureTarget(const SceneTexture& texture)
+        bool sparseTextureFormatSupported(VkFormat format) const
+        {
+            std::uint32_t count = 0;
+            vkGetPhysicalDeviceSparseImageFormatProperties(physicalDevice, format,
+                VK_IMAGE_TYPE_2D, VK_SAMPLE_COUNT_1_BIT,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_IMAGE_TILING_OPTIMAL, &count, nullptr);
+            return count != 0;
+        }
+
+        TextureTarget createTextureTarget(const SceneTexture& texture, bool allowSparse = true)
         {
             TextureTarget target;
             const VkFormat format = textureFormat(texture.format);
@@ -1279,99 +1485,125 @@ void main()
             imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
             imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 
-            std::uint32_t sparseFormatCount = 0;
-            if (sparseTexturesSupported && texture.width >= 1024 && texture.height >= 1024)
-                vkGetPhysicalDeviceSparseImageFormatProperties(physicalDevice, format,
-                    VK_IMAGE_TYPE_2D, VK_SAMPLE_COUNT_1_BIT, imageInfo.usage,
-                    VK_IMAGE_TILING_OPTIMAL, &sparseFormatCount, nullptr);
-            target.sparse = sparseFormatCount > 0;
-            if (target.sparse)
+            const std::uint32_t cappedMip = detail::sparseFirstResidentMip(
+                texture.width, texture.height, texture.mipLevels, texture.mipLevels);
+            const bool attemptSparse = allowSparse && sparseTexturesSupported && cappedMip != 0
+                && sparseTextureFormatSupported(format);
+            if (attemptSparse)
             {
-                ++rendererStats.sparseTextures;
-                imageInfo.flags = VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
-                check(vkCreateImage(device, &imageInfo, nullptr, &target.image), "vkCreateImage sparse texture");
-
-                std::uint32_t requirementCount = 0;
-                vkGetImageSparseMemoryRequirements(device, target.image, &requirementCount, nullptr);
-                std::vector<VkSparseImageMemoryRequirements> sparseRequirements(requirementCount);
-                vkGetImageSparseMemoryRequirements(
-                    device, target.image, &requirementCount, sparseRequirements.data());
-                const auto requirement = std::find_if(sparseRequirements.begin(), sparseRequirements.end(),
-                    [](const auto& value) {
-                        return value.formatProperties.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
-                    });
-                if (requirement == sparseRequirements.end())
-                    throw std::runtime_error("Sparse texture has no color memory requirement");
-
-                VkMemoryRequirements memoryRequirements{};
-                vkGetImageMemoryRequirements(device, target.image, &memoryRequirements);
-                std::vector<VkSparseImageMemoryBind> imageBinds;
-                VkDeviceSize memorySize = 0;
-                const VkExtent3D granularity = requirement->formatProperties.imageGranularity;
-                for (std::uint32_t mip = 0; mip < requirement->imageMipTailFirstLod; ++mip)
+                imageInfo.flags = VK_IMAGE_CREATE_SPARSE_BINDING_BIT
+                    | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
+                if (vkCreateImage(device, &imageInfo, nullptr, &target.image) == VK_SUCCESS)
                 {
-                    const VkExtent3D mipExtent{
-                        std::max(1u, texture.width >> mip), std::max(1u, texture.height >> mip), 1};
-                    const VkDeviceSize blockCount =
-                        ((mipExtent.width + granularity.width - 1) / granularity.width)
-                        * ((mipExtent.height + granularity.height - 1) / granularity.height);
-                    memorySize = (memorySize + memoryRequirements.alignment - 1)
-                        & ~(memoryRequirements.alignment - 1);
-                    VkSparseImageMemoryBind bind{};
-                    bind.subresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0};
-                    bind.extent = mipExtent;
-                    bind.memoryOffset = memorySize;
-                    imageBinds.push_back(bind);
-                    memorySize += blockCount * memoryRequirements.alignment;
-                }
-                memorySize = (memorySize + memoryRequirements.alignment - 1)
-                    & ~(memoryRequirements.alignment - 1);
-                VkSparseMemoryBind tailBind{};
-                const bool hasTail = requirement->imageMipTailFirstLod < texture.mipLevels;
-                if (hasTail)
-                {
-                    tailBind.resourceOffset = requirement->imageMipTailOffset;
-                    tailBind.size = requirement->imageMipTailSize;
-                    tailBind.memoryOffset = memorySize;
-                    memorySize += requirement->imageMipTailSize;
-                }
+                    VkMemoryRequirements memoryRequirements{};
+                    vkGetImageMemoryRequirements(device, target.image, &memoryRequirements);
+                    std::uint32_t sparseCount = 0;
+                    vkGetImageSparseMemoryRequirements(
+                        device, target.image, &sparseCount, nullptr);
+                    std::vector<VkSparseImageMemoryRequirements> sparseRequirements(sparseCount);
+                    if (sparseCount != 0)
+                        vkGetImageSparseMemoryRequirements(device, target.image,
+                            &sparseCount, sparseRequirements.data());
 
-                VkMemoryAllocateInfo allocationInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-                allocationInfo.allocationSize = memorySize;
-                allocationInfo.memoryTypeIndex = findMemoryType(
-                    memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                check(vkAllocateMemory(device, &allocationInfo, nullptr, &target.sparseMemory),
-                    "vkAllocateMemory sparse texture");
-                for (auto& bind : imageBinds)
-                    bind.memory = target.sparseMemory;
-                tailBind.memory = target.sparseMemory;
-
-                VkSparseImageMemoryBindInfo imageBindInfo{};
-                imageBindInfo.image = target.image;
-                imageBindInfo.bindCount = static_cast<std::uint32_t>(imageBinds.size());
-                imageBindInfo.pBinds = imageBinds.data();
-                VkSparseImageOpaqueMemoryBindInfo opaqueBindInfo{};
-                opaqueBindInfo.image = target.image;
-                opaqueBindInfo.bindCount = hasTail ? 1u : 0u;
-                opaqueBindInfo.pBinds = hasTail ? &tailBind : nullptr;
-                VkBindSparseInfo bindInfo{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
-                bindInfo.imageBindCount = imageBinds.empty() ? 0u : 1u;
-                bindInfo.pImageBinds = imageBinds.empty() ? nullptr : &imageBindInfo;
-                bindInfo.imageOpaqueBindCount = hasTail ? 1u : 0u;
-                bindInfo.pImageOpaqueBinds = hasTail ? &opaqueBindInfo : nullptr;
-                VkFence fence = VK_NULL_HANDLE;
-                VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-                check(vkCreateFence(device, &fenceInfo, nullptr, &fence), "vkCreateFence sparse texture");
-                check(vkQueueBindSparse(queue, 1, &bindInfo, fence), "vkQueueBindSparse");
-                check(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "sparse texture fence");
-                vkDestroyFence(device, fence, nullptr);
+                    const VkSparseImageMemoryRequirements* color = nullptr;
+                    for (const auto& requirement : sparseRequirements)
+                    {
+                        if (requirement.formatProperties.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
+                        {
+                            color = &requirement;
+                            break;
+                        }
+                    }
+                    if (color && color->formatProperties.imageGranularity.width != 0
+                        && color->formatProperties.imageGranularity.height != 0)
+                    {
+                        target.firstResidentMip = detail::sparseFirstResidentMip(
+                            texture.width, texture.height, texture.mipLevels,
+                            color->imageMipTailFirstLod);
+                        VkDeviceSize memoryOffset = 0;
+                        const VkExtent3D granularity = color->formatProperties.imageGranularity;
+                        const std::uint32_t firstTailMip = std::min(
+                            color->imageMipTailFirstLod, texture.mipLevels);
+                        for (std::uint32_t mip = target.firstResidentMip;
+                            mip < firstTailMip; ++mip)
+                        {
+                            const VkExtent3D mipExtent{
+                                std::max(1u, texture.width >> mip),
+                                std::max(1u, texture.height >> mip), 1};
+                            for (std::uint32_t y = 0; y < mipExtent.height; y += granularity.height)
+                            {
+                                for (std::uint32_t x = 0; x < mipExtent.width; x += granularity.width)
+                                {
+                                    VkSparseImageMemoryBind bind{};
+                                    bind.subresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0};
+                                    bind.offset = {
+                                        static_cast<std::int32_t>(x),
+                                        static_cast<std::int32_t>(y), 0};
+                                    bind.extent = {
+                                        std::min(granularity.width, mipExtent.width - x),
+                                        std::min(granularity.height, mipExtent.height - y), 1};
+                                    bind.memoryOffset = memoryOffset;
+                                    target.imageBinds.push_back(bind);
+                                    memoryOffset += memoryRequirements.alignment;
+                                }
+                            }
+                        }
+                        if (color->imageMipTailSize != 0)
+                        {
+                            memoryOffset = alignUp(memoryOffset, memoryRequirements.alignment);
+                            target.opaqueBinds.push_back({color->imageMipTailOffset,
+                                color->imageMipTailSize, VK_NULL_HANDLE, memoryOffset, 0});
+                            memoryOffset += color->imageMipTailSize;
+                        }
+                        for (const auto& requirement : sparseRequirements)
+                        {
+                            if (!(requirement.formatProperties.aspectMask & VK_IMAGE_ASPECT_METADATA_BIT)
+                                || requirement.imageMipTailSize == 0)
+                                continue;
+                            memoryOffset = alignUp(memoryOffset, memoryRequirements.alignment);
+                            target.opaqueBinds.push_back({requirement.imageMipTailOffset,
+                                requirement.imageMipTailSize, VK_NULL_HANDLE, memoryOffset,
+                                VK_SPARSE_MEMORY_BIND_METADATA_BIT});
+                            memoryOffset += requirement.imageMipTailSize;
+                        }
+                        memoryOffset = alignUp(memoryOffset, memoryRequirements.alignment);
+                        if (target.firstResidentMip != 0 && memoryOffset != 0
+                            && memoryOffset < memoryRequirements.size)
+                        {
+                            VkMemoryAllocateInfo allocationInfo{
+                                VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                            allocationInfo.allocationSize = memoryOffset;
+                            allocationInfo.memoryTypeIndex = findMemoryType(
+                                memoryRequirements.memoryTypeBits,
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                            check(vkAllocateMemory(device, &allocationInfo, nullptr,
+                                &target.sparseMemory), "vkAllocateMemory sparse texture pages");
+                            for (auto& bind : target.imageBinds)
+                                bind.memory = target.sparseMemory;
+                            for (auto& bind : target.opaqueBinds)
+                                bind.memory = target.sparseMemory;
+                            target.sparse = true;
+                            target.virtualBytes = memoryRequirements.size;
+                            target.residentBytes = memoryOffset;
+                        }
+                    }
+                }
             }
-            else
+
+            if (!target.sparse)
             {
+                if (target.image)
+                    vkDestroyImage(device, target.image, nullptr);
+                target = {};
+                imageInfo.flags = 0;
                 VmaAllocationCreateInfo allocationInfo{};
                 allocationInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
                 check(vmaCreateImage(allocator, &imageInfo, &allocationInfo,
                     &target.image, &target.allocation, nullptr), "vmaCreateImage texture");
+                VkMemoryRequirements memoryRequirements{};
+                vkGetImageMemoryRequirements(device, target.image, &memoryRequirements);
+                target.virtualBytes = memoryRequirements.size;
+                target.residentBytes = memoryRequirements.size;
             }
 
             VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1379,10 +1611,54 @@ void main()
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
             viewInfo.format = format;
             viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            viewInfo.subresourceRange.levelCount = texture.mipLevels;
+            viewInfo.subresourceRange.baseMipLevel = target.firstResidentMip;
+            viewInfo.subresourceRange.levelCount = texture.mipLevels - target.firstResidentMip;
             viewInfo.subresourceRange.layerCount = 1;
             check(vkCreateImageView(device, &viewInfo, nullptr, &target.view), "vkCreateImageView texture");
+            rendererStats.textureVirtualBytes += target.virtualBytes;
+            rendererStats.textureResidentBytes += target.residentBytes;
+            if (target.sparse)
+                ++rendererStats.sparseTextures;
             return target;
+        }
+
+        bool submitSparseBinds(std::span<TextureTarget*> targets,
+            VkSemaphore signalSemaphore = VK_NULL_HANDLE, VkFence fence = VK_NULL_HANDLE)
+        {
+            std::vector<VkSparseImageMemoryBindInfo> imageInfos;
+            std::vector<VkSparseImageOpaqueMemoryBindInfo> opaqueInfos;
+            std::vector<TextureTarget*> submitted;
+            for (TextureTarget* target : targets)
+            {
+                if (!target || !target->sparse || target->sparseBound)
+                    continue;
+                if (!target->imageBinds.empty())
+                    imageInfos.push_back({target->image,
+                        static_cast<std::uint32_t>(target->imageBinds.size()),
+                        target->imageBinds.data()});
+                if (!target->opaqueBinds.empty())
+                    opaqueInfos.push_back({target->image,
+                        static_cast<std::uint32_t>(target->opaqueBinds.size()),
+                        target->opaqueBinds.data()});
+                submitted.push_back(target);
+            }
+            if (submitted.empty())
+                return false;
+
+            VkBindSparseInfo bindInfo{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+            bindInfo.imageBindCount = static_cast<std::uint32_t>(imageInfos.size());
+            bindInfo.pImageBinds = imageInfos.data();
+            bindInfo.imageOpaqueBindCount = static_cast<std::uint32_t>(opaqueInfos.size());
+            bindInfo.pImageOpaqueBinds = opaqueInfos.data();
+            if (signalSemaphore)
+            {
+                bindInfo.signalSemaphoreCount = 1;
+                bindInfo.pSignalSemaphores = &signalSemaphore;
+            }
+            check(vkQueueBindSparse(queue, 1, &bindInfo, fence), "vkQueueBindSparse texture batch");
+            for (TextureTarget* target : submitted)
+                target->sparseBound = true;
+            return true;
         }
 
         void uploadTextures(std::span<const SceneTexture> sceneTextures)
@@ -1403,7 +1679,9 @@ void main()
 
             VkDeviceSize stagingSize = 0;
             std::vector<VkDeviceSize> stagingOffsets;
+            std::vector<std::size_t> sourceOffsets;
             stagingOffsets.reserve(textures.size());
+            sourceOffsets.reserve(textures.size());
             textureTargets.reserve(textures.size());
             rendererStats.residentTextures = static_cast<std::uint32_t>(textures.size());
             for (const SceneTexture* texture : textures)
@@ -1411,15 +1689,34 @@ void main()
                 if (texture->pixels.empty() || texture->width == 0 || texture->height == 0
                     || texture->mipLevels == 0 || texture->mipOffsets.size() < texture->mipLevels)
                     throw std::runtime_error("Scene texture has no image data");
+                textureTargets.push_back(createTextureTarget(*texture));
+                const auto& target = textureTargets.back();
+                const std::size_t sourceOffset = texture->mipOffsets[target.firstResidentMip];
+                if (sourceOffset >= texture->pixels.size())
+                    throw std::runtime_error("Scene texture resident mip data is truncated");
                 stagingSize = (stagingSize + 15) & ~VkDeviceSize(15);
                 stagingOffsets.push_back(stagingSize);
-                stagingSize += texture->pixels.size();
-                textureTargets.push_back(createTextureTarget(*texture));
+                sourceOffsets.push_back(sourceOffset);
+                stagingSize += texture->pixels.size() - sourceOffset;
             }
+            std::vector<TextureTarget*> sparseTargets;
+            sparseTargets.reserve(textureTargets.size());
+            for (auto& target : textureTargets)
+                sparseTargets.push_back(&target);
+            VkFence sparseFence = VK_NULL_HANDLE;
+            VkFenceCreateInfo sparseFenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            check(vkCreateFence(device, &sparseFenceInfo, nullptr, &sparseFence),
+                "vkCreateFence initial sparse batch");
+            if (submitSparseBinds(sparseTargets, VK_NULL_HANDLE, sparseFence))
+                check(vkWaitForFences(device, 1, &sparseFence, VK_TRUE, UINT64_MAX),
+                    "initial sparse texture batch");
+            vkDestroyFence(device, sparseFence, nullptr);
+
             Buffer staging = createBuffer(stagingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
             for (std::size_t index = 0; index < textures.size(); ++index)
                 std::memcpy(static_cast<std::byte*>(staging.mapped) + stagingOffsets[index],
-                    textures[index]->pixels.data(), textures[index]->pixels.size());
+                    textures[index]->pixels.data() + sourceOffsets[index],
+                    textures[index]->pixels.size() - sourceOffsets[index]);
             check(vmaFlushAllocation(allocator, staging.allocation, 0, VK_WHOLE_SIZE),
                 "vmaFlushAllocation textures");
 
@@ -1435,12 +1732,14 @@ void main()
             for (std::size_t index = 0; index < textures.size(); ++index)
             {
                 const SceneTexture& texture = *textures[index];
+                const TextureTarget& target = textureTargets[index];
                 imageBarrier(command, textureTargets[index].image, VK_IMAGE_LAYOUT_UNDEFINED,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
-                    texture.mipLevels);
-                for (std::uint32_t mip = 0; mip < texture.mipLevels; ++mip)
+                    texture.mipLevels - target.firstResidentMip, target.firstResidentMip);
+                for (std::uint32_t mip = target.firstResidentMip;
+                    mip < texture.mipLevels; ++mip)
                 {
-                    const std::uint32_t offset = texture.mipOffsets[mip];
+                    const std::size_t offset = texture.mipOffsets[mip] - sourceOffsets[index];
                     VkBufferImageCopy copy{};
                     copy.bufferOffset = stagingOffsets[index] + offset;
                     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
@@ -1452,7 +1751,7 @@ void main()
                 imageBarrier(command, textureTargets[index].image,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
-                    texture.mipLevels);
+                    texture.mipLevels - target.firstResidentMip, target.firstResidentMip);
             }
             check(vkEndCommandBuffer(command), "vkEndCommandBuffer textures");
             VkFence fence = VK_NULL_HANDLE;
@@ -1481,141 +1780,101 @@ void main()
                 "vkCreateSampler textures");
         }
 
+        void updateDescriptorSet(Frame& frame)
+        {
+            const std::array<VkDescriptorBufferInfo, 8> bufferInfos{
+                VkDescriptorBufferInfo{vertices.handle, 0, vertices.size},
+                VkDescriptorBufferInfo{indices.handle, 0, indices.size},
+                VkDescriptorBufferInfo{meshlets.handle, 0, meshlets.size},
+                VkDescriptorBufferInfo{instances.handle, 0, instances.size},
+                VkDescriptorBufferInfo{sources.handle, 0, sources.size},
+                VkDescriptorBufferInfo{frame.visible.handle, 0, frame.visible.size},
+                VkDescriptorBufferInfo{frame.indirect.handle, 0, frame.indirect.size},
+                VkDescriptorBufferInfo{frame.uniform.handle, 0, frame.uniform.size}
+            };
+            std::array<VkWriteDescriptorSet, 12> writes{};
+            for (std::uint32_t index = 0; index < 8; ++index)
+            {
+                writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[index].dstSet = frame.descriptorSet;
+                writes[index].dstBinding = index;
+                writes[index].descriptorCount = 1;
+                writes[index].descriptorType = index == 7
+                    ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                writes[index].pBufferInfo = &bufferInfos[index];
+            }
+            const VkDescriptorImageInfo imageInfo{
+                shadowSampler, shadowTarget.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[8].dstSet = frame.descriptorSet;
+            writes[8].dstBinding = 8;
+            writes[8].descriptorCount = 1;
+            writes[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[8].pImageInfo = &imageInfo;
+            std::vector<VkDescriptorImageInfo> textureInfos;
+            textureInfos.reserve(textureTargets.size());
+            for (const auto& texture : textureTargets)
+                textureInfos.push_back({textureSampler, texture.view,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+            writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[9].dstSet = frame.descriptorSet;
+            writes[9].dstBinding = 9;
+            const VkDescriptorBufferInfo materialInfo{materials.handle, 0, materials.size};
+            writes[9].descriptorCount = 1;
+            writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[9].pBufferInfo = &materialInfo;
+            writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[10].dstSet = frame.descriptorSet;
+            writes[10].dstBinding = 10;
+            const VkDescriptorBufferInfo skinInfo{skinMatrices.handle, 0, skinMatrices.size};
+            writes[10].descriptorCount = 1;
+            writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[10].pBufferInfo = &skinInfo;
+            writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[11].dstSet = frame.descriptorSet;
+            writes[11].dstBinding = 11;
+            writes[11].descriptorCount = static_cast<std::uint32_t>(textureInfos.size());
+            writes[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[11].pImageInfo = textureInfos.data();
+            vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            frame.descriptorGeneration = descriptorGeneration;
+        }
+
         void updateDescriptorSets()
         {
             for (auto& frame : frames)
-            {
-                const std::array<VkDescriptorBufferInfo, 8> bufferInfos{
-                    VkDescriptorBufferInfo{vertices.handle, 0, vertices.size},
-                    VkDescriptorBufferInfo{indices.handle, 0, indices.size},
-                    VkDescriptorBufferInfo{meshlets.handle, 0, meshlets.size},
-                    VkDescriptorBufferInfo{instances.handle, 0, instances.size},
-                    VkDescriptorBufferInfo{sources.handle, 0, sources.size},
-                    VkDescriptorBufferInfo{frame.visible.handle, 0, frame.visible.size},
-                    VkDescriptorBufferInfo{frame.indirect.handle, 0, frame.indirect.size},
-                    VkDescriptorBufferInfo{frame.uniform.handle, 0, frame.uniform.size}
-                };
-                std::array<VkWriteDescriptorSet, 11> writes{};
-                for (std::uint32_t index = 0; index < 8; ++index)
-                {
-                    writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                    writes[index].dstSet = frame.descriptorSet;
-                    writes[index].dstBinding = index;
-                    writes[index].descriptorCount = 1;
-                    writes[index].descriptorType = index == 7
-                        ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                    writes[index].pBufferInfo = &bufferInfos[index];
-                }
-                const VkDescriptorImageInfo imageInfo{
-                    shadowSampler, shadowTarget.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-                writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[8].dstSet = frame.descriptorSet;
-                writes[8].dstBinding = 8;
-                writes[8].descriptorCount = 1;
-                writes[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                writes[8].pImageInfo = &imageInfo;
-                std::vector<VkDescriptorImageInfo> textureInfos;
-                textureInfos.reserve(textureTargets.size());
-                for (const auto& texture : textureTargets)
-                    textureInfos.push_back({textureSampler, texture.view,
-                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
-                writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[9].dstSet = frame.descriptorSet;
-                writes[9].dstBinding = 9;
-                const VkDescriptorBufferInfo materialInfo{materials.handle, 0, materials.size};
-                writes[9].descriptorCount = 1;
-                writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                writes[9].pBufferInfo = &materialInfo;
-                writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[10].dstSet = frame.descriptorSet;
-                writes[10].dstBinding = 10;
-                writes[10].descriptorCount = static_cast<std::uint32_t>(textureInfos.size());
-                writes[10].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                writes[10].pImageInfo = textureInfos.data();
-                vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-            }
+                updateDescriptorSet(frame);
         }
 
         void ensureDescriptorCapacity(std::uint32_t required)
         {
             if (required <= descriptorCapacity)
                 return;
+            waitForFrames();
             replaceDescriptorPool(grownDescriptorCapacity(required));
+            ++descriptorGeneration;
             updateDescriptorSets();
         }
 
-        std::uint32_t appendTexture(const SceneTexture& texture)
+        std::uint32_t appendTexture(SceneTexture texture)
         {
             if (textureTargets.size() >= maxSceneTextures)
                 throw std::runtime_error("Scene exceeds the bindless texture capacity");
             if (texture.pixels.empty() || texture.width == 0 || texture.height == 0
                 || texture.mipLevels == 0 || texture.mipOffsets.size() < texture.mipLevels)
                 throw std::runtime_error("Streamed texture has no image data");
-            waitForFrames();
-            ensureDescriptorCapacity(static_cast<std::uint32_t>(textureTargets.size() + 1));
-            TextureTarget target = createTextureTarget(texture);
-            Buffer staging = createBuffer(texture.pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
-            std::memcpy(staging.mapped, texture.pixels.data(), texture.pixels.size());
-            check(vmaFlushAllocation(allocator, staging.allocation, 0, VK_WHOLE_SIZE),
-                "vmaFlushAllocation streamed texture");
-
-            VkCommandBuffer command = VK_NULL_HANDLE;
-            VkCommandBufferAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-            allocateInfo.commandPool = commandPool;
-            allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocateInfo.commandBufferCount = 1;
-            check(vkAllocateCommandBuffers(device, &allocateInfo, &command),
-                "vkAllocateCommandBuffers streamed texture");
-            VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            check(vkBeginCommandBuffer(command, &beginInfo), "vkBeginCommandBuffer streamed texture");
-            imageBarrier(command, target.image, VK_IMAGE_LAYOUT_UNDEFINED,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, texture.mipLevels);
-            for (std::uint32_t mip = 0; mip < texture.mipLevels; ++mip)
-            {
-                VkBufferImageCopy copy{};
-                copy.bufferOffset = texture.mipOffsets[mip];
-                copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
-                copy.imageExtent = {
-                    std::max(1u, texture.width >> mip), std::max(1u, texture.height >> mip), 1};
-                vkCmdCopyBufferToImage(command, staging.handle, target.image,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-            }
-            imageBarrier(command, target.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, texture.mipLevels);
-            check(vkEndCommandBuffer(command), "vkEndCommandBuffer streamed texture");
-            VkFence fence = VK_NULL_HANDLE;
-            VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-            check(vkCreateFence(device, &fenceInfo, nullptr, &fence),
-                "vkCreateFence streamed texture");
-            VkCommandBufferSubmitInfo commandInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
-            commandInfo.commandBuffer = command;
-            VkSubmitInfo2 submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-            submitInfo.commandBufferInfoCount = 1;
-            submitInfo.pCommandBufferInfos = &commandInfo;
-            check(vkQueueSubmit2(queue, 1, &submitInfo, fence), "vkQueueSubmit2 streamed texture");
-            check(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX),
-                "streamed texture fence");
-            vkDestroyFence(device, fence, nullptr);
-            vkFreeCommandBuffers(device, commandPool, 1, &command);
-            destroyBuffer(staging);
-
             const auto index = static_cast<std::uint32_t>(textureTargets.size());
-            textureTargets.push_back(target);
+            textureTargets.push_back(createTextureTarget(texture));
+            pendingTextures.push_back(std::move(texture));
             rendererStats.residentTextures = static_cast<std::uint32_t>(textureTargets.size());
-            updateDescriptorSets();
             return index;
         }
 
         std::uint32_t appendMaterial(const SceneMaterial& material)
         {
-            waitForFrames();
             const GpuMaterial gpu = makeGpuMaterial(material);
-            const VkDeviceSize offset = static_cast<VkDeviceSize>(materialCount) * sizeof(GpuMaterial);
-            ensureBuffer(materials, offset + sizeof(GpuMaterial), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            uploadBytes(materials, offset, &gpu, sizeof(gpu));
             const std::uint32_t index = materialCount++;
-            updateDescriptorSets();
+            pendingMaterials.push_back(gpu);
             return index;
         }
 
@@ -1623,8 +1882,11 @@ void main()
         {
             if (mesh.vertices.empty() || mesh.indices.empty() || mesh.meshlets.empty())
                 throw std::runtime_error("Streamed mesh is empty");
-            waitForFrames();
             MeshRange range;
+            range.vertexOffset = vertexCount;
+            range.vertexCount = static_cast<std::uint32_t>(mesh.vertices.size());
+            range.indexOffset = indexCount;
+            range.indexCount = static_cast<std::uint32_t>(mesh.indices.size());
             range.meshletOffset = meshletCount;
             range.meshletCount = static_cast<std::uint32_t>(mesh.meshlets.size());
             range.bounds = mesh.bounds;
@@ -1641,50 +1903,77 @@ void main()
                 meshlet.vertexOffset += vertexCount;
                 meshlet.indexOffset += indexCount;
             }
-            const VkDeviceSize vertexOffset = static_cast<VkDeviceSize>(vertexCount) * sizeof(GpuVertex);
-            const VkDeviceSize indexOffset = static_cast<VkDeviceSize>(indexCount) * sizeof(std::uint32_t);
-            const VkDeviceSize meshletOffset = static_cast<VkDeviceSize>(meshletCount) * sizeof(GpuMeshlet);
-            ensureBuffer(vertices, vertexOffset + mesh.vertices.size() * sizeof(GpuVertex),
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            ensureBuffer(indices, indexOffset + mesh.indices.size() * sizeof(std::uint32_t),
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            ensureBuffer(meshlets, meshletOffset + mesh.meshlets.size() * sizeof(GpuMeshlet),
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            uploadBytes(vertices, vertexOffset, mesh.vertices.data(), mesh.vertices.size() * sizeof(GpuVertex));
-            uploadBytes(indices, indexOffset, mesh.indices.data(), mesh.indices.size() * sizeof(std::uint32_t));
-            uploadBytes(meshlets, meshletOffset, mesh.meshlets.data(), mesh.meshlets.size() * sizeof(GpuMeshlet));
             vertexCount += static_cast<std::uint32_t>(mesh.vertices.size());
             indexCount += static_cast<std::uint32_t>(mesh.indices.size());
             meshletCount += static_cast<std::uint32_t>(mesh.meshlets.size());
-            updateDescriptorSets();
+            meshletData.insert(meshletData.end(), mesh.meshlets.begin(), mesh.meshlets.end());
+            pendingVertices.insert(pendingVertices.end(),
+                std::make_move_iterator(mesh.vertices.begin()), std::make_move_iterator(mesh.vertices.end()));
+            pendingIndices.insert(pendingIndices.end(),
+                std::make_move_iterator(mesh.indices.begin()), std::make_move_iterator(mesh.indices.end()));
+            pendingMeshlets.insert(pendingMeshlets.end(),
+                std::make_move_iterator(mesh.meshlets.begin()), std::make_move_iterator(mesh.meshlets.end()));
             return range;
         }
 
-        void appendInstance(SceneInstance source)
+        void replacePackedMesh(const MeshRange& range, PackedMesh mesh)
+        {
+            if (!detail::fixedTopologyReplacement(range, meshletData, mesh)
+                || static_cast<std::uint64_t>(range.vertexOffset) + range.vertexCount > vertexCount
+                || static_cast<std::uint64_t>(range.indexOffset) + range.indexCount > indexCount
+                || static_cast<std::uint64_t>(range.meshletOffset) + range.meshletCount > meshletCount)
+                throw std::runtime_error("Mesh replacement must preserve its fixed topology");
+
+            for (std::size_t i = 0; i < mesh.meshlets.size(); ++i)
+            {
+                auto& meshlet = mesh.meshlets[i];
+                if (meshlet.vertexOffset + meshlet.vertexCount > mesh.vertices.size()
+                    || meshlet.indexOffset + meshlet.triangleCount * 3 > mesh.indices.size()
+                    || meshlet.materialIndex >= materialCount)
+                    throw std::runtime_error("Mesh replacement changed a meshlet topology");
+                for (std::uint32_t index = 0; index < meshlet.triangleCount * 3; ++index)
+                    if (mesh.indices[meshlet.indexOffset + index] >= meshlet.vertexCount)
+                        throw std::runtime_error("Mesh replacement has an invalid local index");
+                meshlet.vertexOffset += range.vertexOffset;
+                meshlet.indexOffset += range.indexOffset;
+            }
+
+            std::copy(mesh.meshlets.begin(), mesh.meshlets.end(),
+                meshletData.begin() + range.meshletOffset);
+            const auto existing = std::find_if(pendingMeshPatches.begin(), pendingMeshPatches.end(),
+                [&range](const MeshPatch& patch) {
+                    return patch.range.vertexOffset == range.vertexOffset
+                        && patch.range.indexOffset == range.indexOffset
+                        && patch.range.meshletOffset == range.meshletOffset;
+                });
+            if (existing != pendingMeshPatches.end())
+                existing->mesh = std::move(mesh);
+            else
+                pendingMeshPatches.push_back({range, std::move(mesh)});
+        }
+
+        std::uint32_t appendInstance(SceneInstance source)
         {
             if (source.meshletCount == 0 || source.meshletOffset + source.meshletCount > meshletCount)
                 throw std::runtime_error("Streamed instance has an invalid meshlet range");
-            waitForFrames();
+            if (source.skinCount != 0
+                && static_cast<std::size_t>(source.skinOffset) + source.skinCount > skinData.size())
+                throw std::runtime_error("Streamed instance has an invalid skin palette range");
             source.bounds.x = -source.bounds.x;
             const GpuInstance gpu{source.transform, source.bounds, source.lodRange,
-                glm::uvec4(source.meshletOffset, source.meshletCount, 0, 0)};
+                glm::uvec4(source.meshletOffset, source.meshletCount,
+                    source.active ? 1u : 0u, source.overlay ? 1u : 0u),
+                glm::uvec4(source.skinOffset, source.skinCount, 0u, 0u)};
             std::vector<glm::uvec2> candidates;
             candidates.reserve(source.meshletCount);
             for (std::uint32_t meshlet = source.meshletOffset;
                 meshlet < source.meshletOffset + source.meshletCount; ++meshlet)
                 candidates.emplace_back(instanceCount, meshlet);
 
-            const VkDeviceSize instanceOffset = static_cast<VkDeviceSize>(instanceCount) * sizeof(GpuInstance);
-            const VkDeviceSize sourceOffset = static_cast<VkDeviceSize>(candidateCount) * sizeof(glm::uvec2);
-            ensureBuffer(instances, instanceOffset + sizeof(GpuInstance), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            ensureBuffer(sources, sourceOffset + candidates.size() * sizeof(glm::uvec2),
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            const VkDeviceSize visibleSize = sourceOffset + candidates.size() * sizeof(glm::uvec2);
-            for (auto& frame : frames)
-                ensureBuffer(frame.visible, visibleSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
-            uploadBytes(instances, instanceOffset, &gpu, sizeof(gpu));
-            uploadBytes(sources, sourceOffset, candidates.data(), candidates.size() * sizeof(glm::uvec2));
-            ++instanceCount;
+            const std::uint32_t index = instanceCount++;
+            instanceData.push_back(gpu);
+            pendingInstances.push_back(gpu);
+            pendingSources.insert(pendingSources.end(), candidates.begin(), candidates.end());
             candidateCount += source.meshletCount;
             rendererStats.sourceCandidates = candidateCount;
 
@@ -1696,7 +1985,290 @@ void main()
             const glm::vec3 maximum = glm::max(oldMaximum, newMaximum);
             sceneCenter = (minimum + maximum) * 0.5f;
             sceneRadius = std::max(glm::distance(sceneCenter, maximum), 1.0f);
-            updateDescriptorSets();
+            return index;
+        }
+
+        std::uint32_t appendSkinPalette(std::span<const glm::mat4> transforms)
+        {
+            if (transforms.empty())
+                throw std::runtime_error("Skin palette cannot be empty");
+            if (skinData.size() + transforms.size() > std::numeric_limits<std::uint32_t>::max())
+                throw std::runtime_error("Skin palette index exceeds 32 bits");
+            const auto offset = static_cast<std::uint32_t>(skinData.size());
+            skinData.insert(skinData.end(), transforms.begin(), transforms.end());
+            skinDataDirty = true;
+            return offset;
+        }
+
+        void updateSkinPalette(std::uint32_t offset, std::span<const glm::mat4> transforms)
+        {
+            if (transforms.empty()
+                || static_cast<std::size_t>(offset) + transforms.size() > skinData.size())
+                throw std::runtime_error("Skin palette update is out of bounds");
+            std::copy(transforms.begin(), transforms.end(), skinData.begin() + offset);
+            skinDataDirty = true;
+        }
+
+        void setActive(std::span<const std::uint32_t> instanceIndices, bool active)
+        {
+            const std::uint32_t value = active ? 1u : 0u;
+            const std::size_t pendingBase = instanceData.size() - pendingInstances.size();
+            for (const std::uint32_t index : instanceIndices)
+            {
+                if (index >= instanceData.size())
+                    throw std::runtime_error("Streamed instance index is out of bounds");
+                if (instanceData[index].meshletRange.z != value)
+                {
+                    instanceData[index].meshletRange.z = value;
+                    if (index >= pendingBase)
+                        pendingInstances[index - pendingBase].meshletRange.z = value;
+                    else
+                        pendingInstanceUpdates.push_back(index);
+                }
+            }
+        }
+
+        void updateTransform(std::uint32_t index, const glm::mat4& transform, glm::vec4 bounds)
+        {
+            if (index >= instanceData.size())
+                throw std::runtime_error("Streamed instance index is out of bounds");
+            bounds.x = -bounds.x;
+            instanceData[index].transform = transform;
+            instanceData[index].bounds = bounds;
+            const std::size_t pendingBase = instanceData.size() - pendingInstances.size();
+            if (index >= pendingBase)
+                pendingInstances[index - pendingBase] = instanceData[index];
+            else
+                pendingInstanceUpdates.push_back(index);
+            sceneRadius = std::max(sceneRadius,
+                glm::distance(sceneCenter, glm::vec3(bounds)) + bounds.w);
+        }
+
+        bool recordStreamingUploads(Frame& frame, VkCommandBuffer command)
+        {
+            const bool hasUploads = !pendingVertices.empty() || !pendingIndices.empty()
+                || !pendingMeshlets.empty() || !pendingInstances.empty() || !pendingSources.empty()
+                || !pendingMaterials.empty() || !pendingTextures.empty()
+                || !pendingInstanceUpdates.empty() || !pendingMeshPatches.empty() || skinDataDirty;
+            if (!hasUploads)
+            {
+                if (frame.descriptorGeneration != descriptorGeneration)
+                    updateDescriptorSet(frame);
+                return false;
+            }
+
+            ensureDescriptorCapacity(static_cast<std::uint32_t>(textureTargets.size()));
+            bool buffersChanged = false;
+            buffersChanged |= ensureBuffer(vertices,
+                static_cast<VkDeviceSize>(vertexCount) * sizeof(GpuVertex),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            buffersChanged |= ensureBuffer(indices,
+                static_cast<VkDeviceSize>(indexCount) * sizeof(std::uint32_t),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            buffersChanged |= ensureBuffer(meshlets,
+                static_cast<VkDeviceSize>(meshletCount) * sizeof(GpuMeshlet),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            buffersChanged |= ensureBuffer(instances,
+                static_cast<VkDeviceSize>(instanceCount) * sizeof(GpuInstance),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            buffersChanged |= ensureBuffer(sources,
+                static_cast<VkDeviceSize>(candidateCount) * sizeof(glm::uvec2),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            buffersChanged |= ensureBuffer(materials,
+                static_cast<VkDeviceSize>(materialCount) * sizeof(GpuMaterial),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            buffersChanged |= ensureBuffer(skinMatrices,
+                static_cast<VkDeviceSize>(skinData.size()) * sizeof(glm::mat4),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            const VkDeviceSize visibleSize = static_cast<VkDeviceSize>(candidateCount) * sizeof(glm::uvec2);
+            for (auto& targetFrame : frames)
+                buffersChanged |= ensureBuffer(
+                    targetFrame.visible, visibleSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+            if (buffersChanged)
+            {
+                ++descriptorGeneration;
+                updateDescriptorSets();
+            }
+
+            struct BufferUpload
+            {
+                Buffer* destination = nullptr;
+                VkDeviceSize destinationOffset = 0;
+                VkDeviceSize stagingOffset = 0;
+                VkDeviceSize size = 0;
+                const void* data = nullptr;
+            };
+            std::vector<BufferUpload> uploads;
+            VkDeviceSize stagingSize = 0;
+            auto addUpload = [&](Buffer& destination, VkDeviceSize destinationOffset,
+                                 const void* data, VkDeviceSize size) {
+                if (size == 0)
+                    return;
+                stagingSize = (stagingSize + 15) & ~VkDeviceSize(15);
+                uploads.push_back({&destination, destinationOffset, stagingSize, size, data});
+                stagingSize += size;
+            };
+            addUpload(vertices,
+                static_cast<VkDeviceSize>(vertexCount - pendingVertices.size()) * sizeof(GpuVertex),
+                pendingVertices.data(), pendingVertices.size() * sizeof(GpuVertex));
+            addUpload(indices,
+                static_cast<VkDeviceSize>(indexCount - pendingIndices.size()) * sizeof(std::uint32_t),
+                pendingIndices.data(), pendingIndices.size() * sizeof(std::uint32_t));
+            addUpload(meshlets,
+                static_cast<VkDeviceSize>(meshletCount - pendingMeshlets.size()) * sizeof(GpuMeshlet),
+                pendingMeshlets.data(), pendingMeshlets.size() * sizeof(GpuMeshlet));
+            for (const auto& patch : pendingMeshPatches)
+            {
+                addUpload(vertices,
+                    static_cast<VkDeviceSize>(patch.range.vertexOffset) * sizeof(GpuVertex),
+                    patch.mesh.vertices.data(), patch.mesh.vertices.size() * sizeof(GpuVertex));
+                addUpload(meshlets,
+                    static_cast<VkDeviceSize>(patch.range.meshletOffset) * sizeof(GpuMeshlet),
+                    patch.mesh.meshlets.data(), patch.mesh.meshlets.size() * sizeof(GpuMeshlet));
+            }
+            std::sort(pendingInstanceUpdates.begin(), pendingInstanceUpdates.end());
+            pendingInstanceUpdates.erase(
+                std::unique(pendingInstanceUpdates.begin(), pendingInstanceUpdates.end()),
+                pendingInstanceUpdates.end());
+            constexpr std::size_t fullInstanceUploadThreshold = 2048;
+            if (pendingInstanceUpdates.size() >= fullInstanceUploadThreshold)
+            {
+                addUpload(instances, 0, instanceData.data(),
+                    instanceData.size() * sizeof(GpuInstance));
+            }
+            else
+            {
+                addUpload(instances,
+                    static_cast<VkDeviceSize>(instanceCount - pendingInstances.size())
+                        * sizeof(GpuInstance),
+                    pendingInstances.data(), pendingInstances.size() * sizeof(GpuInstance));
+                for (std::size_t first = 0; first < pendingInstanceUpdates.size();)
+                {
+                    std::size_t last = first + 1;
+                    while (last < pendingInstanceUpdates.size()
+                        && pendingInstanceUpdates[last] == pendingInstanceUpdates[last - 1] + 1)
+                        ++last;
+                    const std::uint32_t instanceIndex = pendingInstanceUpdates[first];
+                    const std::size_t count = last - first;
+                    addUpload(instances,
+                        static_cast<VkDeviceSize>(instanceIndex) * sizeof(GpuInstance),
+                        instanceData.data() + instanceIndex, count * sizeof(GpuInstance));
+                    first = last;
+                }
+            }
+            addUpload(sources,
+                static_cast<VkDeviceSize>(candidateCount - pendingSources.size()) * sizeof(glm::uvec2),
+                pendingSources.data(), pendingSources.size() * sizeof(glm::uvec2));
+            addUpload(materials,
+                static_cast<VkDeviceSize>(materialCount - pendingMaterials.size()) * sizeof(GpuMaterial),
+                pendingMaterials.data(), pendingMaterials.size() * sizeof(GpuMaterial));
+            if (skinDataDirty)
+                addUpload(skinMatrices, 0, skinData.data(), skinData.size() * sizeof(glm::mat4));
+
+            const std::size_t firstTexture = textureTargets.size() - pendingTextures.size();
+            std::vector<VkDeviceSize> textureOffsets;
+            std::vector<std::size_t> textureSourceOffsets;
+            textureOffsets.reserve(pendingTextures.size());
+            textureSourceOffsets.reserve(pendingTextures.size());
+            std::vector<TextureTarget*> sparseTargets;
+            sparseTargets.reserve(pendingTextures.size());
+            for (std::size_t index = 0; index < pendingTextures.size(); ++index)
+            {
+                const auto& texture = pendingTextures[index];
+                auto& target = textureTargets[firstTexture + index];
+                const std::size_t sourceOffset = texture.mipOffsets[target.firstResidentMip];
+                if (sourceOffset >= texture.pixels.size())
+                    throw std::runtime_error("Streamed texture resident mip data is truncated");
+                stagingSize = (stagingSize + 15) & ~VkDeviceSize(15);
+                textureOffsets.push_back(stagingSize);
+                textureSourceOffsets.push_back(sourceOffset);
+                stagingSize += texture.pixels.size() - sourceOffset;
+                sparseTargets.push_back(&target);
+            }
+            const bool waitForSparse = submitSparseBinds(sparseTargets, frame.sparseReady);
+
+            Buffer staging = createBuffer(stagingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+            for (const auto& upload : uploads)
+                std::memcpy(static_cast<std::byte*>(staging.mapped) + upload.stagingOffset,
+                    upload.data, static_cast<std::size_t>(upload.size));
+            for (std::size_t index = 0; index < pendingTextures.size(); ++index)
+                std::memcpy(static_cast<std::byte*>(staging.mapped) + textureOffsets[index],
+                    pendingTextures[index].pixels.data() + textureSourceOffsets[index],
+                    pendingTextures[index].pixels.size() - textureSourceOffsets[index]);
+            check(vmaFlushAllocation(allocator, staging.allocation, 0, VK_WHOLE_SIZE),
+                "vmaFlushAllocation streaming batch");
+
+            if (!pendingMeshPatches.empty())
+            {
+                VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+                barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                    | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
+                barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                barrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                dependency.memoryBarrierCount = 1;
+                dependency.pMemoryBarriers = &barrier;
+                vkCmdPipelineBarrier2(command, &dependency);
+            }
+            for (const auto& upload : uploads)
+            {
+                const VkBufferCopy copy{upload.stagingOffset, upload.destinationOffset, upload.size};
+                vkCmdCopyBuffer(command, staging.handle, upload.destination->handle, 1, &copy);
+            }
+            for (std::size_t index = 0; index < pendingTextures.size(); ++index)
+            {
+                const auto& texture = pendingTextures[index];
+                auto& target = textureTargets[firstTexture + index];
+                imageBarrier(command, target.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
+                    texture.mipLevels - target.firstResidentMip, target.firstResidentMip);
+                for (std::uint32_t mip = target.firstResidentMip;
+                    mip < texture.mipLevels; ++mip)
+                {
+                    VkBufferImageCopy copy{};
+                    copy.bufferOffset = textureOffsets[index] + texture.mipOffsets[mip]
+                        - textureSourceOffsets[index];
+                    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+                    copy.imageExtent = {
+                        std::max(1u, texture.width >> mip), std::max(1u, texture.height >> mip), 1};
+                    vkCmdCopyBufferToImage(command, staging.handle, target.image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                }
+                imageBarrier(command, target.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
+                    texture.mipLevels - target.firstResidentMip, target.firstResidentMip);
+            }
+            if (!uploads.empty())
+            {
+                VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+                barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                    | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+                barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                dependency.memoryBarrierCount = 1;
+                dependency.pMemoryBarriers = &barrier;
+                vkCmdPipelineBarrier2(command, &dependency);
+            }
+
+            frame.retiredUploads.push_back(staging);
+            if (!pendingTextures.empty())
+                ++descriptorGeneration;
+            pendingVertices.clear();
+            pendingIndices.clear();
+            pendingMeshlets.clear();
+            pendingInstances.clear();
+            pendingInstanceUpdates.clear();
+            pendingSources.clear();
+            pendingMaterials.clear();
+            pendingTextures.clear();
+            pendingMeshPatches.clear();
+            skinDataDirty = false;
+            if (frame.descriptorGeneration != descriptorGeneration)
+                updateDescriptorSet(frame);
+            return waitForSparse;
         }
 
         VkShaderModule shaderModule(const std::vector<std::uint32_t>& code)
@@ -1729,9 +2301,17 @@ void main()
             check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &computeInfo, nullptr, &computePipeline),
                 "vkCreateComputePipelines");
 
+            const VkSpecializationMapEntry decalPassEntry{0, 0, sizeof(std::uint32_t)};
+            const std::uint32_t regularPassValue = 0;
+            const std::uint32_t decalPassValue = 1;
+            const VkSpecializationInfo regularPassSpecialization{
+                1, &decalPassEntry, sizeof(regularPassValue), &regularPassValue};
+            const VkSpecializationInfo decalPassSpecialization{
+                1, &decalPassEntry, sizeof(decalPassValue), &decalPassValue};
             const std::array stages{
                 VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                    nullptr, 0, VK_SHADER_STAGE_MESH_BIT_EXT, meshModule, "main", nullptr},
+                    nullptr, 0, VK_SHADER_STAGE_MESH_BIT_EXT, meshModule, "main",
+                    &regularPassSpecialization},
                 VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                     nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragmentModule, "main", nullptr}
             };
@@ -1754,7 +2334,7 @@ void main()
             VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
             depth.depthTestEnable = VK_TRUE;
             depth.depthWriteEnable = VK_TRUE;
-            depth.depthCompareOp = VK_COMPARE_OP_LESS;
+            depth.depthCompareOp = VK_COMPARE_OP_GREATER;
             VkPipelineColorBlendAttachmentState blendAttachment{};
             blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
                 | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
@@ -1785,6 +2365,34 @@ void main()
                 device, VK_NULL_HANDLE, 1, &graphicsInfo, nullptr, &graphicsPipeline),
                 "vkCreateGraphicsPipelines");
 
+            auto decalStages = stages;
+            decalStages[0].pSpecializationInfo = &decalPassSpecialization;
+            VkPipelineRasterizationStateCreateInfo decalRasterization = rasterization;
+            decalRasterization.depthBiasEnable = VK_TRUE;
+            decalRasterization.depthBiasConstantFactor = 1.0f;
+            decalRasterization.depthBiasSlopeFactor = 1.0f;
+            VkPipelineDepthStencilStateCreateInfo decalDepth = depth;
+            decalDepth.depthWriteEnable = VK_FALSE;
+            VkPipelineColorBlendAttachmentState decalBlendAttachment = blendAttachment;
+            decalBlendAttachment.blendEnable = VK_TRUE;
+            decalBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            decalBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            decalBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+            decalBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            decalBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            decalBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+            VkPipelineColorBlendStateCreateInfo decalBlend = blend;
+            decalBlend.pAttachments = &decalBlendAttachment;
+            VkGraphicsPipelineCreateInfo decalInfo = graphicsInfo;
+            decalInfo.stageCount = static_cast<std::uint32_t>(decalStages.size());
+            decalInfo.pStages = decalStages.data();
+            decalInfo.pRasterizationState = &decalRasterization;
+            decalInfo.pDepthStencilState = &decalDepth;
+            decalInfo.pColorBlendState = &decalBlend;
+            check(vkCreateGraphicsPipelines(
+                device, VK_NULL_HANDLE, 1, &decalInfo, nullptr, &decalPipeline),
+                "vkCreateGraphicsPipelines decal");
+
             VkPipelineShaderStageCreateInfo shadowStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             shadowStage.stage = VK_SHADER_STAGE_MESH_BIT_EXT;
             shadowStage.module = shadowModule;
@@ -1795,6 +2403,8 @@ void main()
             shadowRasterization.depthBiasSlopeFactor = 1.75f;
             VkPipelineColorBlendStateCreateInfo shadowBlend{
                 VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+            VkPipelineDepthStencilStateCreateInfo shadowDepthState = depth;
+            shadowDepthState.depthCompareOp = VK_COMPARE_OP_LESS;
             VkPipelineRenderingCreateInfo shadowRendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
             shadowRendering.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
             VkGraphicsPipelineCreateInfo shadowInfo = graphicsInfo;
@@ -1802,6 +2412,7 @@ void main()
             shadowInfo.stageCount = 1;
             shadowInfo.pStages = &shadowStage;
             shadowInfo.pRasterizationState = &shadowRasterization;
+            shadowInfo.pDepthStencilState = &shadowDepthState;
             shadowInfo.pColorBlendState = &shadowBlend;
             check(vkCreateGraphicsPipelines(
                 device, VK_NULL_HANDLE, 1, &shadowInfo, nullptr, &shadowPipeline),
@@ -1814,7 +2425,8 @@ void main()
         }
 
         void imageBarrier(VkCommandBuffer command, VkImage image, VkImageLayout oldLayout,
-            VkImageLayout newLayout, VkImageAspectFlags aspect, std::uint32_t levelCount = 1)
+            VkImageLayout newLayout, VkImageAspectFlags aspect, std::uint32_t levelCount = 1,
+            std::uint32_t baseMipLevel = 0)
         {
             VkImageMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
             barrier.srcStageMask = oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
@@ -1848,6 +2460,7 @@ void main()
             barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.image = image;
             barrier.subresourceRange.aspectMask = aspect;
+            barrier.subresourceRange.baseMipLevel = baseMipLevel;
             barrier.subresourceRange.levelCount = levelCount;
             barrier.subresourceRange.layerCount = 1;
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
@@ -1856,7 +2469,8 @@ void main()
             vkCmdPipelineBarrier2(command, &dependency);
         }
 
-        void render(const glm::mat4& view, const glm::mat4& projection, const glm::vec3& cameraPosition)
+        void render(const glm::mat4& view, const glm::mat4& projection,
+            const glm::vec3& cameraPosition, const glm::vec3& worldOrigin)
         {
             const auto cpuStart = std::chrono::steady_clock::now();
             Frame& frame = frames[currentFrame];
@@ -1874,6 +2488,9 @@ void main()
                 rendererStats.visibleMeshlets = std::min(
                     *static_cast<const std::uint32_t*>(frame.indirect.mapped), candidateCount);
             }
+            for (auto& upload : frame.retiredUploads)
+                destroyBuffer(upload);
+            frame.retiredUploads.clear();
 
             std::uint32_t imageIndex = 0;
             const VkResult acquire = vkAcquireNextImageKHR(
@@ -1885,22 +2502,28 @@ void main()
             }
             if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR)
                 check(acquire, "vkAcquireNextImageKHR");
-            check(vkResetFences(device, 1, &frame.fence), "vkResetFences");
             check(vkResetCommandBuffer(frame.commandBuffer, 0), "vkResetCommandBuffer");
 
             CameraData camera;
             camera.viewProjection = projection * view;
             const glm::vec3 lightDirection = glm::normalize(glm::vec3(0.35f, 0.8f, 0.25f));
+            const glm::vec3 localSceneCenter = sceneCenter - worldOrigin;
             const glm::mat4 lightView = glm::lookAtRH(
-                sceneCenter + lightDirection * sceneRadius * 2.5f,
-                sceneCenter, glm::vec3(0.0f, 1.0f, 0.0f));
+                localSceneCenter + lightDirection * sceneRadius * 2.5f,
+                localSceneCenter, glm::vec3(0.0f, 1.0f, 0.0f));
             glm::mat4 lightProjection = glm::orthoRH_ZO(-sceneRadius, sceneRadius,
                 -sceneRadius, sceneRadius, 0.1f, sceneRadius * 5.0f);
             lightProjection[1][1] *= -1.0f;
             camera.lightViewProjection = lightProjection * lightView;
             camera.planes = extractFrustum(camera.viewProjection);
             camera.cameraPosition = glm::vec4(cameraPosition, 1.0f);
-            camera.counts = glm::uvec4(candidateCount, candidateCount, 0, 0);
+            camera.worldOrigin = glm::vec4(worldOrigin, 0.0f);
+            int logicalWidth = 0;
+            int logicalHeight = 0;
+            SDL_GetWindowSize(window, &logicalWidth, &logicalHeight);
+            camera.counts = glm::uvec4(candidateCount, candidateCount,
+                static_cast<std::uint32_t>(std::max(logicalWidth, 1)),
+                static_cast<std::uint32_t>(std::max(logicalHeight, 1)));
             std::memcpy(frame.uniform.mapped, &camera, sizeof(camera));
             check(vmaFlushAllocation(allocator, frame.uniform.allocation, 0, sizeof(camera)),
                 "vmaFlushAllocation");
@@ -1911,6 +2534,7 @@ void main()
             vkCmdResetQueryPool(frame.commandBuffer, queryPool, currentFrame * 2, 2);
             vkCmdWriteTimestamp2(frame.commandBuffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
                 queryPool, currentFrame * 2);
+            const bool waitForSparse = recordStreamingUploads(frame, frame.commandBuffer);
             const VkDrawMeshTasksIndirectCommandEXT indirectCommand{0, 1, 1};
             vkCmdUpdateBuffer(frame.commandBuffer, frame.indirect.handle, 0,
                 sizeof(indirectCommand), &indirectCommand);
@@ -1977,8 +2601,6 @@ void main()
             vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline);
             vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                 pipelineLayout, 0, 1, &frame.descriptorSet, 0, nullptr);
-            vkCmdPushConstants(frame.commandBuffer, pipelineLayout, VK_SHADER_STAGE_MESH_BIT_EXT,
-                0, sizeof(camera.lightViewProjection), glm::value_ptr(camera.lightViewProjection));
             drawMeshTasksIndirect(frame.commandBuffer, frame.indirect.handle, 0, 1,
                 sizeof(VkDrawMeshTasksIndirectCommandEXT));
             vkCmdEndRendering(frame.commandBuffer);
@@ -2008,7 +2630,7 @@ void main()
             depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
             depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            depthAttachment.clearValue.depthStencil = {1.0f, 0};
+            depthAttachment.clearValue.depthStencil = {0.0f, 0};
             VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
             rendering.renderArea.extent = extent;
             rendering.layerCount = 1;
@@ -2026,6 +2648,9 @@ void main()
                 pipelineLayout, 0, 1, &frame.descriptorSet, 0, nullptr);
             drawMeshTasksIndirect(frame.commandBuffer, frame.indirect.handle, 0, 1,
                 sizeof(VkDrawMeshTasksIndirectCommandEXT));
+            vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, decalPipeline);
+            drawMeshTasksIndirect(frame.commandBuffer, frame.indirect.handle, 0, 1,
+                sizeof(VkDrawMeshTasksIndirectCommandEXT));
             vkCmdEndRendering(frame.commandBuffer);
 
             imageBarrier(frame.commandBuffer, swapchainImages[imageIndex],
@@ -2035,18 +2660,23 @@ void main()
             vkCmdWriteTimestamp2(frame.commandBuffer, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
                 queryPool, currentFrame * 2 + 1);
             check(vkEndCommandBuffer(frame.commandBuffer), "vkEndCommandBuffer");
+            check(vkResetFences(device, 1, &frame.fence), "vkResetFences");
 
-            VkSemaphoreSubmitInfo waitInfo{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
-            waitInfo.semaphore = frame.acquired;
-            waitInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+            std::array<VkSemaphoreSubmitInfo, 2> waitInfos{};
+            waitInfos[0].sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+            waitInfos[0].semaphore = frame.acquired;
+            waitInfos[0].stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+            waitInfos[1].sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+            waitInfos[1].semaphore = frame.sparseReady;
+            waitInfos[1].stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
             VkCommandBufferSubmitInfo commandInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
             commandInfo.commandBuffer = frame.commandBuffer;
             VkSemaphoreSubmitInfo signalInfo{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
             signalInfo.semaphore = presentSemaphores[imageIndex];
             signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
             VkSubmitInfo2 submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-            submitInfo.waitSemaphoreInfoCount = 1;
-            submitInfo.pWaitSemaphoreInfos = &waitInfo;
+            submitInfo.waitSemaphoreInfoCount = waitForSparse ? 2u : 1u;
+            submitInfo.pWaitSemaphoreInfos = waitInfos.data();
             submitInfo.commandBufferInfoCount = 1;
             submitInfo.pCommandBufferInfos = &commandInfo;
             submitInfo.signalSemaphoreInfoCount = 1;
@@ -2087,14 +2717,15 @@ void main()
     }
 
     void VulkanRenderer::render(
-        const glm::mat4& view, const glm::mat4& projection, const glm::vec3& cameraPosition)
+        const glm::mat4& view, const glm::mat4& projection,
+        const glm::vec3& cameraPosition, const glm::vec3& worldOrigin)
     {
-        mImpl->render(view, projection, cameraPosition);
+        mImpl->render(view, projection, cameraPosition, worldOrigin);
     }
 
-    std::uint32_t VulkanRenderer::addTexture(const SceneTexture& texture)
+    std::uint32_t VulkanRenderer::addTexture(SceneTexture texture)
     {
-        return mImpl->appendTexture(texture);
+        return mImpl->appendTexture(std::move(texture));
     }
 
     std::uint32_t VulkanRenderer::addMaterial(const SceneMaterial& material)
@@ -2107,9 +2738,37 @@ void main()
         return mImpl->appendPackedMesh(std::move(mesh));
     }
 
-    void VulkanRenderer::addInstance(SceneInstance instance)
+    void VulkanRenderer::updateMesh(const MeshRange& range, PackedMesh mesh)
     {
-        mImpl->appendInstance(instance);
+        mImpl->replacePackedMesh(range, std::move(mesh));
+    }
+
+    std::uint32_t VulkanRenderer::addInstance(SceneInstance instance)
+    {
+        return mImpl->appendInstance(instance);
+    }
+
+    std::uint32_t VulkanRenderer::addSkinPalette(std::span<const glm::mat4> transforms)
+    {
+        return mImpl->appendSkinPalette(transforms);
+    }
+
+    void VulkanRenderer::updateSkinPalette(
+        std::uint32_t offset, std::span<const glm::mat4> transforms)
+    {
+        mImpl->updateSkinPalette(offset, transforms);
+    }
+
+    void VulkanRenderer::updateInstanceTransform(std::uint32_t instance,
+        const glm::mat4& transform, const glm::vec4& bounds)
+    {
+        mImpl->updateTransform(instance, transform, bounds);
+    }
+
+    void VulkanRenderer::setInstancesActive(
+        std::span<const std::uint32_t> instances, bool active)
+    {
+        mImpl->setActive(instances, active);
     }
 
     const RendererStats& VulkanRenderer::stats() const noexcept

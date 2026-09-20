@@ -4,6 +4,8 @@
   "version-string": "0.1.0",
   "dependencies": [
     "glm",
+    "joltphysics",
+    "libgeotiff",
     "lz4",
     {
       "name": "sdl3",
