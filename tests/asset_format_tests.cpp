@@ -122,7 +122,7 @@ namespace
         appendZeros(bytes, 4 + 2 + 1 + 5 + 1 + 2 + 1 + 12 + 3 + 1 + 32);
         append(bytes, 0.75f);
 
-        const auto material = empire::assets::loadMaterial(bytes);
+        const auto material = openf4::assets::loadMaterial(bytes);
         require(material.diffuseTexture == "textures\\test_d.dds", "BGSM diffuse path failed");
         require(material.normalTexture == "textures\\test_n.dds", "BGSM normal path failed");
         require(material.grayscaleTexture == "textures\\test_palette.dds", "BGSM palette path failed");
@@ -148,7 +148,7 @@ namespace
         put(28, 2);
         put(84, fourCc('D', 'X', '1', '0'));
         put(128, 71);
-        const auto texture = empire::assets::loadDdsTexture(bytes);
+        const auto texture = openf4::assets::loadDdsTexture(bytes);
         require(texture.width == 4 && texture.height == 4, "DDS dimensions failed");
         require(texture.mipLevels == 2, "DDS mip count failed");
         require(texture.mipOffsets == std::vector<std::uint32_t>({0, 8}), "DDS mip offsets failed");
@@ -339,12 +339,12 @@ namespace
             group(fourCc('L', 'T', 'E', 'X'), 0, record(fourCc('L', 'T', 'E', 'X'), ltexId, ltexData)),
             group(fourCc('W', 'R', 'L', 'D'), 0, commonwealthChildren)})
             file.insert(file.end(), top.begin(), top.end());
-        const auto path = std::filesystem::temp_directory_path() / "empire-esm-world-test.esm";
+        const auto path = std::filesystem::temp_directory_path() / "openf4-esm-world-test.esm";
         std::ofstream output(path, std::ios::binary | std::ios::trunc);
         output.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
         output.close();
-        const auto world = empire::assets::loadCommonwealth(path);
-        const auto selectedWorld = empire::assets::loadExteriorWorld(path);
+        const auto world = openf4::assets::loadCommonwealth(path);
+        const auto selectedWorld = openf4::assets::loadExteriorWorld(path);
         std::filesystem::remove(path);
         require(world.worldFormId == 0x3Cu && selectedWorld.worldFormId == 0x3Cu
                 && selectedWorld.landscapes.contains({2, -3}),
@@ -362,7 +362,7 @@ namespace
             return reference.formId == 0x502;
         }), "Explicit EDID LOD proxy reference was not filtered");
         require(world.references.front().materialSwap == referenceSwapId, "ESM reference XMSP failed");
-        require(world.references.front().cell == empire::assets::CellCoord{2, -3}, "ESM cell failed");
+        require(world.references.front().cell == openf4::assets::CellCoord{2, -3}, "ESM cell failed");
         require(world.references.front().replacesDistantLod,
             "ESM MNAM reference was not marked as a distant replacement");
         const auto& collectionPart = world.references[1];
@@ -373,7 +373,7 @@ namespace
                 && collectionPart.localRotation[2] == 0.5f
                 && collectionPart.localScale == 2.0f,
             "ESM SCOL part transform failed");
-        require(collectionPart.cell == empire::assets::CellCoord{2, -3}
+        require(collectionPart.cell == openf4::assets::CellCoord{2, -3}
                 && collectionPart.replacesDistantLod,
             "ESM SCOL part replacement cell failed");
         const auto& secondCollectionPart = world.references[2];
@@ -381,7 +381,7 @@ namespace
                 && secondCollectionPart.localPosition[0] == -100.0f
                 && secondCollectionPart.localRotation[2] == -0.75f
                 && secondCollectionPart.localScale == 1.5f
-                && secondCollectionPart.cell == empire::assets::CellCoord{1, -4},
+                && secondCollectionPart.cell == openf4::assets::CellCoord{1, -4},
             "ESM SCOL placement array was not fully expanded");
         const auto& combinedCollectionReferenceResult = world.references[3];
         require(combinedCollectionReferenceResult.baseObject == combinedCollectionId
@@ -420,16 +420,16 @@ namespace
 
     void testEditableLandscape()
     {
-        auto editable = empire::assets::createEditableLandscape();
+        auto editable = openf4::assets::createEditableLandscape();
         for (std::size_t y = 0; y < editable.side; ++y)
         {
             for (std::size_t x = 0; x < editable.side; ++x)
                 editable.height(x, y) = static_cast<float>(x + y) * 8.0f;
         }
 
-        const auto path = std::filesystem::temp_directory_path() / "empire-editable-landscape-test.esm";
-        empire::assets::saveEditableLandscape(path, editable);
-        const auto loaded = empire::assets::loadEditableLandscape(path);
+        const auto path = std::filesystem::temp_directory_path() / "openf4-editable-landscape-test.esm";
+        openf4::assets::saveEditableLandscape(path, editable);
+        const auto loaded = openf4::assets::loadEditableLandscape(path);
         require(loaded.heights == editable.heights, "Editable ESM VHGT round trip failed");
 
         const auto center = loaded.cell({0, 0});
@@ -447,9 +447,9 @@ namespace
         require(expanded.addCell({2, 0}) && expanded.addCell({3, 0}),
             "Editable landscape did not create missing cells");
         require(expanded.cellForms.at({2, 0})
-                == empire::assets::EditableLandscape::CellForms{0x01000813u, 0x01000814u}
+                == openf4::assets::EditableLandscape::CellForms{0x01000813u, 0x01000814u}
                 && expanded.cellForms.at({3, 0})
-                == empire::assets::EditableLandscape::CellForms{0x01000815u, 0x01000816u},
+                == openf4::assets::EditableLandscape::CellForms{0x01000815u, 0x01000816u},
             "Expanded editable CELL/LAND FormIDs were not stable");
         const auto firstAdded = expanded.cell({2, 0});
         const auto secondAdded = expanded.cell({3, 0});
@@ -460,8 +460,8 @@ namespace
             require(firstAdded.heights[y * 33 + 32] == secondAdded.heights[y * 33],
                 "Two dynamically created CELLs diverged at their seam");
         }
-        empire::assets::saveEditableLandscape(path, expanded);
-        require(empire::assets::loadEditableLandscape(path) == expanded,
+        openf4::assets::saveEditableLandscape(path, expanded);
+        require(openf4::assets::loadEditableLandscape(path) == expanded,
             "Expanded editable ESM did not reload semantically");
 
         auto unquantized = editable;
@@ -469,7 +469,7 @@ namespace
         bool rejected = false;
         try
         {
-            empire::assets::saveEditableLandscape(path, unquantized);
+            openf4::assets::saveEditableLandscape(path, unquantized);
         }
         catch (const std::runtime_error&)
         {
@@ -482,7 +482,7 @@ namespace
         rejected = false;
         try
         {
-            empire::assets::saveEditableLandscape(path, excessiveDelta);
+            openf4::assets::saveEditableLandscape(path, excessiveDelta);
         }
         catch (const std::runtime_error&)
         {
@@ -497,7 +497,7 @@ namespace
         rejected = false;
         try
         {
-            (void)empire::assets::loadEditableLandscape(path);
+            (void)openf4::assets::loadEditableLandscape(path);
         }
         catch (const std::runtime_error&)
         {
@@ -568,7 +568,7 @@ namespace
     {
         const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
         const auto directory = std::filesystem::temp_directory_path()
-            / ("empire-dem-import-test-" + std::to_string(nonce));
+            / ("openf4-dem-import-test-" + std::to_string(nonce));
         std::filesystem::create_directories(directory);
         struct Cleanup
         {
@@ -587,7 +587,7 @@ namespace
         writeDemFixture(paths[2], -75, 42, 30.0f);
         writeDemFixture(paths[3], -74, 41, 40.0f);
 
-        const auto summary = empire::assets::inspectDemLandscape(
+        const auto summary = openf4::assets::inspectDemLandscape(
             directory / "NYC.esm", paths);
         require(summary.cellCount == 10'906'969,
             "DEM true-scale projected CELL count changed");
@@ -598,7 +598,7 @@ namespace
             "Times Square is not inside the imported CELL footprint");
         require(std::ranges::all_of(summary.shards, [](const auto& shard) {
                 return shard.cellCount > 0
-                    && shard.cellCount <= empire::assets::maxDemCellsPerEsm;
+                    && shard.cellCount <= openf4::assets::maxDemCellsPerEsm;
             }), "DEM terrain shard exceeded 1,048,576 CELLs");
         require(summary.widthMeters > 170'000.0 && summary.widthMeters < 172'000.0
                 && summary.heightMeters > 223'000.0 && summary.heightMeters < 225'000.0,

@@ -6,7 +6,7 @@
 
 #include <glm/glm.hpp>
 
-namespace empire::render
+namespace openf4::render
 {
     struct SourceVertex
     {

@@ -11,7 +11,7 @@
 
 #include <zlib.h>
 
-namespace empire::assets
+namespace openf4::assets
 {
     namespace
     {

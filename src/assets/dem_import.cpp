@@ -1,4 +1,5 @@
 #include "assets/dem_import.hpp"
+#include "assets/esm_document.hpp"
 
 #include <NifFile.hpp>
 #include <Shaders.hpp>
@@ -36,7 +37,7 @@
 #include <Windows.h>
 #endif
 
-namespace empire::assets
+namespace openf4::assets
 {
     namespace
     {
@@ -576,7 +577,7 @@ namespace empire::assets
             };
             Bytes body;
             appendSubrecord(body, hedr, Header{0.95f, recordCount, nextObjectId});
-            appendStringSubrecord(body, cnam, "EMPIRE");
+            appendStringSubrecord(body, cnam, "OpenF4");
             for (const std::string& master : masters)
             {
                 appendStringSubrecord(body, mast, master);
@@ -589,7 +590,7 @@ namespace empire::assets
         [[nodiscard]] Bytes makeWorldRecord()
         {
             Bytes body;
-            appendStringSubrecord(body, edid, "EmpireWorld");
+            appendStringSubrecord(body, edid, "OpenF4World");
             appendSubrecord(body, data, std::uint8_t{1});
             appendSubrecord(body, nam4, demDefaultWaterHeight);
             return makeRecord(wrld, worldFormId, body);
@@ -619,7 +620,7 @@ namespace empire::assets
             std::ostringstream text;
             text.imbue(std::locale::classic());
             text << std::setprecision(17)
-                 << "EMPIRE_DEM 1\nEPSG 4269 26918\nANCHOR "
+                 << "OPENF4_DEM 1\nEPSG 4269 26918\nANCHOR "
                  << timesSquareLongitude << ' ' << timesSquareLatitude
                  << "\nBOUNDS " << mosaic.west << ' ' << mosaic.south << ' '
                  << mosaic.east << ' ' << mosaic.north
@@ -748,7 +749,7 @@ namespace empire::assets
             const std::uint32_t landForm = importedSelfPrefix
                 | (planned.localCellForm + 1);
             Bytes cellBody;
-            appendStringSubrecord(cellBody, edid, "EmpireCell_"
+            appendStringSubrecord(cellBody, edid, "OpenF4Cell_"
                 + std::to_string(planned.coord.x) + "_"
                 + std::to_string(planned.coord.y));
             constexpr std::uint16_t hasWater = 0x0002;
@@ -957,7 +958,7 @@ namespace empire::assets
             nifly::NifFile file;
             file.Create(nifly::NiVersion::getFO4());
             nifly::NiShape* shape = file.CreateShapeFromData(
-                "EmpireWorld Terrain LOD", &vertices, &triangles, &uvs, &normals);
+                "OpenF4World Terrain LOD", &vertices, &triangles, &uvs, &normals);
             if (!shape)
                 throw std::runtime_error("Could not create BTR terrain shape");
             nifly::MatTransform transform;
@@ -996,7 +997,7 @@ namespace empire::assets
                 const std::filesystem::path directory = prepared.summary.btrDirectory
                     / ("r" + twoDigits(row) + "c" + twoDigits(column));
                 const std::filesystem::path path = directory
-                    / ("empireworld.32." + std::to_string(tile.first) + "."
+                    / ("openf4world.32." + std::to_string(tile.first) + "."
                         + std::to_string(tile.second) + ".btr");
                 bakeBtrTile(prepared, {tile.first, tile.second}, path);
                 ++written;
@@ -1215,7 +1216,7 @@ namespace empire::assets
                 const std::uint64_t topEnd = top + readStream<std::uint32_t>(mFile, top + 4);
                 std::uint64_t cursor = top + recordHeaderSize;
                 if (readStream<std::uint32_t>(mFile, cursor) != wrld)
-                    throw std::runtime_error("DEM ESM is missing EmpireWorld");
+                    throw std::runtime_error("DEM ESM is missing OpenF4World");
                 cursor += recordHeaderSize + readStream<std::uint32_t>(mFile, cursor + 4);
                 if (cursor == topEnd)
                     return;
@@ -1382,7 +1383,7 @@ namespace empire::assets
             for (const auto& [coord, entry] : cells)
             {
                 Bytes cellBody;
-                appendStringSubrecord(cellBody, edid, "EmpireCell_"
+                appendStringSubrecord(cellBody, edid, "OpenF4Cell_"
                     + std::to_string(coord.x) + "_" + std::to_string(coord.y));
                 constexpr std::uint16_t hasWater = 0x0002;
                 appendSubrecord(cellBody, data, hasWater);
@@ -1477,9 +1478,9 @@ namespace empire::assets
         explicit Impl(const std::filesystem::path& editorPath)
             : path(std::filesystem::absolute(editorPath)), header(readEsmHeader(path))
         {
-            if (!header.metadata.starts_with("EMPIRE_DEM 1\n")
+            if ((!header.metadata.starts_with("OPENF4_DEM 1\n") && !header.metadata.starts_with("EMPIRE_DEM 1\n"))
                 || header.metadata.find("\nROLE OVERLAY\n") == std::string::npos)
-                throw std::runtime_error("ESM is not an EMPIRE DEM editor overlay: "
+                throw std::runtime_error("ESM is not an OpenF4 DEM editor overlay: "
                     + path.string());
             if (header.masters.size() < 3 || header.masters.front() != "Fallout4.esm")
                 throw std::runtime_error("DEM overlay has an invalid master list");
@@ -1512,7 +1513,7 @@ namespace empire::assets
                 throw std::runtime_error("DEM overlay is missing its terrain shards");
             const std::uint32_t selfPrefix = static_cast<std::uint32_t>(
                 header.masters.size()) << 24u;
-            nextForm = selfPrefix | header.nextObjectId;
+            nextForm = std::max(selfPrefix | header.nextObjectId, EsmDocument(path).nextFormId());
 
             ShardReader overlayReader(path);
             for (auto& entry : overlayReader.all(std::nullopt))
@@ -1541,17 +1542,25 @@ namespace empire::assets
         void save(const EditableLandscape& landscape,
             const std::set<CellCoord>& changedCells)
         {
+            EsmDocument document(path);
+            std::vector<ESMTerrainCell> changes;
+            auto updated = overlay;
             for (const CellCoord coord : changedCells)
             {
                 const auto forms = landscape.cellForms.find(coord);
                 if (forms == landscape.cellForms.end())
                     throw std::runtime_error("Changed DEM cell is missing from the editor document");
-                overlay[coord] = {landscape.cell(coord), forms->second};
+                const auto cell = landscape.cell(coord);
+                updated[coord] = {cell, forms->second};
+                changes.push_back({cell, forms->second.cell, forms->second.land});
             }
-            if (overlay.size() > maxDemCellsPerEsm)
+            if (updated.size() > maxDemCellsPerEsm)
                 throw std::runtime_error("DEM overlay exceeds 1,048,576 cells");
-            nextForm = landscape.nextFormId;
-            replaceAtomic(path, serializeOverlay(header, overlay, nextForm));
+            document.replaceTerrainCells(changes);
+            document.setNextFormId(std::max(nextForm, landscape.nextFormId));
+            document.save();
+            overlay = std::move(updated);
+            nextForm = document.nextFormId();
             header.nextObjectId = nextForm & 0x00FFFFFFu;
         }
     };
@@ -1572,7 +1581,7 @@ namespace empire::assets
         try
         {
             const EslHeader header = readEsmHeader(editorPath);
-            return header.metadata.starts_with("EMPIRE_DEM 1\n")
+            return (header.metadata.starts_with("OPENF4_DEM 1\n") || header.metadata.starts_with("EMPIRE_DEM 1\n"))
                 && header.metadata.find("\nROLE OVERLAY\n") != std::string::npos;
         }
         catch (...)

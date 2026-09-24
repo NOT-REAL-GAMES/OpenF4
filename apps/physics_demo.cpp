@@ -36,9 +36,9 @@ namespace
         ~SdlGuard() { SDL_Quit(); }
     };
 
-    empire::assets::HavokRigidBody fallbackBox()
+    openf4::assets::HavokRigidBody fallbackBox()
     {
-        empire::assets::HavokRigidBody result;
+        openf4::assets::HavokRigidBody result;
         result.parts.emplace_back();
         auto& hull = result.parts.front().polytope;
         constexpr std::array<float, 2> signs{-1.0f, 1.0f};
@@ -50,18 +50,18 @@ namespace
         return result;
     }
 
-    empire::assets::HavokRigidBody loadAmmoBoxBody()
+    openf4::assets::HavokRigidBody loadAmmoBoxBody()
     {
-        const auto data = empire::assets::findFallout4Data();
+        const auto data = openf4::assets::findFallout4Data();
         if (!data)
         {
             std::cout << "Fallout 4 not found; using built-in box collision\n";
             return fallbackBox();
         }
         const std::filesystem::path archivePath = *data / "Fallout4 - Meshes.ba2";
-        empire::assets::Ba2Archive archive(archivePath);
+        openf4::assets::Ba2Archive archive(archivePath);
         constexpr std::string_view path = "Meshes\\SetDressing\\Ammo\\AmmoBoxNotSkinned.nif";
-        const auto systems = empire::assets::loadNifPhysicsSystems(archive.extract(path));
+        const auto systems = openf4::assets::loadNifPhysicsSystems(archive.extract(path));
         if (systems.empty() || systems.front().bodies.empty())
             throw std::runtime_error("Fallout 4 ammo box has no decoded Havok body");
         std::cout << "Collision: " << path << " ("
@@ -72,8 +72,8 @@ namespace
 
     struct CompressedMeshScene
     {
-        std::vector<empire::assets::HavokRigidBody> bodies;
-        empire::render::PackedMesh mesh;
+        std::vector<openf4::assets::HavokRigidBody> bodies;
+        openf4::render::PackedMesh mesh;
         glm::vec3 supportPoint{};
         std::size_t sections = 0;
         std::size_t vertices = 0;
@@ -83,16 +83,16 @@ namespace
 
     CompressedMeshScene loadCompressedMeshScene()
     {
-        const auto data = empire::assets::findFallout4Data();
+        const auto data = openf4::assets::findFallout4Data();
         if (!data)
             throw std::runtime_error("Fallout 4 is required for --compressed-mesh");
-        empire::assets::Ba2Archive archive(*data / "Fallout4 - Meshes.ba2");
+        openf4::assets::Ba2Archive archive(*data / "Fallout4 - Meshes.ba2");
         constexpr std::string_view path =
             "Meshes\\Architecture\\Unique\\OldStateHouse.nif";
-        const auto systems = empire::assets::loadNifPhysicsSystems(archive.extract(path));
+        const auto systems = openf4::assets::loadNifPhysicsSystems(archive.extract(path));
 
         CompressedMeshScene result;
-        std::vector<empire::render::SourceVertex> vertices;
+        std::vector<openf4::render::SourceVertex> vertices;
         std::vector<std::uint32_t> indices;
         float bestSupportArea = 0.0f;
         for (const auto& system : systems)
@@ -101,17 +101,17 @@ namespace
                 if (!body.triangleMesh)
                     continue;
                 const auto& collision = *body.triangleMesh;
-                const glm::mat4 bodyTransform = empire::physics::havokBodyLocalTransform(body);
+                const glm::mat4 bodyTransform = openf4::physics::havokBodyLocalTransform(body);
                 if (vertices.size() > std::numeric_limits<std::uint32_t>::max()
                     - collision.vertices.size())
                     throw std::runtime_error("OldStateHouse collision mesh is too large");
                 const std::uint32_t base = static_cast<std::uint32_t>(vertices.size());
                 for (const glm::vec3& vertex : collision.vertices)
                 {
-                    empire::render::SourceVertex source;
+                    openf4::render::SourceVertex source;
                     source.position = glm::vec3(bodyTransform * glm::vec4(
                         glm::vec3(vertex.x, vertex.z, vertex.y)
-                            * empire::physics::BethesdaUnitsPerMeter,
+                            * openf4::physics::BethesdaUnitsPerMeter,
                         1.0f));
                     source.normal = glm::vec3(0.0f);
                     vertices.push_back(source);
@@ -152,11 +152,11 @@ namespace
                 ? vertex.normal / std::sqrt(lengthSquared)
                 : glm::vec3(0.0f, 1.0f, 0.0f);
         }
-        result.mesh = empire::render::buildMeshlets(vertices, indices);
+        result.mesh = openf4::render::buildMeshlets(vertices, indices);
         return result;
     }
 
-    glm::vec3 centerHull(empire::assets::HavokConvexPolytope& hull)
+    glm::vec3 centerHull(openf4::assets::HavokConvexPolytope& hull)
     {
         glm::vec3 minimum(std::numeric_limits<float>::max());
         glm::vec3 maximum(std::numeric_limits<float>::lowest());
@@ -172,10 +172,10 @@ namespace
         return {extent.x, extent.z, extent.y};
     }
 
-    empire::render::SceneInstance makeInstance(const empire::render::MeshRange& mesh,
+    openf4::render::SceneInstance makeInstance(const openf4::render::MeshRange& mesh,
         const glm::mat4& transform)
     {
-        empire::render::SceneInstance result;
+        openf4::render::SceneInstance result;
         result.transform = transform;
         result.meshletOffset = mesh.meshletOffset;
         result.meshletCount = mesh.meshletCount;
@@ -208,26 +208,26 @@ try
         }
         else
             throw std::runtime_error(
-                "Usage: empire-physics-demo [--compressed-mesh] [--frames count]");
+                "Usage: openf4-physics-demo [--compressed-mesh] [--frames count]");
     }
 
     SdlGuard sdl;
     SDL_Window* window = SDL_CreateWindow(compressedMesh
-            ? "EMPIRE - Havok Compressed Mesh Demo" : "EMPIRE - Jolt Havok Demo",
+            ? "OpenF4 - Havok Compressed Mesh Demo" : "OpenF4 - Jolt Havok Demo",
         1280, 720,
         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window)
         throw std::runtime_error(SDL_GetError());
 
-    empire::physics::JoltWorld physics;
+    openf4::physics::JoltWorld physics;
     auto bodyDefinition = loadAmmoBoxBody();
     auto& hull = bodyDefinition.parts.front().polytope;
-    const glm::vec3 boxHalfExtent = centerHull(hull) * empire::physics::BethesdaUnitsPerMeter;
-    const auto collisionShape = empire::physics::makeJoltCollisionShape(bodyDefinition);
-    constexpr float units = empire::physics::BethesdaUnitsPerMeter;
+    const glm::vec3 boxHalfExtent = centerHull(hull) * openf4::physics::BethesdaUnitsPerMeter;
+    const auto collisionShape = openf4::physics::makeJoltCollisionShape(bodyDefinition);
+    constexpr float units = openf4::physics::BethesdaUnitsPerMeter;
 
-    empire::render::PackedMesh sceneMesh;
-    empire::render::MeshRange staticRange;
+    openf4::render::PackedMesh sceneMesh;
+    openf4::render::MeshRange staticRange;
     glm::vec3 dropOrigin(0.0f);
     glm::vec3 camera(7.0f * units, 5.0f * units, 9.0f * units);
     glm::vec3 cameraTarget(0.0f, 1.2f * units, 0.0f);
@@ -236,15 +236,15 @@ try
     if (compressedMesh)
     {
         auto collision = loadCompressedMeshScene();
-        staticRange = empire::render::appendMesh(sceneMesh, std::move(collision.mesh));
+        staticRange = openf4::render::appendMesh(sceneMesh, std::move(collision.mesh));
         dropOrigin = collision.supportPoint;
         camera = dropOrigin + glm::vec3(13.0f, 8.0f, 15.0f) * units;
         cameraTarget = dropOrigin;
         cameraFar = 300.0f * units;
         for (const auto& body : collision.bodies)
         {
-            const auto shape = empire::physics::makeJoltCollisionShape(body);
-            const glm::mat4 transform = empire::physics::havokBodyLocalTransform(body);
+            const auto shape = openf4::physics::makeJoltCollisionShape(body);
+            const glm::mat4 transform = openf4::physics::havokBodyLocalTransform(body);
             const glm::quat rotation = glm::normalize(glm::quat_cast(glm::mat3(transform)));
             (void)physics.addStaticBody(shape, glm::vec3(transform[3]), rotation);
         }
@@ -258,26 +258,26 @@ try
     {
         (void)physics.addStaticBox({8.0f * units, 0.25f * units, 8.0f * units},
             {0.0f, -0.25f * units, 0.0f});
-        staticRange = empire::render::appendMesh(
-            sceneMesh, empire::render::makeCubeMesh());
+        staticRange = openf4::render::appendMesh(
+            sceneMesh, openf4::render::makeCubeMesh());
     }
 
-    auto boxMesh = empire::render::makeCubeMesh();
+    auto boxMesh = openf4::render::makeCubeMesh();
     for (auto& meshlet : boxMesh.meshlets)
         meshlet.materialIndex = 1;
-    const auto boxRange = empire::render::appendMesh(sceneMesh, std::move(boxMesh));
+    const auto boxRange = openf4::render::appendMesh(sceneMesh, std::move(boxMesh));
 
-    std::vector<empire::render::SceneMaterial> materials(2);
+    std::vector<openf4::render::SceneMaterial> materials(2);
     materials[0].baseColor = {0.14f, 0.17f, 0.2f, 1.0f};
     materials[1].baseColor = {0.85f, 0.42f, 0.12f, 1.0f};
-    std::vector<empire::render::SceneInstance> instances;
+    std::vector<openf4::render::SceneInstance> instances;
     instances.push_back(makeInstance(staticRange, compressedMesh
             ? glm::mat4(1.0f)
             : glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -0.25f * units, 0.0f))
                 * glm::scale(glm::mat4(1.0f),
                     glm::vec3(8.0f, 0.25f, 8.0f) * units)));
 
-    std::vector<empire::physics::BodyHandle> bodies;
+    std::vector<openf4::physics::BodyHandle> bodies;
     const int layers = compressedMesh ? 4 : 6;
     const int columns = compressedMesh ? 4 : 5;
     for (int layer = 0; layer < layers; ++layer)
@@ -299,7 +299,7 @@ try
         }
     }
 
-    empire::render::VulkanRenderer renderer(window, sceneMesh, instances, materials);
+    openf4::render::VulkanRenderer renderer(window, sceneMesh, instances, materials);
     std::cout << "GPU: " << renderer.deviceName() << '\n'
               << "Jolt: dropping " << bodies.size() << " decoded ammo-box hulls\n"
               << "Press Escape to quit\n";
@@ -339,7 +339,7 @@ try
         {
             const auto view = glm::lookAtRH(camera, cameraTarget,
                 {0.0f, 1.0f, 0.0f});
-            auto projection = empire::render::reverseZPerspectiveRH_ZO(glm::radians(65.0f),
+            auto projection = openf4::render::reverseZPerspectiveRH_ZO(glm::radians(65.0f),
                 static_cast<float>(width) / static_cast<float>(height),
                 0.05f * units, cameraFar);
             projection[1][1] *= -1.0f;
@@ -356,6 +356,6 @@ try
 catch (const std::exception& error)
 {
     std::cerr << error.what() << '\n';
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "EMPIRE", error.what(), nullptr);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenF4", error.what(), nullptr);
     return 1;
 }

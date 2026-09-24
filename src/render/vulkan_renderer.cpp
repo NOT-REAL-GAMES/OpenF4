@@ -23,7 +23,7 @@
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
 
-namespace empire::render
+namespace openf4::render
 {
     namespace
     {
@@ -566,6 +566,8 @@ void main()
         std::vector<VkImageLayout> swapchainLayouts;
         std::vector<DepthTarget> depthTargets;
         std::vector<VkSemaphore> presentSemaphores;
+        std::uint32_t minSwapchainImageCount = frameCount;
+        std::uint64_t swapchainGeneration = 0;
 
         VkCommandPool commandPool = VK_NULL_HANDLE;
         VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
@@ -736,9 +738,9 @@ void main()
             if (!extensions)
                 throw std::runtime_error(SDL_GetError());
             VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-            application.pApplicationName = "EMPIRE";
+            application.pApplicationName = "OpenF4";
             application.applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
-            application.pEngineName = "EMPIRE";
+            application.pEngineName = "OpenF4";
             application.engineVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
             application.apiVersion = VK_API_VERSION_1_3;
             VkInstanceCreateInfo createInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -799,11 +801,14 @@ void main()
 #ifdef _WIN32
                         char* sparseSetting = nullptr;
                         std::size_t sparseSettingSize = 0;
-                        _dupenv_s(&sparseSetting, &sparseSettingSize, "EMPIRE_DISABLE_SPARSE");
+                        _dupenv_s(&sparseSetting, &sparseSettingSize, "OPENF4_DISABLE_SPARSE");
+                        if (!sparseSetting)
+                            _dupenv_s(&sparseSetting, &sparseSettingSize, "EMPIRE_DISABLE_SPARSE");
                         sparseDisabled = sparseSetting != nullptr;
                         std::free(sparseSetting);
 #else
-                        sparseDisabled = std::getenv("EMPIRE_DISABLE_SPARSE") != nullptr;
+                        sparseDisabled = std::getenv("OPENF4_DISABLE_SPARSE") != nullptr
+                            || std::getenv("EMPIRE_DISABLE_SPARSE") != nullptr;
 #endif
                         if (sparseDisabled)
                             sparseTexturesSupported = false;
@@ -847,7 +852,12 @@ void main()
             VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features13};
             features.features.sparseBinding = sparseTexturesSupported;
             features.features.sparseResidencyImage2D = sparseTexturesSupported;
-            constexpr std::array extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_MESH_SHADER_EXTENSION_NAME};
+            // Dear ImGui's Vulkan backend uses the KHR entry points for its
+            // dynamic-rendering path, including on Vulkan 1.3 implementations.
+            constexpr std::array extensions{
+                VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+                VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+                VK_EXT_MESH_SHADER_EXTENSION_NAME};
             VkDeviceCreateInfo createInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &features};
             createInfo.queueCreateInfoCount = 1;
             createInfo.pQueueCreateInfos = &queueInfo;
@@ -1008,6 +1018,8 @@ void main()
             std::uint32_t imageCount = std::max(capabilities.minImageCount + 1, frameCount);
             if (capabilities.maxImageCount > 0)
                 imageCount = std::min(imageCount, capabilities.maxImageCount);
+            minSwapchainImageCount = std::min(imageCount,
+                std::max(capabilities.minImageCount, frameCount));
             VkSwapchainCreateInfoKHR createInfo{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
             createInfo.surface = surface;
             createInfo.minImageCount = imageCount;
@@ -1027,6 +1039,7 @@ void main()
             swapchainImages.resize(imageCount);
             check(vkGetSwapchainImagesKHR(device, swapchain, &imageCount, swapchainImages.data()),
                 "vkGetSwapchainImagesKHR");
+            minSwapchainImageCount = std::min(minSwapchainImageCount, imageCount);
             swapchainLayouts.assign(imageCount, VK_IMAGE_LAYOUT_UNDEFINED);
             swapchainViews.resize(imageCount);
             depthTargets.resize(imageCount);
@@ -1065,6 +1078,7 @@ void main()
                 check(vkCreateImageView(device, &viewInfo, nullptr, &depthTargets[index].view),
                     "vkCreateImageView");
             }
+            ++swapchainGeneration;
         }
 
         void destroySwapchain()
@@ -2470,7 +2484,8 @@ void main()
         }
 
         void render(const glm::mat4& view, const glm::mat4& projection,
-            const glm::vec3& cameraPosition, const glm::vec3& worldOrigin)
+            const glm::vec3& cameraPosition, const glm::vec3& worldOrigin,
+            std::optional<RenderViewport> requestedViewport, const UiDrawCallback& drawUi)
         {
             const auto cpuStart = std::chrono::steady_clock::now();
             Frame& frame = frames[currentFrame];
@@ -2504,6 +2519,22 @@ void main()
                 check(acquire, "vkAcquireNextImageKHR");
             check(vkResetCommandBuffer(frame.commandBuffer, 0), "vkResetCommandBuffer");
 
+            const auto clampedOffset = [](std::int32_t offset, std::uint32_t limit) {
+                return static_cast<std::uint32_t>(std::clamp(offset, 0,
+                    static_cast<std::int32_t>(limit)));
+            };
+            const std::uint32_t viewportX = requestedViewport
+                ? clampedOffset(requestedViewport->x, extent.width) : 0;
+            const std::uint32_t viewportY = requestedViewport
+                ? clampedOffset(requestedViewport->y, extent.height) : 0;
+            const std::uint32_t viewportWidth = std::min(
+                requestedViewport ? requestedViewport->width : extent.width,
+                extent.width - viewportX);
+            const std::uint32_t viewportHeight = std::min(
+                requestedViewport ? requestedViewport->height : extent.height,
+                extent.height - viewportY);
+            const bool drawWorld = viewportWidth != 0 && viewportHeight != 0;
+
             CameraData camera;
             camera.viewProjection = projection * view;
             const glm::vec3 lightDirection = glm::normalize(glm::vec3(0.35f, 0.8f, 0.25f));
@@ -2522,8 +2553,10 @@ void main()
             int logicalHeight = 0;
             SDL_GetWindowSize(window, &logicalWidth, &logicalHeight);
             camera.counts = glm::uvec4(candidateCount, candidateCount,
-                static_cast<std::uint32_t>(std::max(logicalWidth, 1)),
-                static_cast<std::uint32_t>(std::max(logicalHeight, 1)));
+                requestedViewport ? std::max(viewportWidth, 1u)
+                                  : static_cast<std::uint32_t>(std::max(logicalWidth, 1)),
+                requestedViewport ? std::max(viewportHeight, 1u)
+                                  : static_cast<std::uint32_t>(std::max(logicalHeight, 1)));
             std::memcpy(frame.uniform.mapped, &camera, sizeof(camera));
             check(vmaFlushAllocation(allocator, frame.uniform.allocation, 0, sizeof(camera)),
                 "vmaFlushAllocation");
@@ -2638,19 +2671,25 @@ void main()
             rendering.pColorAttachments = &color;
             rendering.pDepthAttachment = &depthAttachment;
             vkCmdBeginRendering(frame.commandBuffer, &rendering);
-            const VkViewport viewport{0.0f, 0.0f, static_cast<float>(extent.width),
-                static_cast<float>(extent.height), 0.0f, 1.0f};
-            const VkRect2D scissor{{0, 0}, extent};
-            vkCmdSetViewport(frame.commandBuffer, 0, 1, &viewport);
-            vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
-            vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
-            vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                pipelineLayout, 0, 1, &frame.descriptorSet, 0, nullptr);
-            drawMeshTasksIndirect(frame.commandBuffer, frame.indirect.handle, 0, 1,
-                sizeof(VkDrawMeshTasksIndirectCommandEXT));
-            vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, decalPipeline);
-            drawMeshTasksIndirect(frame.commandBuffer, frame.indirect.handle, 0, 1,
-                sizeof(VkDrawMeshTasksIndirectCommandEXT));
+            if (drawWorld)
+            {
+                const VkViewport viewport{static_cast<float>(viewportX), static_cast<float>(viewportY),
+                    static_cast<float>(viewportWidth), static_cast<float>(viewportHeight), 0.0f, 1.0f};
+                const VkRect2D scissor{{static_cast<std::int32_t>(viewportX),
+                    static_cast<std::int32_t>(viewportY)}, {viewportWidth, viewportHeight}};
+                vkCmdSetViewport(frame.commandBuffer, 0, 1, &viewport);
+                vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
+                vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+                vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    pipelineLayout, 0, 1, &frame.descriptorSet, 0, nullptr);
+                drawMeshTasksIndirect(frame.commandBuffer, frame.indirect.handle, 0, 1,
+                    sizeof(VkDrawMeshTasksIndirectCommandEXT));
+                vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, decalPipeline);
+                drawMeshTasksIndirect(frame.commandBuffer, frame.indirect.handle, 0, 1,
+                    sizeof(VkDrawMeshTasksIndirectCommandEXT));
+            }
+            if (drawUi)
+                drawUi(frame.commandBuffer);
             vkCmdEndRendering(frame.commandBuffer);
 
             imageBarrier(frame.commandBuffer, swapchainImages[imageIndex],
@@ -2700,6 +2739,14 @@ void main()
             rendererStats.cpuFrameMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - cpuStart).count();
         }
+
+        [[nodiscard]] UiContext uiContext() const noexcept
+        {
+            return {instance, physicalDevice, device, queue, queueFamily, swapchainFormat,
+                VK_FORMAT_D32_SFLOAT,
+                minSwapchainImageCount, static_cast<std::uint32_t>(swapchainImages.size()),
+                swapchainGeneration};
+        }
     };
 
     VulkanRenderer::VulkanRenderer(
@@ -2718,9 +2765,10 @@ void main()
 
     void VulkanRenderer::render(
         const glm::mat4& view, const glm::mat4& projection,
-        const glm::vec3& cameraPosition, const glm::vec3& worldOrigin)
+        const glm::vec3& cameraPosition, const glm::vec3& worldOrigin,
+        std::optional<RenderViewport> viewport, const UiDrawCallback& drawUi)
     {
-        mImpl->render(view, projection, cameraPosition, worldOrigin);
+        mImpl->render(view, projection, cameraPosition, worldOrigin, viewport, drawUi);
     }
 
     std::uint32_t VulkanRenderer::addTexture(SceneTexture texture)
@@ -2779,5 +2827,10 @@ void main()
     const std::string& VulkanRenderer::deviceName() const noexcept
     {
         return mImpl->gpuName;
+    }
+
+    UiContext VulkanRenderer::uiContext() const noexcept
+    {
+        return mImpl->uiContext();
     }
 }

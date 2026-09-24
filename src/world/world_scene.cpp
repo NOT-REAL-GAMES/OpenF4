@@ -1,12 +1,14 @@
 #include "world/world_scene.hpp"
 
 #include "assets/ba2_archive.hpp"
+#include "assets/asset_resolver.hpp"
 #include "assets/dds_texture.hpp"
 #include "assets/dem_import.hpp"
 #include "assets/dx10_archive.hpp"
 #include "assets/havok_packfile.hpp"
 #include "assets/material_file.hpp"
 #include "assets/nif_model.hpp"
+#include "assets/model_import.hpp"
 #include "physics/jolt_collision.hpp"
 
 #include <algorithm>
@@ -36,7 +38,7 @@
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 
-namespace empire::world
+namespace openf4::world
 {
     bool isRenderableModelPath(std::string_view path)
     {
@@ -68,7 +70,8 @@ namespace empire::world
         std::ranges::transform(name, name.begin(), [](unsigned char value) {
             return static_cast<char>(std::tolower(value));
         });
-        constexpr std::string_view prefix = "empireworld.32.";
+        const std::string_view prefix = name.starts_with("openf4world.32.")
+            ? "openf4world.32." : "empireworld.32.";
         constexpr std::string_view suffix = ".btr";
         std::string_view value(name);
         if (!value.starts_with(prefix) || !value.ends_with(suffix))
@@ -87,6 +90,18 @@ namespace empire::world
             || parsedY.ec != std::errc{} || parsedY.ptr != y.data() + y.size())
             return std::nullopt;
         return result;
+    }
+
+    bool detail::preferDemBtr(const std::filesystem::path& candidate,
+        const std::filesystem::path& current)
+    {
+        const auto candidateOrigin = demBtrOrigin(candidate);
+        if (!candidateOrigin || candidateOrigin != demBtrOrigin(current)) return false;
+        // Both paths have validated prefixes; O distinguishes the current branding.
+        const auto isCurrent = [](const std::filesystem::path& path) {
+            return std::tolower(static_cast<unsigned char>(path.filename().string().front())) == 'o';
+        };
+        return isCurrent(candidate) && !isCurrent(current);
     }
 
     bool detail::repairLegacyDemBtrGrid(std::span<render::SourceVertex> vertices,
@@ -356,73 +371,12 @@ namespace empire::world
             return result;
         }
 
-        class Archives
+        class Archives : public assets::AssetResolver
         {
         public:
-            explicit Archives(const std::filesystem::path& data)
-            {
-                for (const char* name : {"Fallout4 - MeshesExtra.ba2", "Fallout4 - Meshes.ba2",
-                         "Fallout4 - Materials.ba2"})
-                {
-                    const auto path = data / name;
-                    if (std::filesystem::is_regular_file(path))
-                        general.emplace_back(std::make_unique<assets::Ba2Archive>(path));
-                }
-                constexpr std::array textureNames{
-                    "Fallout4 - TexturesPatch.ba2", "Fallout4 - Textures1.ba2",
-                    "Fallout4 - Textures2.ba2", "Fallout4 - Textures3.ba2",
-                    "Fallout4 - Textures4.ba2", "Fallout4 - Textures5.ba2",
-                    "Fallout4 - Textures6.ba2", "Fallout4 - Textures7.ba2",
-                    "Fallout4 - Textures8.ba2", "Fallout4 - Textures9.ba2"};
-                for (const char* name : textureNames)
-                {
-                    const auto path = data / name;
-                    if (std::filesystem::is_regular_file(path))
-                        textures.emplace_back(std::make_unique<assets::Dx10Archive>(path));
-                }
-            }
-
-            std::vector<std::byte> extract(std::string_view path) const
-            {
-                for (const auto& archive : general)
-                    if (archive->contains(path))
-                        return archive->extract(path);
-                throw std::runtime_error("Asset is not present in Fallout 4 archives: " + std::string(path));
-            }
-
-            bool contains(std::string_view path) const
-            {
-                return std::ranges::any_of(general,
-                    [&](const auto& archive) { return archive->contains(path); });
-            }
-
-            std::vector<std::string> files(
-                std::string_view prefix, std::string_view suffix) const
-            {
-                std::set<std::string> matches;
-                for (const auto& archive : general)
-                {
-                    for (const auto& [path, entry] : archive->entries())
-                    {
-                        (void)entry;
-                        if (path.starts_with(prefix) && path.ends_with(suffix))
-                            matches.insert(path);
-                    }
-                }
-                return {matches.begin(), matches.end()};
-            }
-
-            std::vector<std::byte> extractTexture(std::string_view path) const
-            {
-                for (const auto& archive : textures)
-                    if (archive->contains(path))
-                        return archive->extractDds(path);
-                throw std::runtime_error("Texture is not present in Fallout 4 archives: " + std::string(path));
-            }
-
-        private:
-            std::vector<std::unique_ptr<assets::Ba2Archive>> general;
-            std::vector<std::unique_ptr<assets::Dx10Archive>> textures;
+            explicit Archives(const std::filesystem::path& data,
+                const std::filesystem::path& master = {})
+                : AssetResolver(master.empty() ? data / "Fallout4.esm" : master, data) {}
         };
 
         render::TextureFormat textureFormat(std::uint32_t dxgiFormat)
@@ -443,6 +397,20 @@ namespace empire::world
                 case 87: return render::TextureFormat::bgra8;
                 default: throw std::runtime_error("Unsupported scene texture format");
             }
+        }
+
+        render::SceneTexture sceneTexture(const assets::ModelImage& image)
+        {
+            render::SceneTexture result;
+            result.width = image.width;
+            result.height = image.height;
+            result.mipLevels = image.mipLevels;
+            result.format = image.encoding == assets::ModelImageEncoding::dds
+                ? textureFormat(image.dxgiFormat)
+                : image.srgb ? render::TextureFormat::rgba8Srgb : render::TextureFormat::rgba8;
+            result.pixels = image.pixels;
+            result.mipOffsets = image.mipOffsets;
+            return result;
         }
 
         struct PreparedTexture
@@ -471,6 +439,32 @@ namespace empire::world
                 fallback.mipOffsets = {0};
                 mScene.textures.push_back(std::move(fallback));
                 mScene.materials.push_back({});
+            }
+
+            PreparedMaterial prepareSurface(const assets::ModelSurface& surface,
+                const std::string& key, const assets::MaterialSwapRecord* swap = nullptr) const
+            {
+                auto prepared = prepare(surface.materialPath, surface.diffuseTexture,
+                    surface.normalTexture, surface.alphaCutoff, swap, surface.decal);
+                prepared.key = key;
+                prepared.source.baseColor *= surface.baseColor;
+                if (surface.alphaBlend)
+                {
+                    prepared.source.alphaCutoff = 0.5f;
+                    prepared.warnings.push_back("Imported alpha blend uses a 0.5 cutout fallback; sorted transparency is not yet supported");
+                }
+                if (surface.doubleSided)
+                    prepared.warnings.push_back("Imported double-sided material uses back-face culling in the current renderer");
+                const auto copyImage = [&](const std::optional<assets::ModelImage>& image,
+                                           std::size_t slot) {
+                    if (!image)
+                        return;
+                    prepared.textures[slot] = {key + "/image" + std::to_string(slot),
+                        sceneTexture(*image), {}};
+                };
+                copyImage(surface.diffuseImage, 0);
+                copyImage(surface.normalImage, 1);
+                return prepared;
             }
 
             std::uint32_t add(std::string_view materialPath, std::string_view directDiffuse,
@@ -1735,7 +1729,7 @@ namespace empire::world
             // dependency graph when inherited records are needed for standalone mod loading.
             : world(masterPath ? assets::loadExteriorWorld(*masterPath)
                                : assets::loadCommonwealth(dataDirectory / "Fallout4.esm"))
-            , archives(dataDirectory)
+            , archives(dataDirectory, masterPath.value_or(dataDirectory / "Fallout4.esm"))
             , materials(archives, initial)
             , fullRadius(cellRadius)
             , lodRadius(std::min(cellRadius + 4, 8))
@@ -3017,6 +3011,8 @@ namespace empire::world
             const auto model = world.models.find(request.reference.baseObject);
             if (model != world.models.end())
             {
+                if (archives.contains(model->second))
+                    return model->second;
                 auto path = assetPath(model->second, "meshes\\", ".nif");
                 if (archives.contains(path))
                     return path;
@@ -3335,10 +3331,21 @@ namespace empire::world
         PreparedModel prepareModel(
             const std::string& path, const ModelKey& key, bool prepareCollision) const
         {
-            const auto bytes = archives.extract(path);
-            auto geometry = assets::loadNifModel(bytes);
+            auto extension = std::filesystem::path(path).extension().string();
+            std::ranges::transform(extension, extension.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            const bool isNif = extension == ".nif" || extension == ".btr" || extension == ".bto";
+            const auto bytes = isNif ? archives.extract(path) : std::vector<std::byte>{};
+            assets::ModelGeometry geometry;
+            if (isNif)
+                geometry = assets::loadNifModel(bytes);
+            else if (const auto loose = archives.resolveLoose(path))
+                geometry = assets::importModel(*loose).geometry;
+            else
+                throw std::runtime_error("Imported model source not found: " + path);
             PreparedModel result;
-            if (prepareCollision)
+            if (prepareCollision && isNif)
             {
                 result.collision.emplace();
                 try
@@ -3403,8 +3410,10 @@ namespace empire::world
                     continue;
                 result.surfaces.push_back({
                     render::buildMeshlets(surface.vertices, surface.indices),
-                    materials.prepare(surface.materialPath, surface.diffuseTexture,
-                        surface.normalTexture, surface.alphaCutoff, materialSwap, surface.decal)});
+                    isNif ? materials.prepare(surface.materialPath, surface.diffuseTexture,
+                        surface.normalTexture, surface.alphaCutoff, materialSwap, surface.decal)
+                        : materials.prepareSurface(surface,
+                            path + "/" + std::to_string(result.surfaces.size()), materialSwap)});
             }
             if (result.surfaces.empty())
                 throw std::runtime_error("NIF contains no streamable surfaces");
@@ -3875,6 +3884,236 @@ namespace empire::world
         }
     };
 
+    struct ObjectScene::Impl
+    {
+        struct Resources
+        {
+            WorldScene scratch;
+            Archives archives;
+            Materials materials;
+            Resources(const std::filesystem::path& data, const std::filesystem::path& master)
+                : archives(data, master), materials(archives, scratch) {}
+        };
+        struct Surface
+        {
+            render::PackedMesh mesh;
+            PreparedMaterial material;
+        };
+        struct Prepared
+        {
+            std::vector<Surface> surfaces;
+            std::vector<std::string> warnings;
+        };
+        struct Model
+        {
+            std::shared_ptr<Resources> resources;
+            std::future<Prepared> job;
+            std::optional<render::MeshRange> range;
+            bool failed = false;
+        };
+        struct Instance
+        {
+            std::uint32_t id = 0;
+            std::string model;
+            glm::mat4 transform{1.0f};
+            glm::vec4 bounds{};
+            bool active = false;
+        };
+        std::filesystem::path data;
+        std::filesystem::path master;
+        std::map<std::filesystem::path, std::shared_ptr<Resources>> resources;
+        std::map<std::string, Model> models;
+        std::map<std::uint32_t, Instance> instances;
+        std::vector<std::string> messages;
+        std::size_t pending = 0;
+        std::size_t active = 0;
+
+        Impl(std::filesystem::path dataPath, std::filesystem::path masterPath)
+            : data(std::move(dataPath)), master(std::move(masterPath)) {}
+
+        void warn(const std::string& message)
+        {
+            std::cerr << "Object stream: " << message << '\n';
+            if (messages.size() == 100)
+                messages.erase(messages.begin());
+            messages.push_back(message);
+        }
+
+        void update(render::VulkanRenderer& renderer,
+            std::span<const assets::PlacedReference> references,
+            const std::map<std::uint32_t, std::string>& paths,
+            const std::unordered_map<std::uint32_t, std::filesystem::path>& sources,
+            const glm::dvec3& camera, std::span<const std::uint32_t> hidden)
+        {
+            std::size_t running = 0;
+            bool installed = false;
+            for (auto& [key, model] : models)
+            {
+                if (!model.job.valid())
+                    continue;
+                if (installed || model.job.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                {
+                    ++running;
+                    continue;
+                }
+                installed = true;
+                try
+                {
+                    auto prepared = model.job.get();
+                    render::PackedMesh combined;
+                    for (auto& surface : prepared.surfaces)
+                    {
+                        const auto material = model.resources->materials.addPreparedDynamic(
+                            renderer, std::move(surface.material));
+                        for (auto& meshlet : surface.mesh.meshlets)
+                            meshlet.materialIndex = material;
+                        (void)render::appendMesh(combined, std::move(surface.mesh));
+                    }
+                    model.range = renderer.addMesh(std::move(combined));
+                    for (const auto& warning : prepared.warnings)
+                        warn(warning);
+                }
+                catch (const std::exception& error)
+                {
+                    model.failed = true;
+                    warn(key + ": " + error.what());
+                }
+            }
+            const assets::CellCoord center{
+                static_cast<std::int32_t>(std::floor(-camera.x / cellSize)),
+                static_cast<std::int32_t>(std::floor(camera.z / cellSize))};
+            const std::set<std::uint32_t> hiddenSet(hidden.begin(), hidden.end());
+            std::set<std::uint32_t> visible;
+            pending = active = 0;
+            const std::size_t workerLimit = std::clamp<std::size_t>(
+                std::max(1u, std::thread::hardware_concurrency()) / 2u, 2u, 16u);
+            for (const auto& reference : references)
+            {
+                if (hiddenSet.contains(reference.formId)
+                    || std::abs(static_cast<std::int64_t>(reference.cell.x) - center.x) > 4
+                    || std::abs(static_cast<std::int64_t>(reference.cell.y) - center.y) > 4)
+                    continue;
+                const auto path = paths.find(reference.baseObject);
+                if (path == paths.end())
+                    continue;
+                const auto source = sources.find(reference.baseObject);
+                const auto& sourcePath = source == sources.end() ? master : source->second;
+                const auto key = sourcePath.generic_string() + ":" + path->second;
+                auto& model = models[key];
+                if (!model.resources)
+                {
+                    auto& pack = resources[sourcePath];
+                    if (!pack)
+                        pack = std::make_shared<Resources>(data, sourcePath);
+                    model.resources = pack;
+                }
+                if (model.failed)
+                    continue;
+                if (!model.range)
+                {
+                    ++pending;
+                    if (!model.job.valid() && running < workerLimit)
+                    {
+                        ++running;
+                        model.job = std::async(std::launch::async,
+                            [pack = model.resources, relative = path->second, key] {
+                                Prepared result;
+                                assets::ModelGeometry geometry;
+                                std::string extension = std::filesystem::path(relative).extension().string();
+                                std::ranges::transform(extension, extension.begin(), [](unsigned char c) {
+                                    return static_cast<char>(std::tolower(c));
+                                });
+                                if (extension == ".nif" || extension == ".bto" || extension == ".btr")
+                                {
+                                    const auto nifPath = pack->archives.contains(relative) ? relative
+                                        : assetPath(relative, "meshes\\", ".nif");
+                                    geometry = assets::loadNifModel(pack->archives.extract(nifPath));
+                                }
+                                else
+                                {
+                                    const auto loose = pack->archives.resolveLoose(relative);
+                                    if (!loose)
+                                        throw std::runtime_error("Imported model source is missing: " + relative);
+                                    auto imported = assets::importModel(*loose);
+                                    geometry = std::move(imported.geometry);
+                                    result.warnings = std::move(imported.warnings);
+                                }
+                                for (std::size_t i = 0; i < geometry.surfaces.size(); ++i)
+                                {
+                                    const auto& surface = geometry.surfaces[i];
+                                    if (surface.vertices.empty() || surface.indices.empty())
+                                        continue;
+                                    result.surfaces.push_back({render::buildMeshlets(
+                                        surface.vertices, surface.indices), pack->materials.prepareSurface(
+                                            surface, key + "/" + std::to_string(i))});
+                                }
+                                if (result.surfaces.empty())
+                                    throw std::runtime_error("Model contains no renderable triangles");
+                                return result;
+                            });
+                    }
+                    continue;
+                }
+                const auto transform = referenceTransform(reference);
+                const auto projected = makeInstance(*model.range, transform);
+                auto found = instances.find(reference.formId);
+                if (found != instances.end() && found->second.model != key)
+                {
+                    const std::array ids{found->second.id};
+                    renderer.setInstancesActive(ids, false);
+                    instances.erase(found);
+                    found = instances.end();
+                }
+                if (found == instances.end())
+                {
+                    found = instances.emplace(reference.formId, Instance{
+                        renderer.addInstance(projected), key, transform, projected.bounds, true}).first;
+                }
+                auto& instance = found->second;
+                if (instance.transform != transform)
+                {
+                    renderer.updateInstanceTransform(instance.id, transform, projected.bounds);
+                    instance.transform = transform;
+                    instance.bounds = projected.bounds;
+                }
+                visible.insert(reference.formId);
+                ++active;
+            }
+            for (auto& [formId, instance] : instances)
+            {
+                const bool wanted = visible.contains(formId);
+                if (instance.active != wanted)
+                {
+                    const std::array ids{instance.id};
+                    renderer.setInstancesActive(ids, wanted);
+                    instance.active = wanted;
+                }
+            }
+        }
+    };
+
+    ObjectScene::ObjectScene(const std::filesystem::path& dataDirectory,
+        const std::filesystem::path& masterPath)
+        : mImpl(std::make_unique<Impl>(dataDirectory, masterPath)) {}
+    ObjectScene::~ObjectScene() = default;
+    void ObjectScene::update(render::VulkanRenderer& renderer,
+        std::span<const assets::PlacedReference> references,
+        const std::map<std::uint32_t, std::string>& models,
+        const std::unordered_map<std::uint32_t, std::filesystem::path>& sources,
+        const glm::dvec3& camera, std::span<const std::uint32_t> hidden)
+    {
+        mImpl->update(renderer, references, models, sources, camera, hidden);
+    }
+    std::optional<glm::vec4> ObjectScene::bounds(std::uint32_t formId) const
+    {
+        const auto found = mImpl->instances.find(formId);
+        return found == mImpl->instances.end() || !found->second.active
+            ? std::nullopt : std::optional(found->second.bounds);
+    }
+    std::size_t ObjectScene::pending() const noexcept { return mImpl->pending; }
+    std::size_t ObjectScene::loaded() const noexcept { return mImpl->active; }
+    const std::vector<std::string>& ObjectScene::diagnostics() const noexcept { return mImpl->messages; }
+
     struct LandscapeEditor::Impl
     {
         static constexpr std::int32_t demCellRadius = 4;
@@ -4010,6 +4249,8 @@ namespace empire::world
         bool initialTaken = false;
         bool strokeActive = false;
         bool brushVisible = false;
+        bool brushEnabled = true;
+        bool externalSave = false;
         bool readOnly = false;
         assets::EditableLandscape strokeBefore;
         glm::vec2 brushCenter{std::numeric_limits<float>::max()};
@@ -4035,7 +4276,11 @@ namespace empire::world
                 if (!entry.is_regular_file())
                     continue;
                 if (const auto origin = detail::demBtrOrigin(entry.path()))
-                    demBtrTiles.try_emplace(*origin, DemBtrTile{entry.path()});
+                {
+                    const auto [tile, inserted] = demBtrTiles.try_emplace(*origin, DemBtrTile{entry.path()});
+                    if (!inserted && detail::preferDemBtr(entry.path(), tile->second.path))
+                        tile->second = DemBtrTile{entry.path()};
+                }
             }
         }
 
@@ -4151,7 +4396,7 @@ namespace empire::world
             const render::MeshRange& range, const glm::mat4& transform, bool coarse) const
         {
             auto instance = makeInstance(range, transform);
-            if (readOnly)
+            if (demProject)
                 instance.lodRange = detail::demTerrainLodRange(coarse);
             return instance;
         }
@@ -4356,8 +4601,6 @@ namespace empire::world
               saved(document), materialWorld(assets::loadCommonwealth(dataDirectory / "Fallout4.esm")),
               archives(dataDirectory), materials(archives, initial), readOnly(viewOnly)
         {
-            if (readOnly && !demProject)
-                throw std::runtime_error("Read-only landscape viewing requires an EMPIRE DEM overlay");
             materialWorld.models.clear();
             materialWorld.modelLods.clear();
             materialWorld.staticCollections.clear();
@@ -4396,9 +4639,9 @@ namespace empire::world
                 activeCells.insert(coord);
             }
 
-            if (readOnly)
+            if (demProject)
                 appendInitialDemBtrs({0, 0});
-            else
+            if (!readOnly)
             {
                 render::SceneMaterial brushSceneMaterial;
                 brushSceneMaterial.baseColor = {0.95f, 0.2f, 0.04f, 1.0f};
@@ -4425,7 +4668,7 @@ namespace empire::world
 
         ~Impl()
         {
-            if (readOnly || !isDirty())
+            if (readOnly || externalSave || !isDirty())
                 return;
             try
             {
@@ -4685,16 +4928,11 @@ namespace empire::world
         void updateDemWindow(render::VulkanRenderer& renderer, assets::CellCoord center)
         {
             const bool centerChanged = activeCenter != center;
-            if (!centerChanged && !readOnly)
-                return;
             if (centerChanged)
                 finishStroke(renderer);
-            if (readOnly)
-            {
-                pollDemCells(renderer);
-                queueDemCells(center);
-                startDemCellJob();
-            }
+            pollDemCells(renderer);
+            queueDemCells(center);
+            startDemCellJob();
             std::set<assets::CellCoord> desired;
             for (std::int32_t y = center.y - demCellRadius;
                 y <= center.y + demCellRadius; ++y)
@@ -4703,14 +4941,12 @@ namespace empire::world
                     x <= center.x + demCellRadius; ++x)
                 {
                     const assets::CellCoord coord{x, y};
-                    if (!readOnly && !document.containsCell(coord))
-                        if (const auto imported = loadDemCell(coord))
-                            addRuntimeCell(renderer, *imported);
                     if (document.containsCell(coord))
                         desired.insert(coord);
                 }
             }
-            if (centerChanged && !readOnly && !document.containsCell(center))
+            if (centerChanged && !readOnly && !document.containsCell(center)
+                && !demProject->contains(center))
             {
                 if (!document.addCell(center))
                     throw std::runtime_error("Could not create missing DEM editor CELL");
@@ -4724,7 +4960,7 @@ namespace empire::world
             }
             std::vector<std::uint32_t> activate;
             std::vector<std::uint32_t> deactivate;
-            const bool switchLand = !readOnly || demWindowResolved(center);
+            const bool switchLand = demWindowResolved(center);
             if (switchLand)
             {
                 for (const auto& [coord, instance] : terrainInstances)
@@ -4735,8 +4971,7 @@ namespace empire::world
                         deactivate.push_back(instance);
                 }
             }
-            if (readOnly)
-                updateDemBtrs(renderer, center, activate, deactivate);
+            updateDemBtrs(renderer, center, activate, deactivate);
             if (centerChanged && waterInstance)
             {
                 auto water = makeInstance(waterRange, demWaterTransform(center));
@@ -4767,6 +5002,8 @@ namespace empire::world
                 updateDemWindow(renderer, coord);
                 return;
             }
+            if (readOnly)
+                return;
             if (document.containsCell(coord))
                 return;
             finishStroke(renderer);
@@ -4789,6 +5026,12 @@ namespace empire::world
             ensureCameraCell(renderer, cameraPosition);
             if (readOnly)
                 return;
+            if (!brushEnabled)
+            {
+                finishStroke(renderer);
+                setBrushVisible(renderer, false);
+                return;
+            }
             const auto hit = raycast(cameraPosition, cameraForward);
             if (sculpting && hit)
             {
@@ -4875,6 +5118,46 @@ namespace empire::world
     glm::mat4 bethesdaReferenceTransform(const assets::PlacedReference& reference)
     {
         return referenceTransform(reference);
+    }
+
+    void setBethesdaReferenceTransform(assets::PlacedReference& reference,
+        const glm::mat4& transform)
+    {
+        for (int column = 0; column < 4; ++column)
+            for (int row = 0; row < 4; ++row)
+                if (!std::isfinite(transform[column][row]))
+                    throw std::runtime_error("Reference transform must be finite");
+        const glm::vec3 scales(glm::length(glm::vec3(transform[0])),
+            glm::length(glm::vec3(transform[1])), glm::length(glm::vec3(transform[2])));
+        const float scale = (scales.x + scales.y + scales.z) / 3.0f;
+        if (scale < 0.0001f || glm::any(glm::greaterThan(glm::abs(scales - scale),
+                glm::vec3(scale * 0.001f))) || glm::determinant(glm::mat3(transform)) <= 0.0f)
+            throw std::runtime_error("References require positive uniform scale");
+        const glm::mat3 engineRotation = glm::mat3(transform) / scale;
+        if (std::abs(glm::dot(engineRotation[0], engineRotation[1])) > 0.001f
+            || std::abs(glm::dot(engineRotation[0], engineRotation[2])) > 0.001f
+            || std::abs(glm::dot(engineRotation[1], engineRotation[2])) > 0.001f)
+            throw std::runtime_error("References cannot contain shear");
+        const glm::quat engine = glm::normalize(glm::quat_cast(engineRotation));
+        const glm::mat3 rotation = glm::mat3_cast(glm::quat(engine.w, engine.x, engine.z, engine.y));
+        const float y = std::asin(glm::clamp(-rotation[0][2], -1.0f, 1.0f));
+        const bool singular = std::abs(std::cos(y)) < 0.0001f;
+        const float x = singular ? std::atan2(-rotation[2][1], rotation[1][1])
+            : std::atan2(rotation[1][2], rotation[2][2]);
+        const float z = singular ? 0.0f : std::atan2(rotation[0][1], rotation[0][0]);
+        const double cellX = std::floor(static_cast<double>(transform[3].x) / cellSize);
+        const double cellY = std::floor(static_cast<double>(transform[3].z) / cellSize);
+        if (cellX < INT32_MIN || cellX > INT32_MAX || cellY < INT32_MIN || cellY > INT32_MAX)
+            throw std::runtime_error("Reference position exceeds CELL coordinate range");
+        reference.position[0] = transform[3].x;
+        reference.position[1] = transform[3].z;
+        reference.position[2] = transform[3].y;
+        reference.rotation[0] = x;
+        reference.rotation[1] = y;
+        reference.rotation[2] = z;
+        reference.scale = scale;
+        reference.hasLocalTransform = false;
+        reference.cell = {static_cast<std::int32_t>(cellX), static_cast<std::int32_t>(cellY)};
     }
 
     WorldStreamer::WorldStreamer(const std::filesystem::path& dataDirectory,
@@ -4995,6 +5278,73 @@ namespace empire::world
         mImpl->save(renderer);
     }
 
+    void LandscapeEditor::setBrushEnabled(bool enabled) noexcept
+    {
+        mImpl->brushEnabled = enabled;
+    }
+
+    void LandscapeEditor::setExternalSave(bool enabled) noexcept
+    {
+        mImpl->externalSave = enabled;
+    }
+
+    std::optional<glm::vec3> LandscapeEditor::raycast(
+        const glm::dvec3& cameraPosition, const glm::vec3& direction) const
+    {
+        return mImpl->raycast(cameraPosition, direction);
+    }
+
+    assets::EditableLandscape LandscapeEditor::snapshot() const
+    {
+        return mImpl->document;
+    }
+
+    std::size_t LandscapeEditor::residentCells() const noexcept
+    {
+        return mImpl->document.cellForms.size();
+    }
+
+    std::size_t LandscapeEditor::pendingWork() const noexcept
+    {
+        return mImpl->queuedDemCells.size() + mImpl->demBtrQueue.size()
+            + static_cast<std::size_t>(mImpl->demBtrJob.valid());
+    }
+
+    std::uint32_t LandscapeEditor::nextFormId() const noexcept
+    {
+        return mImpl->document.nextFormId;
+    }
+
+    void LandscapeEditor::setNextFormId(std::uint32_t next) noexcept
+    {
+        mImpl->document.nextFormId = std::max(mImpl->document.nextFormId, next);
+    }
+
+    void LandscapeEditor::applySnapshot(render::VulkanRenderer& renderer,
+        const assets::EditableLandscape& snapshot)
+    {
+        mImpl->finishStroke(renderer);
+        auto restored = snapshot;
+        // Streaming is not an authoring command. Undoing an older stroke must not
+        // remove cells that arrived from the stream after that snapshot was taken.
+        for (const auto& [cell, forms] : mImpl->document.cellForms)
+            if (!restored.containsCell(cell))
+                Impl::insertCell(restored, {mImpl->document.cell(cell), forms});
+        restored.nextFormId = std::max(restored.nextFormId, mImpl->document.nextFormId);
+        for (const auto& [cell, forms] : restored.cellForms)
+            if (!mImpl->terrainInstances.contains(cell))
+                mImpl->addRuntimeCell(renderer, {restored.cell(cell), forms});
+        for (const auto& [cell, instance] : mImpl->terrainInstances)
+        {
+            const std::array ids{instance};
+            renderer.setInstancesActive(ids, restored.containsCell(cell)
+                && (!mImpl->demProject || mImpl->activeCells.contains(cell)));
+            mImpl->dirtyCells.insert(cell);
+        }
+        mImpl->document = std::move(restored);
+        mImpl->refreshAll(renderer);
+    }
+
     bool LandscapeEditor::dirty() const noexcept
     {
         return mImpl->isDirty();
@@ -5013,7 +5363,7 @@ namespace empire::world
         const std::uint64_t cells = mImpl->demProject
             ? mImpl->demProject->importedCellCount()
             : mImpl->document.cellForms.size();
-        return std::string("EMPIRE Editor | ") + tool
+        return std::string("OpenF4 Editor | ") + tool
             + " | cells " + std::to_string(cells)
             + " | radius " + std::to_string(static_cast<int>(std::lround(mImpl->radius)))
             + " | strength " + std::to_string(static_cast<int>(std::lround(mImpl->strength)))

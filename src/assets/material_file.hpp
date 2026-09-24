@@ -6,7 +6,7 @@
 
 #include <glm/glm.hpp>
 
-namespace empire::assets
+namespace openf4::assets
 {
     struct MaterialInfo
     {

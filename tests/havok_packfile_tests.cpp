@@ -560,7 +560,7 @@ namespace
     void testSyntheticPackfile()
     {
         const auto bytes = makeCubePackfile();
-        const auto system = empire::assets::loadHavokPhysicsSystem(bytes);
+        const auto system = openf4::assets::loadHavokPhysicsSystem(bytes);
         require(system.bodies.size() == 1, "cube body was not decoded");
         const auto& body = system.bodies.front();
         require(!body.dynamic, "static cube was marked dynamic");
@@ -571,11 +571,11 @@ namespace
         require(hull.indices.size() == 36, "cube faces were not triangulated");
         require(std::abs(hull.convexRadius - 0.01f) < 0.00001f,
             "convex radius was not decoded");
-        const auto shape = empire::physics::makeJoltCollisionShape(body);
+        const auto shape = openf4::physics::makeJoltCollisionShape(body);
         require(shape != nullptr, "Jolt hull was not created");
 
-        empire::physics::JoltWorld world;
-        constexpr float units = empire::physics::BethesdaUnitsPerMeter;
+        openf4::physics::JoltWorld world;
+        constexpr float units = openf4::physics::BethesdaUnitsPerMeter;
         (void)world.addStaticBox({5.0f * units, 0.25f * units, 5.0f * units},
             {0.0f, -0.25f * units, 0.0f});
         const auto dynamicBody = world.addDynamicBody(shape, {0.0f, 4.0f * units, 0.0f});
@@ -588,7 +588,7 @@ namespace
         auto corrupt = bytes;
         write<std::uint32_t>(corrupt, 0xc0 + 20, 0xfffffff0u);
         bool rejected = false;
-        try { (void)empire::assets::loadHavokPhysicsSystem(corrupt); }
+        try { (void)openf4::assets::loadHavokPhysicsSystem(corrupt); }
         catch (const std::runtime_error&) { rejected = true; }
         require(rejected, "out-of-range section was accepted");
     }
@@ -596,7 +596,7 @@ namespace
     void testCompoundAndHeightField()
     {
         auto bytes = makeCompoundPackfile();
-        const auto system = empire::assets::loadHavokPhysicsSystem(bytes);
+        const auto system = openf4::assets::loadHavokPhysicsSystem(bytes);
         require(system.bodies.size() == 1 && system.bodies.front().parts.size() == 1,
             "compound child was not flattened");
         const auto& part = system.bodies.front().parts.front();
@@ -604,26 +604,26 @@ namespace
             "compound child translation changed");
         require(part.scale == glm::vec3(2.0f, 0.5f, 1.5f),
             "compound child scale changed");
-        require(empire::physics::makeJoltCollisionShape(system.bodies.front()) != nullptr,
+        require(openf4::physics::makeJoltCollisionShape(system.bodies.front()) != nullptr,
             "Jolt rejected the synthetic compound");
 
         std::uint32_t dataStart = 0;
         std::memcpy(&dataStart, bytes.data() + 0xc0 + 20, sizeof(dataStart));
         write<std::uint32_t>(bytes, dataStart + 0x1e0 + 0x68, 0xffffu);
         bool rejected = false;
-        try { (void)empire::assets::loadHavokPhysicsSystem(bytes); }
+        try { (void)openf4::assets::loadHavokPhysicsSystem(bytes); }
         catch (const std::runtime_error&) { rejected = true; }
         require(rejected, "malformed compound instance array was accepted");
 
-        const auto cube = empire::assets::loadHavokPhysicsSystem(makeCubePackfile());
-        const auto shape = empire::physics::makeJoltCollisionShape(cube.bodies.front());
+        const auto cube = openf4::assets::loadHavokPhysicsSystem(makeCubePackfile());
+        const auto shape = openf4::physics::makeJoltCollisionShape(cube.bodies.front());
         constexpr std::uint32_t side = 33;
         constexpr float spacing = 128.0f;
         std::array<float, side * side> heights{};
         for (std::uint32_t y = 0; y < side; ++y)
             for (std::uint32_t x = 0; x < side; ++x)
                 heights[y * side + x] = 100.0f + static_cast<float>(x) * 2.0f;
-        empire::physics::JoltWorld world;
+        openf4::physics::JoltWorld world;
         const glm::vec3 origin(8192.0f, 0.0f, -4096.0f);
         world.setOrigin(origin);
         auto terrain = world.addStaticHeightField(heights, side, spacing, origin);
@@ -635,10 +635,10 @@ namespace
                 && glm::distance(occupiedBeforeRebase.front(),
                     origin + glm::vec3(16.0f * spacing, surface + 500.0f,
                         16.0f * spacing)) < 0.01f,
-            "dynamic body residency position is not in Empire world space");
+            "dynamic body residency position is not in engine world space");
         for (int step = 0; step < 300; ++step)
             world.step(1.0f / 60.0f);
-        const float expected = surface + empire::physics::BethesdaUnitsPerMeter;
+        const float expected = surface + openf4::physics::BethesdaUnitsPerMeter;
         require(std::abs(world.bodyTransform(falling)[3].y - expected) < 12.0f,
             "body did not settle on the non-zero-origin LAND slope");
         const glm::vec3 beforeRebase(world.bodyTransform(falling)[3]);
@@ -660,17 +660,17 @@ namespace
 
     void testAdditionalConvexShapes()
     {
-        const auto convex = empire::assets::loadHavokPhysicsSystem(makeConvexPackfile());
+        const auto convex = openf4::assets::loadHavokPhysicsSystem(makeConvexPackfile());
         require(convex.bodies.size() == 1 && convex.bodies.front().parts.size() == 1,
             "plain convex shape was not decoded");
         require(convex.bodies.front().parts.front().polytope.vertices.size() == 8
                 && convex.bodies.front().parts.front().polytope.indices.empty(),
             "plain convex shape used polytope face data");
-        require(empire::physics::makeJoltCollisionShape(convex.bodies.front()) != nullptr,
+        require(openf4::physics::makeJoltCollisionShape(convex.bodies.front()) != nullptr,
             "Jolt rejected the plain convex shape");
 
         auto capsuleBytes = makeCapsulePackfile();
-        const auto capsule = empire::assets::loadHavokPhysicsSystem(capsuleBytes);
+        const auto capsule = openf4::assets::loadHavokPhysicsSystem(capsuleBytes);
         require(capsule.bodies.size() == 1 && capsule.bodies.front().capsules.size() == 1,
             "capsule shape was not decoded");
         const auto& decoded = capsule.bodies.front().capsules.front().capsule;
@@ -678,13 +678,13 @@ namespace
                 && decoded.pointB == glm::vec3(0.0f, 1.0f, 0.0f)
                 && std::abs(decoded.radius - 0.25f) < 0.00001f,
             "capsule dimensions changed");
-        require(empire::physics::makeJoltCollisionShape(capsule.bodies.front()) != nullptr,
+        require(openf4::physics::makeJoltCollisionShape(capsule.bodies.front()) != nullptr,
             "Jolt rejected the capsule shape");
 
         auto nonUniformCapsule = capsule.bodies.front();
         nonUniformCapsule.capsules.front().scale = {1.0f, 2.0f, 1.0f};
         bool rejectedNonUniform = false;
-        try { (void)empire::physics::makeJoltCollisionShape(nonUniformCapsule); }
+        try { (void)openf4::physics::makeJoltCollisionShape(nonUniformCapsule); }
         catch (const std::runtime_error&) { rejectedNonUniform = true; }
         require(rejectedNonUniform, "non-uniform capsule scale was accepted by Jolt");
 
@@ -694,23 +694,23 @@ namespace
         write<float>(capsuleBytes, dataStart + shape + 0x54,
             std::numeric_limits<float>::quiet_NaN());
         bool rejected = false;
-        try { (void)empire::assets::loadHavokPhysicsSystem(capsuleBytes); }
+        try { (void)openf4::assets::loadHavokPhysicsSystem(capsuleBytes); }
         catch (const std::runtime_error&) { rejected = true; }
         require(rejected, "capsule with a non-finite endpoint was accepted");
 
         capsuleBytes = makeCapsulePackfile();
         write<float>(capsuleBytes, dataStart + shape + 0x14, -1.0f);
         rejected = false;
-        try { (void)empire::assets::loadHavokPhysicsSystem(capsuleBytes); }
+        try { (void)openf4::assets::loadHavokPhysicsSystem(capsuleBytes); }
         catch (const std::runtime_error&) { rejected = true; }
         require(rejected, "capsule with a negative radius was accepted");
 
         auto mixed = convex.bodies.front();
         mixed.capsules = capsule.bodies.front().capsules;
-        const auto compressed = empire::assets::loadHavokPhysicsSystem(
+        const auto compressed = openf4::assets::loadHavokPhysicsSystem(
             makeCompressedMeshPackfile());
         mixed.triangleMesh = compressed.bodies.front().triangleMesh;
-        require(empire::physics::makeJoltCollisionShape(mixed) != nullptr,
+        require(openf4::physics::makeJoltCollisionShape(mixed) != nullptr,
             "Jolt rejected a mixed mesh, convex, and capsule compound");
     }
 
@@ -725,7 +725,7 @@ namespace
         constexpr std::uint32_t globalFixups = 0x358;
 
         const auto bytes = makeCompressedMeshPackfile();
-        const auto system = empire::assets::loadHavokPhysicsSystem(bytes);
+        const auto system = openf4::assets::loadHavokPhysicsSystem(bytes);
         require(system.bodies.size() == 1, "compressed mesh body was not decoded");
         const auto& body = system.bodies.front();
         require(body.parts.empty() && body.triangleMesh.has_value(),
@@ -747,7 +747,7 @@ namespace
             "compressed shared vertex was not reconstructed");
         require(glm::distance(mesh.vertices[2], glm::vec3(1.0f, 0.0f, 0.0f)) < 0.00001f,
             "compressed local vertex was not reconstructed");
-        const auto shapeResult = empire::physics::makeJoltCollisionShape(body);
+        const auto shapeResult = openf4::physics::makeJoltCollisionShape(body);
         require(shapeResult != nullptr, "Jolt rejected the synthetic compressed mesh");
         const auto bounds = shapeResult->GetLocalBounds();
         require(bounds.mMax.GetY() > 0.99f && bounds.mMax.GetZ() > 0.99f,
@@ -757,7 +757,7 @@ namespace
         std::memcpy(&dataStart, bytes.data() + 0xc0 + 20, sizeof(dataStart));
         const auto rejected = [&](auto corrupt, std::string_view message) {
             bool didReject = false;
-            try { (void)empire::assets::loadHavokPhysicsSystem(corrupt); }
+            try { (void)openf4::assets::loadHavokPhysicsSystem(corrupt); }
             catch (const std::runtime_error&) { didReject = true; }
             require(didReject, message);
         };
@@ -793,19 +793,19 @@ namespace
         auto dynamicMesh = body;
         dynamicMesh.dynamic = true;
         bool rejectedDynamic = false;
-        try { (void)empire::physics::makeJoltCollisionShape(dynamicMesh); }
+        try { (void)openf4::physics::makeJoltCollisionShape(dynamicMesh); }
         catch (const std::runtime_error&) { rejectedDynamic = true; }
         require(rejectedDynamic, "dynamic compressed mesh was accepted by Jolt");
 
-        empire::physics::JoltWorld world;
+        openf4::physics::JoltWorld world;
         auto staticBody = world.addStaticBody(shapeResult);
-        require(empire::physics::scaleJoltCollisionShape(
+        require(openf4::physics::scaleJoltCollisionShape(
                     shapeResult, glm::vec3(2.0f, 1.0f, 0.5f)) != nullptr,
             "Jolt rejected a valid streamed-reference shape scale");
         bool rejectedScale = false;
         try
         {
-            (void)empire::physics::scaleJoltCollisionShape(
+            (void)openf4::physics::scaleJoltCollisionShape(
                 shapeResult, glm::vec3(1.0f, 0.0f, 1.0f));
         }
         catch (const std::runtime_error&)
@@ -813,20 +813,20 @@ namespace
             rejectedScale = true;
         }
         require(rejectedScale, "Jolt accepted an invalid streamed-reference shape scale");
-        empire::assets::HavokRigidBody smallBox;
+        openf4::assets::HavokRigidBody smallBox;
         smallBox.parts.emplace_back();
         constexpr std::array<float, 2> signs{-0.1f, 0.1f};
         for (const float z : signs)
             for (const float y : signs)
                 for (const float x : signs)
                     smallBox.parts.front().polytope.vertices.emplace_back(x, y, z);
-        const auto smallBoxShape = empire::physics::makeJoltCollisionShape(smallBox);
+        const auto smallBoxShape = openf4::physics::makeJoltCollisionShape(smallBox);
         const auto falling = world.addDynamicBody(smallBoxShape,
-            glm::vec3(0.25f, 1.0f, 0.25f) * empire::physics::BethesdaUnitsPerMeter);
+            glm::vec3(0.25f, 1.0f, 0.25f) * openf4::physics::BethesdaUnitsPerMeter);
         for (int step = 0; step < 180; ++step)
             world.step(1.0f / 60.0f);
         require(world.bodyTransform(falling)[3].y > 0.05f
-                * empire::physics::BethesdaUnitsPerMeter,
+                * openf4::physics::BethesdaUnitsPerMeter,
             "dynamic hull fell through synthetic compressed mesh");
         world.removeBody(falling);
         world.removeBody(staticBody);
@@ -842,14 +842,14 @@ namespace
         constexpr std::uint32_t globalFixups = 0x838;
         constexpr std::uint32_t virtualFixups = 0x880;
         const auto bytes = makeRagdollPackfile();
-        const auto ragdoll = empire::assets::loadHavokRagdoll(bytes);
+        const auto ragdoll = openf4::assets::loadHavokRagdoll(bytes);
         require(ragdoll.bones.size() == 3 && ragdoll.bodies.size() == 3,
             "synthetic ragdoll body hierarchy changed");
         require(ragdoll.constraints.size() == 2
                 && ragdoll.constraints[0].type
-                    == empire::assets::HavokConstraintType::Ragdoll
+                    == openf4::assets::HavokConstraintType::Ragdoll
                 && ragdoll.constraints[1].type
-                    == empire::assets::HavokConstraintType::LimitedHinge,
+                    == openf4::assets::HavokConstraintType::LimitedHinge,
             "synthetic ragdoll constraint types changed");
         require(ragdoll.bones[0].parent == -1 && ragdoll.bones[1].parent == 0
                 && ragdoll.bones[2].parent == 1,
@@ -876,8 +876,8 @@ namespace
                     == glm::vec3(0.0f, 0.0f, -0.5f),
             "synthetic ragdoll local frames changed");
 
-        empire::physics::JoltWorld world;
-        constexpr float units = empire::physics::BethesdaUnitsPerMeter;
+        openf4::physics::JoltWorld world;
+        constexpr float units = openf4::physics::BethesdaUnitsPerMeter;
         (void)world.addStaticBox({5.0f * units, 0.25f * units, 5.0f * units},
             {0.0f, -0.25f * units, 0.0f});
         auto handle = world.addRagdoll(ragdoll, {0.0f, 4.0f * units, 0.0f});
@@ -912,7 +912,7 @@ namespace
         std::memcpy(&dataStart, bytes.data() + 0xc0 + 20, sizeof(dataStart));
         const auto rejected = [&](auto corrupt, std::string_view message) {
             bool didReject = false;
-            try { (void)empire::assets::loadHavokRagdoll(corrupt); }
+            try { (void)openf4::assets::loadHavokRagdoll(corrupt); }
             catch (const std::runtime_error&) { didReject = true; }
             require(didReject, message);
         };
@@ -957,18 +957,18 @@ namespace
 
     int testFallout4Asset()
     {
-        const auto data = empire::assets::findFallout4Data();
+        const auto data = openf4::assets::findFallout4Data();
         if (!data)
             return 77;
         const auto archivePath = *data / "Fallout4 - Meshes.ba2";
         if (!std::filesystem::exists(archivePath))
             return 77;
-        empire::assets::Ba2Archive archive(archivePath);
+        openf4::assets::Ba2Archive archive(archivePath);
         constexpr std::string_view path = "Meshes\\SetDressing\\Ammo\\AmmoBoxNotSkinned.nif";
         if (!archive.contains(path))
             return 77;
         const auto nif = archive.extract(path);
-        const auto systems = empire::assets::loadNifPhysicsSystems(nif);
+        const auto systems = openf4::assets::loadNifPhysicsSystems(nif);
         require(systems.size() == 1 && systems.front().bodies.size() == 1,
             "Fallout 4 ammo box collision body was not decoded");
         const auto& body = systems.front().bodies.front();
@@ -981,19 +981,19 @@ namespace
         require(hull.indices.size() == 36, "Fallout 4 ammo box triangle count changed");
         require(std::abs(hull.convexRadius - 0.01f) < 0.0001f,
             "Fallout 4 ammo box radius changed");
-        require(empire::physics::makeJoltCollisionShape(body) != nullptr,
+        require(openf4::physics::makeJoltCollisionShape(body) != nullptr,
             "Jolt rejected the Fallout 4 ammo box hull");
-        const auto ammoShape = empire::physics::makeJoltCollisionShape(body);
+        const auto ammoShape = openf4::physics::makeJoltCollisionShape(body);
 
         const auto testShapeAsset = [&](std::string_view assetPath,
                                         bool expectPlainConvex,
                                         bool expectCapsule,
                                         bool expectMixed) {
             require(archive.contains(assetPath), "Fallout 4 shape fixture is missing");
-            std::vector<empire::assets::HavokPhysicsSystem> shapeSystems;
+            std::vector<openf4::assets::HavokPhysicsSystem> shapeSystems;
             try
             {
-                shapeSystems = empire::assets::loadNifPhysicsSystems(
+                shapeSystems = openf4::assets::loadNifPhysicsSystems(
                     archive.extract(assetPath));
             }
             catch (const std::exception& error)
@@ -1016,12 +1016,12 @@ namespace
                     sawCapsule = sawCapsule || !shapeBody.capsules.empty();
                     sawMixed = sawMixed || (shapeBody.triangleMesh.has_value()
                         && (!shapeBody.parts.empty() || !shapeBody.capsules.empty()));
-                    const auto joltShape = empire::physics::makeJoltCollisionShape(shapeBody);
+                    const auto joltShape = openf4::physics::makeJoltCollisionShape(shapeBody);
                     require(joltShape != nullptr,
                         "Jolt rejected a Fallout 4 shape fixture body");
                     if (expectPlainConvex && joltShape->GetMassProperties().mMass <= 0.0f)
                     {
-                        empire::physics::JoltWorld fixtureWorld;
+                        openf4::physics::JoltWorld fixtureWorld;
                         require(static_cast<bool>(fixtureWorld.addDynamicBody(
                                     joltShape, glm::vec3(0.0f),
                                     glm::quat(1.0f, 0.0f, 0.0f, 0.0f), 10.0f)),
@@ -1054,7 +1054,7 @@ namespace
                                         std::span<const std::byte> nif,
                                         glm::vec3& boundsMinimum,
                                         glm::vec3& boundsMaximum) {
-            const auto meshSystems = empire::assets::loadNifPhysicsSystems(nif);
+            const auto meshSystems = openf4::assets::loadNifPhysicsSystems(nif);
             std::size_t meshBodies = 0;
             std::size_t sections = 0;
             std::size_t vertices = 0;
@@ -1083,13 +1083,13 @@ namespace
                         boundsMinimum = glm::min(boundsMinimum, vertex);
                         boundsMaximum = glm::max(boundsMaximum, vertex);
                     }
-                    shapes.push_back(empire::physics::makeJoltCollisionShape(meshBody));
+                    shapes.push_back(openf4::physics::makeJoltCollisionShape(meshBody));
                     for (std::size_t index = 0; index < decoded.indices.size(); index += 3)
                     {
                         const auto joltVertex = [&](std::uint32_t vertexIndex) {
                             const glm::vec3& vertex = decoded.vertices[vertexIndex];
                             return glm::vec3(vertex.x, vertex.z, vertex.y)
-                                * empire::physics::BethesdaUnitsPerMeter;
+                                * openf4::physics::BethesdaUnitsPerMeter;
                         };
                         const glm::vec3 a = joltVertex(decoded.indices[index]);
                         const glm::vec3 b = joltVertex(decoded.indices[index + 2]);
@@ -1114,7 +1114,7 @@ namespace
                       << boundsMinimum.y << ',' << boundsMinimum.z << ")-("
                       << boundsMaximum.x << ',' << boundsMaximum.y << ','
                       << boundsMaximum.z << ")\n";
-            empire::physics::JoltWorld meshWorld;
+            openf4::physics::JoltWorld meshWorld;
             const glm::quat supportRotation = rotationBetween(
                 supportNormal, glm::vec3(0.0f, 1.0f, 0.0f));
             dropPoint = supportRotation * dropPoint;
@@ -1190,7 +1190,7 @@ namespace
             "Meshes\\Weapons\\10mmPistol\\10MMPistol.nif";
         require(archive.contains(pistolPath), "Fallout 4 10mm pistol is missing");
         const auto pistolNif = archive.extract(pistolPath);
-        const auto pistolSystems = empire::assets::loadNifPhysicsSystems(pistolNif);
+        const auto pistolSystems = openf4::assets::loadNifPhysicsSystems(pistolNif);
         require(pistolSystems.size() == 1 && pistolSystems.front().bodies.size() == 1,
             "Fallout 4 10mm pistol body was not decoded");
         const auto& pistol = pistolSystems.front().bodies.front();
@@ -1200,17 +1200,17 @@ namespace
         require(std::ranges::all_of(pistol.parts,
             [](const auto& part) { return part.polytope.vertices.size() == 8; }),
             "Fallout 4 10mm pistol convex vertex count changed");
-        const auto pistolShape = empire::physics::makeJoltCollisionShape(pistol);
+        const auto pistolShape = openf4::physics::makeJoltCollisionShape(pistol);
         require(pistolShape != nullptr, "Jolt rejected the Fallout 4 10mm pistol compound");
 
-        const auto geometry = empire::assets::loadNifModel(pistolNif);
+        const auto geometry = openf4::assets::loadNifModel(pistolNif);
         require(std::ranges::any_of(geometry.attachmentPoints, [](const auto& point) {
             return point.name == "P-Grip";
         }), "10mm pistol grip attachment point is missing");
         constexpr std::string_view gripPath =
             "Meshes\\Weapons\\10mmPistol\\10mmGrip.nif";
         require(archive.contains(gripPath), "Fallout 4 10mm grip is missing");
-        const auto grip = empire::assets::loadNifModel(archive.extract(gripPath));
+        const auto grip = openf4::assets::loadNifModel(archive.extract(gripPath));
         require(std::ranges::any_of(grip.attachmentTargets, [](const std::string& target) {
             return target == "C-Grip";
         }), "10mm grip attachment target is missing");
@@ -1230,7 +1230,7 @@ namespace
             collisionBounds.mMax.GetY(), collisionBounds.mMax.GetZ());
         const glm::vec3 collisionCenterOfMassMeters(
             centerOfMass.GetX(), centerOfMass.GetY(), centerOfMass.GetZ());
-        const glm::mat4 bodyLocal = empire::physics::havokBodyLocalTransform(pistol);
+        const glm::mat4 bodyLocal = openf4::physics::havokBodyLocalTransform(pistol);
         glm::vec3 collisionMinimum(std::numeric_limits<float>::max());
         glm::vec3 collisionMaximum(std::numeric_limits<float>::lowest());
         for (int corner = 0; corner < 8; ++corner)
@@ -1241,7 +1241,7 @@ namespace
                 (corner & 4) ? collisionMaximumMeters.z : collisionMinimumMeters.z);
             const glm::vec3 transformed = glm::vec3(bodyLocal * glm::vec4(
                 (local + collisionCenterOfMassMeters)
-                    * empire::physics::BethesdaUnitsPerMeter,
+                    * openf4::physics::BethesdaUnitsPerMeter,
                 1.0f));
             collisionMinimum = glm::min(collisionMinimum, transformed);
             collisionMaximum = glm::max(collisionMaximum, transformed);
@@ -1259,7 +1259,7 @@ namespace
         constexpr std::string_view skeletonPath =
             "Meshes\\Actors\\Character\\CharacterAssets\\skeleton.nif";
         require(archive.contains(skeletonPath), "Fallout 4 human skeleton is missing");
-        const auto ragdolls = empire::assets::loadNifRagdolls(
+        const auto ragdolls = openf4::assets::loadNifRagdolls(
             archive.extract(skeletonPath));
         require(ragdolls.size() == 1, "Fallout 4 human ragdoll was not decoded");
         const auto& ragdoll = ragdolls.front();
@@ -1271,17 +1271,17 @@ namespace
                     std::views::iota(std::uint32_t{0}, std::uint32_t{18})),
             "Fallout 4 human ragdoll body map changed");
         require(std::ranges::count_if(ragdoll.constraints, [](const auto& constraint) {
-                    return constraint.type == empire::assets::HavokConstraintType::Ragdoll;
+                    return constraint.type == openf4::assets::HavokConstraintType::Ragdoll;
                 }) == 9
                 && std::ranges::count_if(ragdoll.constraints, [](const auto& constraint) {
                     return constraint.type
-                        == empire::assets::HavokConstraintType::LimitedHinge;
+                        == openf4::assets::HavokConstraintType::LimitedHinge;
                 }) == 8,
             "Fallout 4 human ragdoll constraint types changed");
         constexpr std::string_view maleBodyPath =
             "Meshes\\Actors\\Character\\CharacterAssets\\MaleBody.nif";
         require(archive.contains(maleBodyPath), "Fallout 4 male body is missing");
-        const auto maleBody = empire::assets::loadNifModel(archive.extract(maleBodyPath));
+        const auto maleBody = openf4::assets::loadNifModel(archive.extract(maleBodyPath));
         require(!maleBody.skinBones.empty() && maleBody.skinBones.size() <= 256,
             "Fallout 4 male body skin palette was not decoded");
         for (const auto& surface : maleBody.surfaces)
@@ -1300,7 +1300,7 @@ namespace
             skinBindPositions.emplace_back(glm::inverse(bone.skinToBone)[3]);
         std::vector<glm::vec3> ragdollBodyPositions;
         for (std::size_t bone = 0; bone < ragdoll.bones.size(); ++bone)
-            ragdollBodyPositions.emplace_back(empire::physics::havokBodyLocalTransform(
+            ragdollBodyPositions.emplace_back(openf4::physics::havokBodyLocalTransform(
                 ragdoll.bodies[ragdoll.boneToBody[bone]])[3]);
         const auto byX = [](const glm::vec3& left, const glm::vec3& right) {
             return left.x < right.x;
@@ -1327,8 +1327,8 @@ namespace
         }
         require(std::ranges::count(mappedRagdollBodies, true) >= 16,
             "Fallout 4 skin bind pose collapsed onto too few ragdoll limbs");
-        empire::physics::JoltWorld ragdollWorld;
-        constexpr float units = empire::physics::BethesdaUnitsPerMeter;
+        openf4::physics::JoltWorld ragdollWorld;
+        constexpr float units = openf4::physics::BethesdaUnitsPerMeter;
         (void)ragdollWorld.addStaticBox(
             {10.0f * units, 0.25f * units, 10.0f * units},
             {0.0f, -0.25f * units, 0.0f});
@@ -1374,20 +1374,20 @@ namespace
         ragdollHandle = ragdollWorld.addRagdoll(ragdoll, {0.0f, 5.0f * units, 0.0f});
         ragdollWorld.removeRagdoll(ragdollHandle);
 
-        const auto commonwealth = empire::assets::loadCommonwealth(*data / "Fallout4.esm");
-        constexpr empire::assets::CellCoord cell{8, -13};
+        const auto commonwealth = openf4::assets::loadCommonwealth(*data / "Fallout4.esm");
+        constexpr openf4::assets::CellCoord cell{8, -13};
         const auto landscape = commonwealth.landscapes.find(cell);
         require(landscape != commonwealth.landscapes.end(),
             "Fallout 4 LAND cell 8, -13 is missing");
         constexpr float cellSize = 4096.0f;
         constexpr float spacing = 128.0f;
-        constexpr std::size_t center = 16 * empire::assets::LandscapeCell::side + 16;
+        constexpr std::size_t center = 16 * openf4::assets::LandscapeCell::side + 16;
         const float surface = landscape->second.heights[center];
         require(surface >= -3000.0f && surface <= 12470.0f,
             "Fallout 4 LAND height is outside the expected range");
-        empire::physics::JoltWorld world;
+        openf4::physics::JoltWorld world;
         const auto terrain = world.addStaticHeightField(landscape->second.heights,
-            empire::assets::LandscapeCell::side, spacing,
+            openf4::assets::LandscapeCell::side, spacing,
             {cell.x * cellSize, 0.0f, cell.y * cellSize});
         const glm::vec3 spawn((cell.x + 0.5f) * cellSize,
             surface + 500.0f, (cell.y + 0.5f) * cellSize);

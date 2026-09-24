@@ -5,7 +5,7 @@
 #include <cmath>
 #include <stdexcept>
 
-namespace empire::render
+namespace openf4::render
 {
     PackedMesh buildMeshlets(
         std::span<const SourceVertex> vertices, std::span<const std::uint32_t> indices,

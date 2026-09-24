@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace empire::assets
+namespace openf4::assets
 {
     class Dx10Archive
     {

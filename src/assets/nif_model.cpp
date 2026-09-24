@@ -14,7 +14,7 @@
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 
-namespace empire::assets
+namespace openf4::assets
 {
     namespace
     {

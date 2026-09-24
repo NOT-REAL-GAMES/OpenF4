@@ -46,7 +46,7 @@ namespace
             reinterpret_cast<const Bytef*>(input.data()), static_cast<uLong>(input.size()),
             Z_BEST_SPEED) == Z_OK, "zlib test compression failed");
         packed.resize(packedSize);
-        const auto output = empire::assets::decompressBa2Payload(packed, input.size());
+        const auto output = openf4::assets::decompressBa2Payload(packed, input.size());
         require(std::memcmp(output.data(), input.data(), input.size()) == 0, "zlib round trip failed");
     }
 
@@ -59,13 +59,13 @@ namespace
             static_cast<int>(input.size()), static_cast<int>(packed.size()));
         require(packedSize > 0, "LZ4 test compression failed");
         packed.resize(static_cast<std::size_t>(packedSize));
-        const auto output = empire::assets::decompressBa2Payload(packed, input.size());
+        const auto output = openf4::assets::decompressBa2Payload(packed, input.size());
         require(std::memcmp(output.data(), input.data(), input.size()) == 0, "LZ4 round trip failed");
     }
 
     void testOffset64()
     {
-        const auto path = std::filesystem::temp_directory_path() / "empire-ba2-offset-test.ba2";
+        const auto path = std::filesystem::temp_directory_path() / "openf4-ba2-offset-test.ba2";
         constexpr std::uint64_t expectedOffset = 0x00000001'00000020ull;
         constexpr std::string_view name = "meshes\\test.nif";
         std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -86,7 +86,7 @@ namespace
         output.write(name.data(), static_cast<std::streamsize>(name.size()));
         output.close();
 
-        const empire::assets::Ba2Archive archive(path);
+        const openf4::assets::Ba2Archive archive(path);
         require(archive.contains("Meshes/Test.nif"), "BA2 path normalization failed");
         require(archive.entries().at("meshes\\test.nif").offset == expectedOffset,
             "BA2 64-bit offset was truncated");
@@ -102,7 +102,7 @@ namespace
         require(packedSize > 0, "DX10 LZ4 test compression failed");
         packed.resize(static_cast<std::size_t>(packedSize));
 
-        const auto path = std::filesystem::temp_directory_path() / "empire-dx10-lz4-test.ba2";
+        const auto path = std::filesystem::temp_directory_path() / "openf4-dx10-lz4-test.ba2";
         constexpr std::string_view name = "textures\\test.dds";
         constexpr std::uint64_t payloadOffset = 84;
         const std::uint64_t nameTableOffset = payloadOffset + packed.size();
@@ -136,7 +136,7 @@ namespace
         output.write(name.data(), static_cast<std::streamsize>(name.size()));
         output.close();
 
-        const empire::assets::Dx10Archive archive(path);
+        const openf4::assets::Dx10Archive archive(path);
         require(archive.contains("Textures/Test.dds"), "DX10 BA2 path normalization failed");
         const auto dds = archive.extractDds(name);
         require(dds.size() == 148 + input.size(), "DX10 DDS reconstruction size is wrong");

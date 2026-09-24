@@ -11,7 +11,7 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/vec3.hpp>
 
-namespace empire::assets
+namespace openf4::assets
 {
     struct HavokConvexPolytope
     {

@@ -1,4 +1,5 @@
 #include "assets/esm_editor.hpp"
+#include "assets/esm_document.hpp"
 
 #include <algorithm>
 #include <array>
@@ -19,7 +20,7 @@
 #include <Windows.h>
 #endif
 
-namespace empire::assets
+namespace openf4::assets
 {
     namespace
     {
@@ -289,8 +290,9 @@ namespace empire::assets
                     throw std::runtime_error("Editable ESM has an unexpected WRLD FormID");
                 const auto found = std::find_if(subs.begin(), subs.end(),
                     [](const Subrecord& sub) { return sub.type == edid; });
-                if (found == subs.end() || readString(bytes, found->offset, found->size) != "EmpireWorld")
-                    throw std::runtime_error("Editable ESM does not contain EmpireWorld");
+                if (found == subs.end() || (readString(bytes, found->offset, found->size) != "OpenF4World"
+                    && readString(bytes, found->offset, found->size) != "EmpireWorld"))
+                    throw std::runtime_error("Editable ESM does not contain OpenF4World");
                 parsed.worldSeen = true;
                 return;
             }
@@ -454,13 +456,13 @@ namespace empire::assets
                 + static_cast<std::uint32_t>(landscape.cellForms.size()) * 2u;
             appendSubrecord(tesBody, hedr, Header{0.95f, recordCount,
                 landscape.nextFormId & 0x00FFFFFFu});
-            appendStringSubrecord(tesBody, cnam, "EMPIRE");
+            appendStringSubrecord(tesBody, cnam, "OpenF4");
             appendStringSubrecord(tesBody, mast, "Fallout4.esm");
             appendSubrecord(tesBody, data, std::uint64_t{0});
 
             Bytes output = makeRecord(tes4, 0, tesBody, 1u);
             Bytes worldBody;
-            appendStringSubrecord(worldBody, edid, "EmpireWorld");
+            appendStringSubrecord(worldBody, edid, "OpenF4World");
             const std::uint8_t worldData = 1;
             appendSubrecord(worldBody, data, worldData);
 
@@ -472,7 +474,7 @@ namespace empire::assets
 
                 Bytes cellBody;
                 appendStringSubrecord(cellBody, edid,
-                    "EmpireCell_" + std::to_string(coord.x) + "_" + std::to_string(coord.y));
+                    "OpenF4Cell_" + std::to_string(coord.x) + "_" + std::to_string(coord.y));
                 appendSubrecord(cellBody, data, std::uint16_t{0});
                 const std::array<std::int32_t, 3> coordinates{coord.x, coord.y, 0};
                 appendSubrecord(cellBody, xclc, coordinates.data(), sizeof(coordinates));
@@ -675,42 +677,44 @@ namespace empire::assets
 
     EditableLandscape loadEditableLandscape(const std::filesystem::path& path)
     {
-        std::ifstream file(path, std::ios::binary | std::ios::ate);
-        if (!file)
-            throw std::runtime_error("Could not open editable ESM: " + path.string());
-        const std::streamsize size = file.tellg();
-        if (size < static_cast<std::streamsize>(recordHeaderSize))
-            throw std::runtime_error("Editable ESM is truncated");
-        file.seekg(0);
-        Bytes bytes(static_cast<std::size_t>(size));
-        file.read(reinterpret_cast<char*>(bytes.data()), size);
-        if (!file)
-            throw std::runtime_error("Could not read editable ESM: " + path.string());
-
+        std::ifstream file(path, std::ios::binary);
+        Bytes bytes(recordHeaderSize);
+        file.read(reinterpret_cast<char*>(bytes.data()), recordHeaderSize);
+        if (!file) throw std::runtime_error("Editable ESM is truncated");
         if (read<std::uint32_t>(bytes, 0) != tes4 || (read<std::uint32_t>(bytes, 8) & 1u) == 0)
             throw std::runtime_error("Editable ESM must begin with a master TES4 record");
-        const std::uint32_t tesSize = read<std::uint32_t>(bytes, 4);
-        if (tesSize > bytes.size() - recordHeaderSize)
-            throw std::runtime_error("Editable TES4 record is truncated");
-        bool falloutMaster = false;
-        for (const Subrecord& sub : subrecords(bytes, recordHeaderSize, recordHeaderSize + tesSize))
-        {
-            if (sub.type == mast && readString(bytes, sub.offset, sub.size) == "Fallout4.esm")
-                falloutMaster = true;
-        }
-        if (!falloutMaster)
+        EsmDocument document(path);
+        if (std::find(document.masters().begin(), document.masters().end(), "Fallout4.esm") == document.masters().end())
             throw std::runtime_error("Editable ESM is missing its Fallout4.esm dependency");
-
-        const std::size_t topOffset = recordHeaderSize + tesSize;
-        if (topOffset >= bytes.size() || read<std::uint32_t>(bytes, topOffset) != grup)
-            throw std::runtime_error("Editable ESM is missing its WRLD top group");
+        if (document.worldFormId() != EditableLandscape::worldFormId || !document.isOpenF4Owned())
+            throw std::runtime_error("Editable ESM does not contain OpenF4World");
         ParsedDocument parsed;
-        parseGroup(bytes, topOffset, bytes.size(), 0, parsed);
-        const std::uint32_t topSize = read<std::uint32_t>(bytes, topOffset + 4);
-        if (topOffset + topSize != bytes.size())
-            throw std::runtime_error("Editable ESM contains unsupported trailing data");
-        if (!parsed.worldSeen)
-            throw std::runtime_error("Editable ESM does not contain EmpireWorld");
+        for (const auto& [coord, entry] : document.terrainCells())
+        {
+            if (std::abs(static_cast<std::int64_t>(coord.x)) > 1'000'000
+                || std::abs(static_cast<std::int64_t>(coord.y)) > 1'000'000)
+                throw std::runtime_error("Editable CELL coordinate is outside the supported range");
+            if (!validEditorFormId(entry.cellFormId) || !validEditorFormId(entry.landFormId)
+                || !parsed.formIds.insert(entry.cellFormId).second || !parsed.formIds.insert(entry.landFormId).second)
+                throw std::runtime_error("Editable CELL/LAND has an invalid or duplicate FormID");
+            if (const auto initial = initialCellIndex(coord); initial
+                && (entry.cellFormId != EditableLandscape::firstCellFormId + *initial
+                    || entry.landFormId != EditableLandscape::firstLandFormId + *initial))
+                throw std::runtime_error("Initial editable CELL/LAND has an unstable FormID");
+            const auto decoded = document.terrainCell(coord);
+            if (!decoded || !decoded->landscape.hasHeights)
+                throw std::runtime_error("Editable CELL is missing its LAND VHGT record");
+            (void)encodeVhgt(decoded->landscape);
+            parsed.landscape.cellForms.emplace(coord, EditableLandscape::CellForms{entry.cellFormId, entry.landFormId});
+            for (std::int32_t y = 0; y < 33; ++y) for (std::int32_t x = 0; x < 33; ++x)
+            {
+                const EditableLandscape::SampleCoord global{coord.x * 32 + x, coord.y * 32 + y};
+                const float value = decoded->landscape.heights[y * 33 + x];
+                const auto [sample, inserted] = parsed.samples.emplace(global, value);
+                if (!inserted && sample->second != value)
+                    throw std::runtime_error("Editable LAND cells contain a divergent shared seam");
+            }
+        }
         for (std::int32_t y = -1; y <= 1; ++y)
         {
             for (std::int32_t x = -1; x <= 1; ++x)
@@ -727,12 +731,30 @@ namespace empire::assets
         }
         for (const auto& [coord, value] : parsed.samples)
             parsed.landscape.setSample(coord, value);
-        parsed.landscape.nextFormId = highestFormId + 1;
+        parsed.landscape.nextFormId = std::max(highestFormId + 1, document.nextFormId());
         return parsed.landscape;
     }
 
     void saveEditableLandscape(const std::filesystem::path& path, const EditableLandscape& landscape)
     {
-        atomicWrite(path, serialize(landscape));
+        if (!std::filesystem::exists(path))
+        {
+            atomicWrite(path, serialize(landscape));
+            return;
+        }
+        EsmDocument document(path);
+        std::vector<ESMTerrainCell> changes;
+        for (const auto& [coord, forms] : landscape.cellForms)
+        {
+            const auto cell = landscape.cell(coord);
+            (void)encodeVhgt(cell);
+            const auto existing = document.terrainCell(coord);
+            if (!existing || existing->cellFormId != forms.cell || existing->landFormId != forms.land
+                || existing->landscape.heights != cell.heights)
+                changes.push_back({cell, forms.cell, forms.land});
+        }
+        document.replaceTerrainCells(changes);
+        document.setNextFormId(landscape.nextFormId);
+        document.save();
     }
 }

@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace empire::assets
+namespace openf4::assets
 {
     struct CellCoord
     {
@@ -57,6 +57,7 @@ namespace empire::assets
         float localScale = 1.0f;
         bool hasLocalTransform = false;
         bool replacesDistantLod = false;
+        bool operator==(const PlacedReference&) const = default;
     };
 
     struct StaticCollectionPart

@@ -12,7 +12,7 @@
 
 #include <glm/mat4x4.hpp>
 
-namespace empire::physics
+namespace openf4::physics
 {
     inline constexpr float BethesdaUnitsPerMeter = 69.99125f;
 

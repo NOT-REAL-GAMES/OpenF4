@@ -3,7 +3,7 @@
 #include <array>
 #include <cstdlib>
 
-namespace empire::assets
+namespace openf4::assets
 {
     namespace
     {

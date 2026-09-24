@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace empire::assets
+namespace openf4::assets
 {
     namespace
     {

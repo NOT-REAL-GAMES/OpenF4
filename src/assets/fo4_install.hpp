@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <optional>
 
-namespace empire::assets
+namespace openf4::assets
 {
     [[nodiscard]] std::optional<std::filesystem::path> findFallout4Data();
 }

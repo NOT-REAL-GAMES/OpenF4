@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 
-namespace empire::assets
+namespace openf4::assets
 {
     struct EditableLandscape
     {

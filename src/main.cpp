@@ -1,5 +1,6 @@
 #include "assets/ba2_archive.hpp"
 #include "assets/dem_import.hpp"
+#include "assets/esm_document.hpp"
 #include "assets/fo4_install.hpp"
 #include "assets/nif_model.hpp"
 #include "physics/jolt_collision.hpp"
@@ -67,7 +68,7 @@ namespace
             const std::filesystem::path archivePath = data / archiveName;
             if (!std::filesystem::is_regular_file(archivePath))
                 continue;
-            empire::assets::Ba2Archive archive(archivePath);
+            openf4::assets::Ba2Archive archive(archivePath);
             if (requested)
             {
                 if (archive.contains(*requested))
@@ -96,14 +97,14 @@ namespace
         return std::nullopt;
     }
 
-    empire::render::PackedMesh makeOverlayMesh(std::span<const glm::vec2> points,
+    openf4::render::PackedMesh makeOverlayMesh(std::span<const glm::vec2> points,
         std::span<const std::uint32_t> indices, std::uint32_t material, float depth)
     {
-        std::vector<empire::render::SourceVertex> vertices;
+        std::vector<openf4::render::SourceVertex> vertices;
         vertices.reserve(points.size());
         for (const glm::vec2 point : points)
             vertices.push_back({glm::vec3(point, depth)});
-        return empire::render::buildMeshlets(vertices, indices, material);
+        return openf4::render::buildMeshlets(vertices, indices, material);
     }
 }
 
@@ -122,7 +123,7 @@ try
     int worldRadius = 1;
     std::size_t maxObjects = std::numeric_limits<std::size_t>::max();
     std::optional<std::string> requestedModel;
-    std::optional<empire::assets::CellCoord> requestedCell;
+    std::optional<openf4::assets::CellCoord> requestedCell;
     std::optional<std::filesystem::path> editorPath;
     std::optional<std::filesystem::path> masterPath;
     std::optional<std::filesystem::path> demImportPath;
@@ -219,7 +220,7 @@ try
             editorConflict = true;
             if (index + 2 >= argc)
                 throw std::runtime_error("--cell expects X and Y coordinates");
-            empire::assets::CellCoord cell;
+            openf4::assets::CellCoord cell;
             for (int component = 0; component < 2; ++component)
             {
                 const std::string_view value(argv[++index]);
@@ -238,7 +239,7 @@ try
                 throw std::runtime_error("--editor may only be specified once");
             editorPath = argv[index];
         }
-        else if (index == 1 && argc == 2
+        else if (index == 1
             && !std::string_view(argv[index]).starts_with('-'))
         {
             std::filesystem::path candidate = std::filesystem::absolute(argv[index]);
@@ -261,8 +262,8 @@ try
     {
         headless = true;
         const auto summary = inspectDemOnly
-            ? empire::assets::inspectDemLandscape(*demImportPath, demSources)
-            : empire::assets::importDemLandscape(
+            ? openf4::assets::inspectDemLandscape(*demImportPath, demSources)
+            : openf4::assets::importDemLandscape(
                 *demImportPath, demSources, {.bakeBtr = bakeDemBtr});
         std::cout << (inspectDemOnly ? "DEM import preflight: " : "DEM import complete: ")
                   << summary.cellCount << " cells in "
@@ -278,50 +279,69 @@ try
             if (summary.btrCount != 0)
                 std::cout << "BTRs: " << summary.btrCount << " level-32 tiles in "
                           << summary.btrDirectory.string() << '\n';
-            std::cout << "Open with: empire.exe --editor \""
+            std::cout << "Open with: openf4.exe --editor \""
                       << summary.editorPath.string() << "\"\n";
         }
         return 0;
     }
-    const bool demViewer = masterPath
-        && empire::assets::DemLandscapeProject::recognizes(*masterPath);
+    bool demViewer = masterPath
+        && openf4::assets::DemLandscapeProject::recognizes(*masterPath);
 
     SdlGuard sdl;
     SDL_Window* window = SDL_CreateWindow(
-        "EMPIRE", 1600, 900,
+        "OpenF4", 1600, 900,
         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window)
         throw std::runtime_error(SDL_GetError());
 
-    const auto falloutData = empire::assets::findFallout4Data();
+    const auto falloutData = openf4::assets::findFallout4Data();
     auto assetData = falloutData;
     if (masterPath && (std::filesystem::is_regular_file(
             masterPath->parent_path() / "Fallout4 - Meshes.ba2") || !assetData))
         assetData = masterPath->parent_path();
+    std::optional<openf4::assets::ESMMasterStack> projectRecords;
+    std::optional<std::filesystem::path> terrainMaster = masterPath;
+    bool projectTerrain = false;
+    if (masterPath)
+    {
+        openf4::assets::EsmDocument source(*masterPath);
+        if (source.isOpenF4Owned())
+        {
+            projectRecords = openf4::assets::loadEsmMasterStack(*masterPath, assetData);
+            terrainMaster = projectRecords->basePath;
+            openf4::assets::EsmDocument terrainSource(*terrainMaster);
+            projectTerrain = terrainSource.isOpenF4Owned();
+            demViewer = projectTerrain;
+        }
+    }
     if ((editorPath || demViewer) && !falloutData)
         throw std::runtime_error(
             "Landscape loading requires Fallout 4 data (set FALLOUT4_PATH)");
     if (physicsSample && (cubesOnly || requestedModel || !assetData))
         throw std::runtime_error(
             "--physics-sample requires Fallout 4 data and the streamed world scene");
-    empire::render::PackedMesh mesh;
-    std::vector<empire::render::SceneInstance> instances;
-    std::vector<empire::render::SceneMaterial> materials;
-    std::vector<empire::render::SceneTexture> textures;
+    openf4::render::PackedMesh mesh;
+    std::vector<openf4::render::SceneInstance> instances;
+    std::vector<openf4::render::SceneMaterial> materials;
+    std::vector<openf4::render::SceneTexture> textures;
     glm::vec3 initialPosition{};
     glm::vec3 initialTarget{};
     float sceneScale = 100.0f;
     bool usingNif = false;
     bool usingWorld = false;
-    std::unique_ptr<empire::physics::JoltWorld> physicsWorld;
-    std::unique_ptr<empire::world::WorldStreamer> worldStreamer;
-    std::unique_ptr<empire::world::LandscapeEditor> landscapeEditor;
+    std::unique_ptr<openf4::physics::JoltWorld> physicsWorld;
+    std::unique_ptr<openf4::world::WorldStreamer> worldStreamer;
+    std::unique_ptr<openf4::world::LandscapeEditor> landscapeEditor;
+    std::unique_ptr<openf4::world::ObjectScene> projectObjects;
+    std::vector<openf4::assets::PlacedReference> projectReferences;
+    std::map<std::uint32_t, std::string> projectModels;
+    std::unordered_map<std::uint32_t, std::filesystem::path> projectModelSources;
     bool landscapeEditing = false;
     if (editorPath || demViewer)
     {
         landscapeEditing = editorPath.has_value();
-        const auto& landscapePath = landscapeEditing ? *editorPath : *masterPath;
-        landscapeEditor = std::make_unique<empire::world::LandscapeEditor>(
+        const auto& landscapePath = landscapeEditing ? *editorPath : *terrainMaster;
+        landscapeEditor = std::make_unique<openf4::world::LandscapeEditor>(
             *falloutData, landscapePath, !landscapeEditing);
         auto world = landscapeEditor->takeInitialScene();
         mesh = std::move(world.mesh);
@@ -343,8 +363,9 @@ try
     }
     else if (!cubesOnly && !requestedModel && assetData)
     {
-        worldStreamer = std::make_unique<empire::world::WorldStreamer>(
-            *assetData, requestedCell, worldRadius, !landOnly, maxObjects, masterPath);
+        worldStreamer = std::make_unique<openf4::world::WorldStreamer>(
+            *assetData, requestedCell, worldRadius, !landOnly && !projectRecords,
+            maxObjects, terrainMaster);
         auto world = worldStreamer->takeInitialScene();
         mesh = std::move(world.mesh);
         instances = std::move(world.instances);
@@ -364,23 +385,36 @@ try
     {
         if (auto archived = loadArchivedModel(*falloutData, requestedModel))
         {
-            const auto geometry = empire::assets::loadNifModel(archived->bytes);
+            const auto geometry = openf4::assets::loadNifModel(archived->bytes);
             std::size_t vertexCount = 0;
             for (const auto& surface : geometry.surfaces)
             {
                 vertexCount += surface.vertices.size();
-                (void)empire::render::appendMesh(mesh,
-                    empire::render::buildMeshlets(surface.vertices, surface.indices));
+                (void)openf4::render::appendMesh(mesh,
+                    openf4::render::buildMeshlets(surface.vertices, surface.indices));
             }
             usingNif = true;
             std::cout << "NIF: " << archived->path << " (" << vertexCount
                       << " vertices, " << mesh.meshlets.size() << " meshlets)\n";
         }
     }
+    if (projectRecords && !landOnly)
+    {
+        projectObjects = std::make_unique<openf4::world::ObjectScene>(
+            assetData.value_or(masterPath->parent_path()), *masterPath);
+        for (const auto& model : projectRecords->models)
+        {
+            projectModels.emplace(model.formId, model.path);
+            projectModelSources.emplace(model.formId,
+                model.sourceEsm.empty() ? *masterPath : std::filesystem::path(model.sourceEsm));
+        }
+        for (const auto& reference : projectRecords->references)
+            projectReferences.push_back(reference.placement);
+    }
     if (!usingWorld)
     {
         if (mesh.meshlets.empty())
-            mesh = empire::render::makeCubeMesh();
+            mesh = openf4::render::makeCubeMesh();
         const int radius = usingNif ? worldRadius : 40;
         const float spacing = usingNif ? std::max(mesh.bounds.w * 2.4f, 100.0f) : 4.0f;
         instances.reserve((radius * 2 + 1) * (radius * 2 + 1));
@@ -388,7 +422,7 @@ try
         {
             for (int x = -radius; x <= radius; ++x)
             {
-                empire::render::SceneInstance instance;
+                openf4::render::SceneInstance instance;
                 const float height = usingNif ? 0.0f : 1.0f + static_cast<float>((x * x + z * z) % 12);
                 const glm::vec3 translation(x * spacing, height, z * spacing);
                 instance.transform = glm::translate(glm::mat4(1.0f), translation);
@@ -409,11 +443,11 @@ try
         initialPosition = initialTarget + glm::vec3(0.0f, sceneScale * 0.3f, sceneScale * 0.8f);
     }
 
-    auto renderer = std::make_unique<empire::render::VulkanRenderer>(
+    auto renderer = std::make_unique<openf4::render::VulkanRenderer>(
         window, mesh, instances, materials, textures);
     if (worldStreamer)
     {
-        physicsWorld = std::make_unique<empire::physics::JoltWorld>();
+        physicsWorld = std::make_unique<openf4::physics::JoltWorld>();
         if (const auto target = worldStreamer->enablePhysics(
                 *renderer, *physicsWorld, physicsSample))
         {
@@ -425,15 +459,15 @@ try
     std::optional<std::uint32_t> physicsPauseButton;
     if (physicsWorld && physicsSample)
     {
-        empire::render::SceneMaterial background;
+        openf4::render::SceneMaterial background;
         background.baseColor = {0.035f, 0.05f, 0.06f, 1.0f};
-        empire::render::SceneMaterial icon;
+        openf4::render::SceneMaterial icon;
         icon.baseColor = {0.28f, 0.95f, 0.55f, 1.0f};
         const std::uint32_t backgroundMaterial = renderer->addMaterial(background);
         const std::uint32_t iconMaterial = renderer->addMaterial(icon);
-        const auto addOverlay = [&](empire::render::PackedMesh overlay, bool active) {
+        const auto addOverlay = [&](openf4::render::PackedMesh overlay, bool active) {
             const auto range = renderer->addMesh(std::move(overlay));
-            empire::render::SceneInstance instance;
+            openf4::render::SceneInstance instance;
             instance.bounds = range.bounds;
             instance.meshletOffset = range.meshletOffset;
             instance.meshletCount = range.meshletCount;
@@ -535,13 +569,13 @@ try
                 else if (control && event.key.key == SDLK_Y)
                     (void)landscapeEditor->redo(*renderer);
                 else if (event.key.key == SDLK_1)
-                    landscapeEditor->setTool(empire::world::LandscapeTool::raise);
+                    landscapeEditor->setTool(openf4::world::LandscapeTool::raise);
                 else if (event.key.key == SDLK_2)
-                    landscapeEditor->setTool(empire::world::LandscapeTool::lower);
+                    landscapeEditor->setTool(openf4::world::LandscapeTool::lower);
                 else if (event.key.key == SDLK_3)
-                    landscapeEditor->setTool(empire::world::LandscapeTool::smooth);
+                    landscapeEditor->setTool(openf4::world::LandscapeTool::smooth);
                 else if (event.key.key == SDLK_4)
-                    landscapeEditor->setTool(empire::world::LandscapeTool::flatten);
+                    landscapeEditor->setTool(openf4::world::LandscapeTool::flatten);
             }
             else if (event.type == SDL_EVENT_MOUSE_WHEEL && landscapeEditing
                 && landscapeEditor)
@@ -594,6 +628,9 @@ try
             physicsWorld->step(delta);
         if (landscapeEditor)
             landscapeEditor->update(*renderer, position, forward, delta, editorSculpting);
+        if (projectObjects)
+            projectObjects->update(*renderer, projectReferences, projectModels,
+                projectModelSources, position);
         if (worldStreamer)
         {
             worldStreamer->update(*renderer, position);
@@ -627,9 +664,9 @@ try
         const auto view = glm::lookAtRH(
             localPosition, localPosition + forward, glm::vec3(0.0f, 1.0f, 0.0f));
         auto projection = usingWorld
-            ? empire::render::reverseZInfinitePerspectiveRH_ZO(glm::radians(70.0f),
+            ? openf4::render::reverseZInfinitePerspectiveRH_ZO(glm::radians(70.0f),
                 static_cast<float>(width) / static_cast<float>(height), 0.1f)
-            : empire::render::reverseZPerspectiveRH_ZO(glm::radians(70.0f),
+            : openf4::render::reverseZPerspectiveRH_ZO(glm::radians(70.0f),
                 static_cast<float>(width) / static_cast<float>(height), 0.1f,
                 std::max(5000.0f, sceneScale * 8.0f));
         projection[1][1] *= -1.0f;
@@ -655,7 +692,7 @@ try
             const auto& stats = renderer->stats();
             const std::string title = landscapeEditing && landscapeEditor
                 ? landscapeEditor->status()
-                : "EMPIRE | CPU " + std::to_string(stats.cpuFrameMs).substr(0, 5)
+                : "OpenF4 | CPU " + std::to_string(stats.cpuFrameMs).substr(0, 5)
                 + " ms | GPU " + std::to_string(stats.gpuFrameMs).substr(0, 5) + " ms"
                 + (physicsPlayButton
                     ? (physicsRunning ? " | Physics running" : " | Physics paused") : "")
@@ -669,6 +706,9 @@ try
     const auto finalStats = renderer->stats();
     if (landscapeEditing && landscapeEditor && landscapeEditor->dirty())
         landscapeEditor->save(*renderer);
+    if (projectObjects)
+        std::cout << "Project objects: " << projectObjects->loaded() << " loaded, "
+                  << projectObjects->pending() << " pending\n";
     if (worldStreamer)
         std::cout << "Streamer final: " << worldStreamer->streamedObjects()
                   << " loaded, " << worldStreamer->pendingObjects() << " pending\n";
@@ -709,7 +749,7 @@ try
 catch (const std::exception& error)
 {
     if (!headless)
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "EMPIRE", error.what(), nullptr);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenF4", error.what(), nullptr);
     std::cerr << error.what() << '\n';
     return 1;
 }

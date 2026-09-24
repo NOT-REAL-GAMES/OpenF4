@@ -36,7 +36,7 @@
 #include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/quaternion.hpp>
 
-namespace empire::physics
+namespace openf4::physics
 {
     namespace
     {
@@ -77,7 +77,7 @@ namespace empire::physics
             return {value.x, value.y, value.z, value.w};
         }
 
-        glm::mat4 toEmpireAxes(const glm::mat4& value)
+        glm::mat4 toEngineAxes(const glm::mat4& value)
         {
             glm::mat4 axes(1.0f);
             axes[1] = glm::vec4(0.0f, 0.0f, 1.0f, 0.0f);
@@ -85,14 +85,14 @@ namespace empire::physics
             return axes * value * axes;
         }
 
-        glm::vec3 toEmpireAxes(const glm::vec3& value)
+        glm::vec3 toEngineAxes(const glm::vec3& value)
         {
             return {value.x, value.z, value.y};
         }
 
-        glm::quat toEmpireAxes(const glm::quat& value)
+        glm::quat toEngineAxes(const glm::quat& value)
         {
-            const glm::mat4 converted = toEmpireAxes(glm::mat4_cast(value));
+            const glm::mat4 converted = toEngineAxes(glm::mat4_cast(value));
             return glm::normalize(glm::quat_cast(glm::mat3(converted)));
         }
 
@@ -113,8 +113,8 @@ namespace empire::physics
         glm::mat4 bodyTransformMeters(const assets::HavokRigidBody& body,
             const glm::vec3& spawnPositionMeters, const glm::quat& spawnRotation)
         {
-            const glm::vec3 localPosition = toEmpireAxes(body.position);
-            const glm::quat localRotation = toEmpireAxes(body.rotation);
+            const glm::vec3 localPosition = toEngineAxes(body.position);
+            const glm::quat localRotation = toEngineAxes(body.rotation);
             return glm::translate(glm::mat4(1.0f),
                        spawnPositionMeters + spawnRotation * localPosition)
                 * glm::mat4_cast(glm::normalize(spawnRotation * localRotation));
@@ -244,7 +244,7 @@ namespace empire::physics
                         + scaled.GetError().c_str());
                 child = scaled.Get();
             }
-            const glm::mat4 transform = toEmpireAxes(part.transform);
+            const glm::mat4 transform = toEngineAxes(part.transform);
             const glm::vec3 position(transform[3]);
             const glm::quat rotation = glm::normalize(glm::quat_cast(glm::mat3(transform)));
             compound.AddShape(JPH::Vec3(position.x, position.y, position.z),
@@ -260,8 +260,8 @@ namespace empire::physics
                     part.scale, glm::vec3(part.scale.x), 0.00001f)))
                 throw std::runtime_error("Non-uniform Havok capsule scale is unsupported");
 
-            const glm::vec3 pointA = toEmpireAxes(part.capsule.pointA) * part.scale.x;
-            const glm::vec3 pointB = toEmpireAxes(part.capsule.pointB) * part.scale.x;
+            const glm::vec3 pointA = toEngineAxes(part.capsule.pointA) * part.scale.x;
+            const glm::vec3 pointB = toEngineAxes(part.capsule.pointB) * part.scale.x;
             const glm::vec3 axis = pointB - pointA;
             const float length = glm::length(axis);
             if (!std::isfinite(length))
@@ -272,7 +272,7 @@ namespace empire::physics
                 throw std::runtime_error(std::string("Jolt rejected Havok capsule: ")
                     + capsuleResult.GetError().c_str());
 
-            const glm::mat4 transform = toEmpireAxes(part.transform);
+            const glm::mat4 transform = toEngineAxes(part.transform);
             const glm::vec3 position = glm::vec3(transform
                 * glm::vec4((pointA + pointB) * 0.5f, 1.0f));
             const glm::quat parentRotation = glm::normalize(
@@ -520,7 +520,7 @@ namespace empire::physics
         }
 
         const auto convertedFrame = [](const glm::mat4& frame) {
-            return toEmpireAxes(frame);
+            return toEngineAxes(frame);
         };
         const auto worldFrame = [&](std::uint32_t body, const glm::mat4& frame) {
             return bodyWorld[body] * convertedFrame(frame);

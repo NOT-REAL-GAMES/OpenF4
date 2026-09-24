@@ -8,15 +8,18 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
 #include <glm/glm.hpp>
 #include <glm/ext/matrix_clip_space.hpp>
+#include <vulkan/vulkan.h>
 
-namespace empire::render
+namespace openf4::render
 {
     inline constexpr std::uint32_t maxSceneTextures = 16384;
 
@@ -129,6 +132,32 @@ namespace empire::render
         std::uint64_t textureResidentBytes = 0;
     };
 
+    // The editor owns its UI backend; the renderer only supplies the Vulkan objects
+    // and records the UI draw list at the safe point in its existing frame.
+    struct UiContext
+    {
+        VkInstance instance = VK_NULL_HANDLE;
+        VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+        VkDevice device = VK_NULL_HANDLE;
+        VkQueue queue = VK_NULL_HANDLE;
+        std::uint32_t queueFamily = 0;
+        VkFormat colorFormat = VK_FORMAT_UNDEFINED;
+        VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+        std::uint32_t minImageCount = 0;
+        std::uint32_t imageCount = 0;
+        std::uint64_t swapchainGeneration = 0;
+    };
+
+    struct RenderViewport
+    {
+        std::int32_t x = 0;
+        std::int32_t y = 0;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+    };
+
+    using UiDrawCallback = std::function<void(VkCommandBuffer)>;
+
     class VulkanRenderer
     {
     public:
@@ -142,7 +171,9 @@ namespace empire::render
 
         void resize();
         void render(const glm::mat4& view, const glm::mat4& projection,
-            const glm::vec3& cameraPosition, const glm::vec3& worldOrigin = {});
+            const glm::vec3& cameraPosition, const glm::vec3& worldOrigin = {},
+            std::optional<RenderViewport> viewport = std::nullopt,
+            const UiDrawCallback& drawUi = {});
         [[nodiscard]] std::uint32_t addTexture(SceneTexture texture);
         [[nodiscard]] std::uint32_t addMaterial(const SceneMaterial& material);
         [[nodiscard]] MeshRange addMesh(PackedMesh mesh);
@@ -155,6 +186,7 @@ namespace empire::render
         void setInstancesActive(std::span<const std::uint32_t> instances, bool active);
         [[nodiscard]] const RendererStats& stats() const noexcept;
         [[nodiscard]] const std::string& deviceName() const noexcept;
+        [[nodiscard]] UiContext uiContext() const noexcept;
 
     private:
         struct Impl;

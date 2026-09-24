@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-namespace empire::assets
+namespace openf4::assets
 {
     inline constexpr std::uint64_t maxDemCellsPerEsm = 1'048'576;
     inline constexpr double demBethesdaUnitsPerMeter = 69.99125;

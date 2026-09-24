@@ -5,7 +5,7 @@
 #include <span>
 #include <vector>
 
-namespace empire::assets
+namespace openf4::assets
 {
     struct DdsTexture
     {

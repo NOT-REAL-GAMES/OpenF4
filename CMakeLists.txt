@@ -1,8 +1,12 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(EMPIRE VERSION 0.1.0 LANGUAGES CXX)
+project(OpenF4 VERSION 0.1.0 LANGUAGES CXX)
 
-option(EMPIRE_BUILD_TESTS "Build focused unit tests" ON)
+if(NOT DEFINED OPENF4_BUILD_TESTS AND DEFINED EMPIRE_BUILD_TESTS)
+    message(DEPRECATION "EMPIRE_BUILD_TESTS is deprecated; use OPENF4_BUILD_TESTS")
+    set(OPENF4_BUILD_TESTS "${EMPIRE_BUILD_TESTS}" CACHE BOOL "Build focused unit tests")
+endif()
+option(OPENF4_BUILD_TESTS "Build focused unit tests" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,6 +22,10 @@ find_package(PROJ CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(unofficial-shaderc CONFIG REQUIRED)
 find_package(ZLIB REQUIRED)
+find_package(assimp CONFIG REQUIRED)
+find_package(Stb REQUIRED)
+find_package(imgui CONFIG REQUIRED)
+find_package(imguizmo CONFIG REQUIRED)
 
 include(FetchContent)
 FetchContent_Declare(nifly
@@ -35,32 +43,35 @@ if(NOT TARGET lz4::lz4)
     add_library(lz4::lz4 ALIAS PkgConfig::LZ4)
 endif()
 
-add_library(empire-assets
+add_library(openf4-assets
+    src/assets/asset_resolver.cpp
     src/assets/ba2_archive.cpp
     src/assets/dds_texture.cpp
     src/assets/dem_import.cpp
     src/assets/dx10_archive.cpp
     src/assets/esm_editor.cpp
+    src/assets/esm_document.cpp
     src/assets/esm_world.cpp
     src/assets/fo4_install.cpp
     src/assets/havok_packfile.cpp
     src/assets/material_file.cpp
+    src/assets/model_import.cpp
     src/assets/nif_model.cpp
 )
-target_include_directories(empire-assets PUBLIC src PRIVATE ${GEOTIFF_INCLUDE_DIR})
-target_link_libraries(empire-assets PUBLIC glm::glm lz4::lz4 ZLIB::ZLIB
-    PRIVATE nifly ${GEOTIFF_LIBRARIES} PROJ::proj)
+target_include_directories(openf4-assets PUBLIC src PRIVATE ${GEOTIFF_INCLUDE_DIR} ${Stb_INCLUDE_DIR})
+target_link_libraries(openf4-assets PUBLIC glm::glm lz4::lz4 ZLIB::ZLIB
+    PRIVATE nifly ${GEOTIFF_LIBRARIES} PROJ::proj assimp::assimp)
 
-add_library(empire-physics src/physics/jolt_collision.cpp)
-target_include_directories(empire-physics PUBLIC src)
-target_link_libraries(empire-physics PUBLIC empire-assets Jolt::Jolt)
+add_library(openf4-physics src/physics/jolt_collision.cpp)
+target_include_directories(openf4-physics PUBLIC src)
+target_link_libraries(openf4-physics PUBLIC openf4-assets Jolt::Jolt)
 
-add_library(empire-renderer
+add_library(openf4-renderer
     src/render/mesh_builder.cpp
     src/render/vulkan_renderer.cpp
 )
-target_include_directories(empire-renderer PUBLIC src)
-target_link_libraries(empire-renderer
+target_include_directories(openf4-renderer PUBLIC src)
+target_link_libraries(openf4-renderer
     PUBLIC
         SDL3::SDL3
         Vulkan::Vulkan
@@ -72,45 +83,61 @@ target_link_libraries(empire-renderer
 
 if(MSVC)
     target_compile_options(nifly PRIVATE /FS)
-    target_compile_options(empire-assets PRIVATE /W4 /permissive- /FS)
-    target_compile_options(empire-physics PRIVATE /W4 /permissive- /FS)
-    target_compile_options(empire-renderer PRIVATE /W4 /permissive- /FS)
+    target_compile_options(openf4-assets PRIVATE /W4 /permissive- /FS)
+    target_compile_options(openf4-physics PRIVATE /W4 /permissive- /FS)
+    target_compile_options(openf4-renderer PRIVATE /W4 /permissive- /FS)
 else()
-    target_compile_options(empire-assets PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(empire-physics PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(empire-renderer PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(openf4-assets PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(openf4-physics PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(openf4-renderer PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_library(empire-world src/world/world_scene.cpp)
-target_include_directories(empire-world PUBLIC src)
-target_link_libraries(empire-world PUBLIC empire-assets empire-renderer empire-physics)
+add_library(openf4-world src/world/world_scene.cpp)
+target_include_directories(openf4-world PUBLIC src)
+target_link_libraries(openf4-world PUBLIC openf4-assets openf4-renderer openf4-physics)
 if(MSVC)
-    target_compile_options(empire-world PRIVATE /W4 /permissive- /FS)
+    target_compile_options(openf4-world PRIVATE /W4 /permissive- /FS)
 else()
-    target_compile_options(empire-world PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(openf4-world PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_executable(empire src/main.cpp)
-target_link_libraries(empire PRIVATE empire-world)
+add_executable(openf4 src/main.cpp)
+target_link_libraries(openf4 PRIVATE openf4-world)
 
-add_executable(empire-physics-demo apps/physics_demo.cpp)
-target_link_libraries(empire-physics-demo PRIVATE empire-physics empire-renderer)
+add_library(openf4-editor-document src/editor/editor_document.cpp)
+target_include_directories(openf4-editor-document PUBLIC src)
+target_link_libraries(openf4-editor-document PUBLIC openf4-world)
+add_executable(openf4-editor src/editor/main.cpp src/editor/editor_app.cpp)
+target_link_libraries(openf4-editor PRIVATE openf4-editor-document imgui::imgui imguizmo::imguizmo)
+if(MSVC)
+    target_compile_options(openf4-editor-document PRIVATE /W4 /permissive- /FS)
+    target_compile_options(openf4-editor PRIVATE /W4 /permissive- /FS)
+endif()
 
-if(EMPIRE_BUILD_TESTS)
+add_executable(openf4-physics-demo apps/physics_demo.cpp)
+target_link_libraries(openf4-physics-demo PRIVATE openf4-physics openf4-renderer)
+
+if(OPENF4_BUILD_TESTS)
     enable_testing()
-    add_executable(empire-ba2-tests tests/ba2_archive_tests.cpp)
-    target_link_libraries(empire-ba2-tests PRIVATE empire-assets)
-    add_test(NAME ba2_archive COMMAND empire-ba2-tests)
-    add_executable(empire-asset-format-tests tests/asset_format_tests.cpp)
-    target_include_directories(empire-asset-format-tests PRIVATE ${GEOTIFF_INCLUDE_DIR})
-    target_link_libraries(empire-asset-format-tests PRIVATE empire-assets ${GEOTIFF_LIBRARIES})
-    add_test(NAME asset_formats COMMAND empire-asset-format-tests)
-    add_executable(empire-mesh-builder-tests tests/mesh_builder_tests.cpp)
-    target_link_libraries(empire-mesh-builder-tests PRIVATE empire-world)
-    add_test(NAME mesh_builder COMMAND empire-mesh-builder-tests)
-    add_executable(empire-havok-tests tests/havok_packfile_tests.cpp)
-    target_link_libraries(empire-havok-tests PRIVATE empire-physics)
-    add_test(NAME havok_packfile COMMAND empire-havok-tests)
-    add_test(NAME havok_fallout4_asset COMMAND empire-havok-tests --fallout4)
+    add_executable(openf4-editor-document-tests tests/editor_document_tests.cpp)
+    target_link_libraries(openf4-editor-document-tests PRIVATE openf4-editor-document)
+    add_test(NAME editor_document COMMAND openf4-editor-document-tests)
+    add_executable(openf4-model-import-tests tests/model_import_tests.cpp)
+    target_link_libraries(openf4-model-import-tests PRIVATE openf4-assets)
+    add_test(NAME model_import COMMAND openf4-model-import-tests)
+    add_executable(openf4-ba2-tests tests/ba2_archive_tests.cpp)
+    target_link_libraries(openf4-ba2-tests PRIVATE openf4-assets)
+    add_test(NAME ba2_archive COMMAND openf4-ba2-tests)
+    add_executable(openf4-asset-format-tests tests/asset_format_tests.cpp)
+    target_include_directories(openf4-asset-format-tests PRIVATE ${GEOTIFF_INCLUDE_DIR})
+    target_link_libraries(openf4-asset-format-tests PRIVATE openf4-assets ${GEOTIFF_LIBRARIES})
+    add_test(NAME asset_formats COMMAND openf4-asset-format-tests)
+    add_executable(openf4-mesh-builder-tests tests/mesh_builder_tests.cpp)
+    target_link_libraries(openf4-mesh-builder-tests PRIVATE openf4-world)
+    add_test(NAME mesh_builder COMMAND openf4-mesh-builder-tests)
+    add_executable(openf4-havok-tests tests/havok_packfile_tests.cpp)
+    target_link_libraries(openf4-havok-tests PRIVATE openf4-physics)
+    add_test(NAME havok_packfile COMMAND openf4-havok-tests)
+    add_test(NAME havok_fallout4_asset COMMAND openf4-havok-tests --fallout4)
     set_tests_properties(havok_fallout4_asset PROPERTIES SKIP_RETURN_CODE 77)
 endif()
