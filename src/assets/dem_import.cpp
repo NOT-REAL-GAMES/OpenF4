@@ -1,8 +1,6 @@
 #include "assets/dem_import.hpp"
 #include "assets/esm_document.hpp"
-
-#include <NifFile.hpp>
-#include <Shaders.hpp>
+#include "assets/lod_terrain.hpp"
 
 #include <geotiffio.h>
 #include <geovalues.h>
@@ -21,6 +19,7 @@
 #include <locale>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <sstream>
@@ -905,76 +904,12 @@ namespace openf4::assets
         void bakeBtrTile(const PreparedImport& prepared, CellCoord origin,
             const std::filesystem::path& path)
         {
-            constexpr std::size_t side = 33;
-            constexpr float spacing = static_cast<float>(cellSize);
-            // FO4's compact BSTriShape positions overflow above 65,504. Keep the
-            // level-32 tile local and restore its 1:1 dimensions with the shape scale.
-            constexpr float shapeScale = 8.0f;
-            std::array<float, side * side> heights{};
-            std::vector<nifly::Vector3> vertices;
-            std::vector<nifly::Vector3> normals;
-            std::vector<nifly::Vector2> uvs;
-            std::vector<nifly::Triangle> triangles;
-            vertices.reserve(side * side);
-            normals.reserve(side * side);
-            uvs.reserve(side * side);
-            triangles.reserve(32 * 32 * 2);
-            for (std::size_t y = 0; y < side; ++y)
-                for (std::size_t x = 0; x < side; ++x)
-                    heights[y * side + x] = sampleAtAssetPosition(prepared,
-                        (origin.x + static_cast<std::int32_t>(x)) * cellSize,
-                        (origin.y + static_cast<std::int32_t>(y)) * cellSize);
-            const auto height = [&](int x, int y) {
-                return heights[static_cast<std::size_t>(std::clamp(y, 0, 32)) * side
-                    + static_cast<std::size_t>(std::clamp(x, 0, 32))];
-            };
-            for (int y = 0; y < 33; ++y)
-            {
-                for (int x = 0; x < 33; ++x)
-                {
-                    vertices.emplace_back(x * spacing / shapeScale,
-                        y * spacing / shapeScale, height(x, y) / shapeScale);
-                    nifly::Vector3 normal(height(x - 1, y) - height(x + 1, y),
-                        height(x, y - 1) - height(x, y + 1), 2.0f * spacing);
-                    normal.Normalize();
-                    normals.push_back(normal);
-                    uvs.emplace_back(static_cast<float>(x) / 32.0f,
-                        static_cast<float>(y) / 32.0f);
-                }
-            }
-            for (std::uint16_t y = 0; y < 32; ++y)
-            {
-                for (std::uint16_t x = 0; x < 32; ++x)
-                {
-                    const std::uint16_t topLeft = static_cast<std::uint16_t>(y * 33 + x);
-                    const std::uint16_t topRight = static_cast<std::uint16_t>(topLeft + 1);
-                    const std::uint16_t bottomLeft = static_cast<std::uint16_t>(topLeft + 33);
-                    const std::uint16_t bottomRight = static_cast<std::uint16_t>(bottomLeft + 1);
-                    triangles.emplace_back(topLeft, topRight, bottomLeft);
-                    triangles.emplace_back(topRight, bottomRight, bottomLeft);
-                }
-            }
-
-            nifly::NifFile file;
-            file.Create(nifly::NiVersion::getFO4());
-            nifly::NiShape* shape = file.CreateShapeFromData(
-                "OpenF4World Terrain LOD", &vertices, &triangles, &uvs, &normals);
-            if (!shape)
-                throw std::runtime_error("Could not create BTR terrain shape");
-            nifly::MatTransform transform;
-            transform.scale = shapeScale;
-            shape->SetTransformToParent(transform);
-            if (auto* shader = file.GetShader(shape))
-            {
-                shader->name.get().clear();
-                shader->SetWetMaterialName("");
-            }
-            std::filesystem::create_directories(path.parent_path());
-            std::filesystem::path temporary = path;
-            temporary += ".tmp";
-            if (file.Save(temporary) != 0)
-                throw std::runtime_error("Could not save BTR terrain shard: " + path.string());
-            std::filesystem::rename(temporary, path);
+            writeTerrainBtr(path, static_cast<float>(cellSize),
+                [&](int x, int y) -> std::optional<float> {
+                    return sampleAtAssetPosition(prepared,
+                        (static_cast<double>(origin.x) + x) * cellSize,
+                        (static_cast<double>(origin.y) + y) * cellSize);
+                }, [](int, int) { return true; });
         }
 
         std::uint64_t bakeBtrs(PreparedImport& prepared)
@@ -1199,6 +1134,66 @@ namespace openf4::assets
                     }
                 }
                 return result;
+            }
+
+            void forEachCell(const std::function<void(CellCoord)>& visit) const
+            {
+                for (const auto& [label, blockOffset] : mBlocks)
+                {
+                    (void)label;
+                    const std::uint64_t blockEnd = blockOffset
+                        + readStream<std::uint32_t>(mFile, blockOffset + 4);
+                    std::uint64_t subblock = blockOffset + recordHeaderSize;
+                    while (subblock < blockEnd)
+                    {
+                        const auto size = readStream<std::uint32_t>(mFile, subblock + 4);
+                        if (readStream<std::uint32_t>(mFile, subblock) != grup
+                            || readStream<std::uint32_t>(mFile, subblock + 12) != 5
+                            || size < recordHeaderSize || subblock + size > blockEnd)
+                            throw std::runtime_error("DEM shard has a malformed sub-block");
+                        // One sub-block is at most 64 LAND cells; scan it sequentially
+                        // rather than seeking through every individual LAND payload.
+                        const Bytes bytes = readStreamBytes(mFile,
+                            subblock + recordHeaderSize, size - recordHeaderSize);
+                        std::size_t cursor = 0;
+                        while (cursor < bytes.size())
+                        {
+                            if (bytes.size() - cursor < recordHeaderSize
+                                || readBytes<std::uint32_t>(bytes, cursor) != cell)
+                                throw std::runtime_error("DEM sub-block contains a non-CELL record");
+                            const auto recordSize = readBytes<std::uint32_t>(bytes, cursor + 4);
+                            const std::size_t recordEnd = cursor + recordHeaderSize + recordSize;
+                            if (recordEnd > bytes.size())
+                                throw std::runtime_error("DEM shard CELL exceeds its sub-block");
+                            std::optional<CellCoord> coord;
+                            for (std::size_t field = cursor + recordHeaderSize; field < recordEnd;)
+                            {
+                                if (recordEnd - field < 6)
+                                    throw std::runtime_error("DEM shard CELL has a truncated field");
+                                const auto fieldSize = readBytes<std::uint16_t>(bytes, field + 4);
+                                if (fieldSize > recordEnd - field - 6)
+                                    throw std::runtime_error("DEM shard CELL field exceeds its record");
+                                if (readBytes<std::uint32_t>(bytes, field) == xclc && fieldSize >= 8)
+                                    coord = {readBytes<std::int32_t>(bytes, field + 6),
+                                        readBytes<std::int32_t>(bytes, field + 10)};
+                                field += 6 + fieldSize;
+                            }
+                            if (!coord)
+                                throw std::runtime_error("Imported CELL is missing XCLC");
+                            if (bytes.size() - recordEnd < recordHeaderSize
+                                || readBytes<std::uint32_t>(bytes, recordEnd) != grup
+                                || readBytes<std::uint32_t>(bytes, recordEnd + 12) != 6)
+                                throw std::runtime_error("Imported CELL is missing its children group");
+                            const auto childrenSize = readBytes<std::uint32_t>(bytes, recordEnd + 4);
+                            if (childrenSize < recordHeaderSize
+                                || childrenSize > bytes.size() - recordEnd)
+                                throw std::runtime_error("Imported CELL children exceed their sub-block");
+                            visit(*coord);
+                            cursor = recordEnd + childrenSize;
+                        }
+                        subblock += size;
+                    }
+                }
             }
 
         private:
@@ -1472,6 +1467,9 @@ namespace openf4::assets
         EslHeader header;
         std::vector<Shard> shards;
         std::map<CellCoord, DemLandscapeCell> overlay;
+        // Reads seek persistent shard streams; const lookups must not overlap.
+        // ponytail: one project lock also protects saves; split per shard only if contended.
+        mutable std::mutex ioMutex;
         std::uint32_t nextForm = firstLocalFormId;
         std::uint64_t totalCells = 0;
 
@@ -1592,16 +1590,18 @@ namespace openf4::assets
 
     bool DemLandscapeProject::contains(CellCoord coord) const
     {
-        return mImpl->find(coord).has_value();
+        return cell(coord).has_value();
     }
 
     std::optional<DemLandscapeCell> DemLandscapeProject::cell(CellCoord coord) const
     {
+        std::scoped_lock lock(mImpl->ioMutex);
         return mImpl->find(coord);
     }
 
     std::uint32_t DemLandscapeProject::nextFormId() const noexcept
     {
+        std::scoped_lock lock(mImpl->ioMutex);
         return mImpl->nextForm;
     }
 
@@ -1612,12 +1612,48 @@ namespace openf4::assets
 
     std::size_t DemLandscapeProject::overlayCellCount() const noexcept
     {
+        std::scoped_lock lock(mImpl->ioMutex);
         return mImpl->overlay.size();
+    }
+
+    void DemLandscapeProject::forEachCell(
+        const std::function<void(CellCoord)>& visit) const
+    {
+        std::scoped_lock lock(mImpl->ioMutex);
+        for (const auto& shard : mImpl->shards)
+            shard.reader->forEachCell(visit);
+        for (const auto& [coord, entry] : mImpl->overlay)
+        {
+            (void)entry;
+            visit(coord);
+        }
+    }
+
+    std::vector<std::filesystem::path> DemLandscapeProject::sourceFiles() const
+    {
+        std::vector<std::filesystem::path> result{mImpl->path};
+        result.reserve(mImpl->shards.size() + 1);
+        for (const auto& shard : mImpl->shards)
+            result.push_back(mImpl->path.parent_path()
+                / mImpl->header.masters[shard.masterIndex]);
+        return result;
+    }
+
+    std::optional<std::pair<CellCoord, CellCoord>>
+        DemLandscapeProject::shardCellBounds(const std::filesystem::path& source) const
+    {
+        const auto path = std::filesystem::absolute(source).lexically_normal();
+        for (const auto& shard : mImpl->shards)
+            if ((mImpl->path.parent_path()
+                    / mImpl->header.masters[shard.masterIndex]).lexically_normal() == path)
+                return std::pair{shard.minimum, shard.maximum};
+        return std::nullopt;
     }
 
     void DemLandscapeProject::save(const EditableLandscape& landscape,
         const std::set<CellCoord>& changedCells)
     {
+        std::scoped_lock lock(mImpl->ioMutex);
         mImpl->save(landscape, changedCells);
     }
 }

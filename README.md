@@ -88,15 +88,48 @@ other static Assimp formats are accepted when usable. One glTF meter is 69.99125
 
 Hold RMB in the viewport to fly with WASD and Q/E; Shift accelerates. Drop a model file
 into the window, use File/Import, or drag an imported Asset Browser entry into the view.
-Click to select, Shift-click to extend selection, F to frame, W/E/R to change gizmos,
+Click to select, Shift-click to toggle selection, F to frame, W/E/R to change gizmos,
 Delete to remove, and Ctrl+D to duplicate. The Inspector exposes transforms, hide, and
 lock. Ctrl+Z/Y undo/redo complete commands; Ctrl+S saves. Landscape mode reuses the
 terrain tools described below, with the same document history and reference-safe save.
 
+Object picking uses loaded mesh triangles (not just bounding spheres), with LAND
+occlusion. The active object has an amber visible-only outline; other selected objects
+have cyan outlines. Outliner and viewport selection share the same active reference.
+The viewport toolbar selects World/Local axes and Active Object/Selection Center
+pivots. Move and rotation snapping are off initially, with 128-unit and 15-degree
+steps; snapping is relative to the drag's start. Scaling is always uniform, and
+numeric Inspector entry remains exact. Escape cancels a drag and its cell ownership
+changes; each group operation is a single undo step. Hidden/locked references are
+excluded from transforms, duplication, and grounding.
+
+Use **Build → Bake Changed LOD** after saving to update affected terrain and static
+tiles, or **Bake All LOD** to rebuild the world. The first bake is always full.
+The editor shows progress and allows cancellation; completed tiles refresh in the
+open viewport. The headless equivalent is:
+
+```powershell
+build/bin/Release/openf4-editor.exe "build/mods/NYC.esm" --bake-lod --yes
+build/bin/Release/openf4-editor.exe "build/mods/NYC.esm" --bake-lod --full --terrain-only --yes
+```
+
+`--statics-only` selects static tiles instead. Preflight prints the tile count and
+estimated size; jobs over 10,000 tiles require editor confirmation or CLI `--yes`.
+Terrain BTRs are written to `<world>.btr/` at levels 4, 8, 16, and 32. Simplified
+static glTF tiles and the SQLite change index live in `<world>.assets/lod/`.
+These are derived products: the ESM and its terrain shards remain authoritative.
+
+`End` or **Drop to Ground** places each selected object's lowest geometry point at
+the loaded LAND height beneath its origin. Optional **Align to terrain** tilts local
+up to the terrain normal while keeping heading. Water, BTRs, and other objects are
+not grounding surfaces; unavailable LAND/models are skipped with a diagnostic.
+Placement preferences are session-local. Transparent holes are still geometric for
+picking; texture-alpha-aware selection is not implemented.
+
 Basic imported materials support base color, PNG/JPEG textures, and alpha masks.
 Blend materials currently fall back to alpha cutout; double-sided materials still use
 back-face culling. Diagnostics report these fallbacks. Tangent/PBR metadata is retained
-for the later material pass. Advanced material editing, derived bakes, and external
+for the later material pass. Advanced material editing and external
 Bethesda-tool compatibility remain follow-on work. Save As of a sharded project stays
 beside its local terrain masters; relocating those masters is not automatic.
 

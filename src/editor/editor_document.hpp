@@ -56,6 +56,9 @@ namespace openf4::editor
             std::string modelPath, std::string sourcePath, const glm::mat4& transform);
         void beginTransaction();
         void endTransaction();
+        // Cancel the whole active transaction, including nested operations and
+        // any CELL/FormID allocations, without creating an undo entry.
+        void cancelTransaction();
         [[nodiscard]] std::uint32_t addModel(std::string projectRelativePath,
             std::string sourcePath = {});
         [[nodiscard]] std::uint32_t place(std::uint32_t model, const glm::mat4& transform,

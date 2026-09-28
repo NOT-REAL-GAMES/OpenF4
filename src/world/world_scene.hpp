@@ -3,6 +3,7 @@
 #include "render/mesh_builder.hpp"
 #include "render/vulkan_renderer.hpp"
 #include "physics/jolt_collision.hpp"
+#include "world/picking_geometry.hpp"
 
 #include <filesystem>
 #include <limits>
@@ -27,6 +28,18 @@ namespace openf4::world
         flatten
     };
 
+    struct ObjectPick
+    {
+        std::uint32_t formId = 0;
+        double distance = 0.0;
+    };
+
+    struct LandscapeSurface
+    {
+        double height = 0.0;
+        glm::vec3 normal{0.0f, 1.0f, 0.0f};
+    };
+
     namespace detail
     {
         inline constexpr float demHorizonFadeStart = 80.0f * 4096.0f;
@@ -49,6 +62,19 @@ namespace openf4::world
                 : glm::vec4(0.0f, 0.0f, fadeStart, fadeEnd);
         }
 
+        [[nodiscard]] inline glm::vec4 demBtrLodRange(int level) noexcept
+        {
+            constexpr float cell = 4096.0f;
+            switch (level)
+            {
+            case 4: return {3.0f * cell, 4.0f * cell, 8.0f * cell, 12.0f * cell};
+            case 8: return {8.0f * cell, 12.0f * cell, 16.0f * cell, 24.0f * cell};
+            case 16: return {16.0f * cell, 24.0f * cell, 32.0f * cell, 48.0f * cell};
+            default: return {32.0f * cell, 48.0f * cell,
+                demHorizonFadeStart, demHorizonFadeEnd};
+            }
+        }
+
         [[nodiscard]] inline glm::vec4 demWaterLodRange() noexcept
         {
             return {0.0f, 0.0f, demHorizonFadeStart, demHorizonFadeEnd};
@@ -57,6 +83,8 @@ namespace openf4::world
             glm::vec2 center, LandscapeTool tool, float radius, float amount,
             float flattenHeight = 0.0f);
         void quantizeLandscape(assets::EditableLandscape& landscape);
+        [[nodiscard]] std::optional<LandscapeSurface> landscapeSurface(
+            const assets::EditableLandscape& landscape, glm::dvec2 engineXZ);
 
         class LandscapeHistory
         {
@@ -116,9 +144,18 @@ namespace openf4::world
             const glm::dvec3& cameraPosition,
             std::span<const std::uint32_t> hiddenForms = {});
         [[nodiscard]] std::optional<glm::vec4> bounds(std::uint32_t formId) const;
+        // Picking and bounds use absolute engine coordinates, without camera reflection.
+        [[nodiscard]] std::optional<ObjectPick> pick(const glm::dvec3& origin,
+            const glm::dvec3& unitDirection, std::span<const std::uint32_t> excludedForms = {},
+            double maxDistance = std::numeric_limits<double>::infinity()) const;
+        [[nodiscard]] std::optional<GeometryBounds> geometryBounds(std::uint32_t formId,
+            std::optional<glm::mat4> transform = std::nullopt) const;
+        [[nodiscard]] std::optional<std::uint32_t> rendererInstance(std::uint32_t formId) const;
         [[nodiscard]] std::size_t pending() const noexcept;
         [[nodiscard]] std::size_t loaded() const noexcept;
         [[nodiscard]] const std::vector<std::string>& diagnostics() const noexcept;
+        void refreshDerivedLod(render::VulkanRenderer& renderer,
+            std::span<const std::filesystem::path> publishedPaths);
 
     private:
         struct Impl;
@@ -170,6 +207,7 @@ namespace openf4::world
         void setExternalSave(bool enabled) noexcept;
         [[nodiscard]] std::optional<glm::vec3> raycast(
             const glm::dvec3& cameraPosition, const glm::vec3& direction) const;
+        [[nodiscard]] std::optional<LandscapeSurface> surfaceAt(glm::dvec2 engineXZ) const;
         [[nodiscard]] assets::EditableLandscape snapshot() const;
         [[nodiscard]] std::size_t residentCells() const noexcept;
         [[nodiscard]] std::size_t pendingWork() const noexcept;
@@ -177,6 +215,8 @@ namespace openf4::world
         void setNextFormId(std::uint32_t next) noexcept;
         void applySnapshot(render::VulkanRenderer& renderer,
             const assets::EditableLandscape& snapshot);
+        void refreshDerivedLod(render::VulkanRenderer& renderer,
+            std::span<const std::filesystem::path> publishedPaths);
         void adjustRadius(float wheelSteps) noexcept;
         void adjustStrength(float wheelSteps) noexcept;
         void update(render::VulkanRenderer& renderer, const glm::dvec3& cameraPosition,

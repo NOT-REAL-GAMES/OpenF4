@@ -23,6 +23,8 @@ find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(unofficial-shaderc CONFIG REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(assimp CONFIG REQUIRED)
+find_package(meshoptimizer CONFIG REQUIRED)
+find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(Stb REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(imguizmo CONFIG REQUIRED)
@@ -54,13 +56,17 @@ add_library(openf4-assets
     src/assets/esm_world.cpp
     src/assets/fo4_install.cpp
     src/assets/havok_packfile.cpp
+    src/assets/lod_bake.cpp
+    src/assets/lod_statics.cpp
+    src/assets/lod_terrain.cpp
     src/assets/material_file.cpp
     src/assets/model_import.cpp
     src/assets/nif_model.cpp
 )
 target_include_directories(openf4-assets PUBLIC src PRIVATE ${GEOTIFF_INCLUDE_DIR} ${Stb_INCLUDE_DIR})
 target_link_libraries(openf4-assets PUBLIC glm::glm lz4::lz4 ZLIB::ZLIB
-    PRIVATE nifly ${GEOTIFF_LIBRARIES} PROJ::proj assimp::assimp)
+    PRIVATE nifly ${GEOTIFF_LIBRARIES} PROJ::proj assimp::assimp
+        meshoptimizer::meshoptimizer unofficial::sqlite3::sqlite3)
 
 add_library(openf4-physics src/physics/jolt_collision.cpp)
 target_include_directories(openf4-physics PUBLIC src)
@@ -92,7 +98,7 @@ else()
     target_compile_options(openf4-renderer PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_library(openf4-world src/world/world_scene.cpp)
+add_library(openf4-world src/world/world_scene.cpp src/world/picking_geometry.cpp)
 target_include_directories(openf4-world PUBLIC src)
 target_link_libraries(openf4-world PUBLIC openf4-assets openf4-renderer openf4-physics)
 if(MSVC)
@@ -104,7 +110,7 @@ endif()
 add_executable(openf4 src/main.cpp)
 target_link_libraries(openf4 PRIVATE openf4-world)
 
-add_library(openf4-editor-document src/editor/editor_document.cpp)
+add_library(openf4-editor-document src/editor/editor_document.cpp src/editor/editor_manipulation.cpp)
 target_include_directories(openf4-editor-document PUBLIC src)
 target_link_libraries(openf4-editor-document PUBLIC openf4-world)
 add_executable(openf4-editor src/editor/main.cpp src/editor/editor_app.cpp)
@@ -140,4 +146,13 @@ if(OPENF4_BUILD_TESTS)
     add_test(NAME havok_packfile COMMAND openf4-havok-tests)
     add_test(NAME havok_fallout4_asset COMMAND openf4-havok-tests --fallout4)
     set_tests_properties(havok_fallout4_asset PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(openf4-lod-terrain-tests tests/lod_terrain_tests.cpp)
+    target_link_libraries(openf4-lod-terrain-tests PRIVATE openf4-assets)
+    add_test(NAME lod_terrain COMMAND openf4-lod-terrain-tests)
+    add_executable(openf4-lod-statics-tests tests/lod_statics_tests.cpp)
+    target_link_libraries(openf4-lod-statics-tests PRIVATE openf4-assets)
+    add_test(NAME lod_statics COMMAND openf4-lod-statics-tests)
+    add_executable(openf4-lod-bake-tests tests/lod_bake_tests.cpp)
+    target_link_libraries(openf4-lod-bake-tests PRIVATE openf4-assets)
+    add_test(NAME lod_bake COMMAND openf4-lod-bake-tests)
 endif()

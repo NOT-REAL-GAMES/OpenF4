@@ -13,11 +13,13 @@
     "joltphysics",
     "libgeotiff",
     "lz4",
+    "meshoptimizer",
     {
       "name": "sdl3",
       "features": ["vulkan"]
     },
     "shaderc",
+    "sqlite3",
     "stb",
     "vulkan-memory-allocator",
     "zlib"

@@ -142,7 +142,8 @@ void main()
     Instance instance = instances[candidate.x];
     Meshlet meshlet = meshlets[candidate.y];
     bool decal = materials[meshlet.materialIndex].parameters.w > 0.5;
-    if (decal != (decalPass != 0)) {
+    if (decalPass == 2 ? (instance.skinRange.z == 0 || instance.meshletRange.w != 0)
+                      : decal != (decalPass != 0)) {
         SetMeshOutputsEXT(0, 0);
         return;
     }
@@ -221,6 +222,7 @@ layout(std140, binding = 7) uniform Camera {
 } camera;
 layout(binding = 8) uniform sampler2DShadow shadowMap;
 layout(binding = 11) uniform sampler2D diffuseTextures[];
+layout(constant_id = 1) const uint selectionPass = 0;
 
 layout(location = 0) in vec3 fragmentNormal;
 layout(location = 1) in flat uint fragmentInstance;
@@ -308,6 +310,12 @@ void main()
         ? 1.0 : textureSample.a * material.baseColor.a * fragmentColor.a;
     if (material.parameters.y > 0.0 && opacity < material.parameters.y)
         discard;
+    if (selectionPass != 0) {
+        if (opacity <= 0.001)
+            discard;
+        outputColor = vec4(float(instance.skinRange.z) * 0.5, 0.0, 0.0, 1.0);
+        return;
+    }
     vec3 sampled = textureSample.rgb;
     if (!terrain && material.textureIndices.w != 0u && material.textureIndices.z != 0u) {
         float gray = dot(sampled, vec3(0.333333));
@@ -336,6 +344,44 @@ void main()
     if (terrainLod)
         color *= color * color + 1.0;
     outputColor = vec4(color, opacity);
+}
+)";
+
+        const char* outlineVertexShader = R"(
+#version 460
+void main()
+{
+    vec2 corner = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
+    gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+        const char* outlineFragmentShader = R"(
+#version 460
+layout(binding = 0) uniform sampler2D selectionMask;
+layout(location = 0) out vec4 outputColor;
+void main()
+{
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    float selected = texelFetch(selectionMask, pixel, 0).r;
+    if (selected == 0.0)
+        discard;
+    ivec2 size = textureSize(selectionMask, 0);
+    bool edge = false;
+    for (int y = -2; y <= 2; ++y)
+        for (int x = -2; x <= 2; ++x) {
+            if (x*x + y*y > 4)
+                continue;
+            ivec2 neighbor = pixel + ivec2(x, y);
+            // The outline is two pixels inward, so it cannot bleed onto an occluder
+            // or outside the editor viewport, even at a partially hidden silhouette.
+            if (all(greaterThanEqual(neighbor, ivec2(0))) && all(lessThan(neighbor, size)))
+                edge = edge || texelFetch(selectionMask, neighbor, 0).r != selected;
+        }
+    if (!edge)
+        discard;
+    outputColor = selected > 0.75 ? vec4(1.0, 0.55, 0.05, 1.0)
+                                  : vec4(0.0, 0.85, 1.0, 1.0);
 }
 )";
 
@@ -540,6 +586,8 @@ void main()
             VkSemaphore acquired = VK_NULL_HANDLE;
             VkSemaphore sparseReady = VK_NULL_HANDLE;
             VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+            VkDescriptorSet selectionDescriptorSet = VK_NULL_HANDLE;
+            DepthTarget selectionMask;
             Buffer uniform;
             Buffer visible;
             Buffer indirect;
@@ -578,6 +626,14 @@ void main()
         VkPipeline graphicsPipeline = VK_NULL_HANDLE;
         VkPipeline decalPipeline = VK_NULL_HANDLE;
         VkPipeline shadowPipeline = VK_NULL_HANDLE;
+        VkPipeline selectionPipeline = VK_NULL_HANDLE;
+        VkPipeline outlinePipeline = VK_NULL_HANDLE;
+        VkDescriptorSetLayout selectionDescriptorSetLayout = VK_NULL_HANDLE;
+        VkDescriptorPool selectionDescriptorPool = VK_NULL_HANDLE;
+        VkPipelineLayout outlinePipelineLayout = VK_NULL_HANDLE;
+        VkSampler selectionSampler = VK_NULL_HANDLE;
+        std::vector<std::uint32_t> selectedInstances;
+        std::optional<std::uint32_t> activeSelection;
         VkQueryPool queryPool = VK_NULL_HANDLE;
         PFN_vkCmdDrawMeshTasksIndirectEXT drawMeshTasksIndirect = nullptr;
 
@@ -661,6 +717,16 @@ void main()
                 vkDeviceWaitIdle(device);
             if (queryPool)
                 vkDestroyQueryPool(device, queryPool, nullptr);
+            if (selectionPipeline)
+                vkDestroyPipeline(device, selectionPipeline, nullptr);
+            if (outlinePipeline)
+                vkDestroyPipeline(device, outlinePipeline, nullptr);
+            if (outlinePipelineLayout)
+                vkDestroyPipelineLayout(device, outlinePipelineLayout, nullptr);
+            if (selectionDescriptorSetLayout)
+                vkDestroyDescriptorSetLayout(device, selectionDescriptorSetLayout, nullptr);
+            if (selectionSampler)
+                vkDestroySampler(device, selectionSampler, nullptr);
             if (graphicsPipeline)
                 vkDestroyPipeline(device, graphicsPipeline, nullptr);
             if (decalPipeline)
@@ -1083,6 +1149,7 @@ void main()
 
         void destroySwapchain()
         {
+            destroySelectionTargets();
             for (VkSemaphore semaphore : presentSemaphores)
                 vkDestroySemaphore(device, semaphore, nullptr);
             presentSemaphores.clear();
@@ -1954,6 +2021,18 @@ void main()
 
             std::copy(mesh.meshlets.begin(), mesh.meshlets.end(),
                 meshletData.begin() + range.meshletOffset);
+            const std::size_t pendingVertexBase = vertexCount - pendingVertices.size();
+            const std::size_t pendingMeshletBase = meshletCount - pendingMeshlets.size();
+            if (range.vertexOffset >= pendingVertexBase && range.meshletOffset >= pendingMeshletBase)
+            {
+                // A newly streamed cell can be rebuilt before its first upload.
+                // Replace that queued data, rather than issue overlapping GPU copies.
+                std::copy(mesh.vertices.begin(), mesh.vertices.end(),
+                    pendingVertices.begin() + (range.vertexOffset - pendingVertexBase));
+                std::copy(mesh.meshlets.begin(), mesh.meshlets.end(),
+                    pendingMeshlets.begin() + (range.meshletOffset - pendingMeshletBase));
+                return;
+            }
             const auto existing = std::find_if(pendingMeshPatches.begin(), pendingMeshPatches.end(),
                 [&range](const MeshPatch& patch) {
                     return patch.range.vertexOffset == range.vertexOffset
@@ -2040,6 +2119,41 @@ void main()
                         pendingInstanceUpdates.push_back(index);
                 }
             }
+        }
+
+        void setSelection(std::span<const std::uint32_t> instanceIndices,
+            std::optional<std::uint32_t> active)
+        {
+            std::vector<std::uint32_t> selected(instanceIndices.begin(), instanceIndices.end());
+            std::sort(selected.begin(), selected.end());
+            selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
+            if (!selected.empty() && selected.back() >= instanceData.size())
+                throw std::runtime_error("Selected instance index is out of bounds");
+            if (active && !std::binary_search(selected.begin(), selected.end(), *active))
+                throw std::runtime_error("Active instance is not selected");
+            if (selected == selectedInstances && active == activeSelection)
+                return;
+
+            std::vector<std::uint32_t> changed = selectedInstances;
+            changed.insert(changed.end(), selected.begin(), selected.end());
+            std::sort(changed.begin(), changed.end());
+            changed.erase(std::unique(changed.begin(), changed.end()), changed.end());
+            const std::size_t pendingBase = instanceData.size() - pendingInstances.size();
+            for (const std::uint32_t index : changed)
+            {
+                const std::uint32_t category = active == index ? 2u
+                    : std::binary_search(selected.begin(), selected.end(), index) ? 1u : 0u;
+                // skinRange.z is transient selection metadata, not part of SceneInstance/ESM.
+                if (instanceData[index].skinRange.z == category)
+                    continue;
+                instanceData[index].skinRange.z = category;
+                if (index >= pendingBase)
+                    pendingInstances[index - pendingBase].skinRange.z = category;
+                else
+                    pendingInstanceUpdates.push_back(index);
+            }
+            selectedInstances = std::move(selected);
+            activeSelection = active;
         }
 
         void updateTransform(std::uint32_t index, const glm::mat4& transform, glm::vec4 bounds)
@@ -2212,11 +2326,13 @@ void main()
             check(vmaFlushAllocation(allocator, staging.allocation, 0, VK_WHOLE_SIZE),
                 "vmaFlushAllocation streaming batch");
 
-            if (!pendingMeshPatches.empty())
+            // Scene buffers are shared by both in-flight frames: wait for earlier
+            // shader reads before overwriting existing geometry/instance/skin data.
+            if (!pendingMeshPatches.empty() || !pendingInstanceUpdates.empty() || skinDataDirty)
             {
                 VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
                 barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
-                    | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
+                    | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
                 barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
                 barrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
                 barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -2438,6 +2554,180 @@ void main()
             vkDestroyShaderModule(device, computeModule, nullptr);
         }
 
+        void createSelectionPipelines()
+        {
+            const VkShaderModule meshModule = shaderModule(
+                compileShader(meshShader, shaderc_mesh_shader, "selection.mesh"));
+            const VkShaderModule fragmentModule = shaderModule(
+                compileShader(fragmentShader, shaderc_fragment_shader, "selection.frag"));
+            const VkShaderModule vertexModule = shaderModule(
+                compileShader(outlineVertexShader, shaderc_vertex_shader, "outline.vert"));
+            const VkShaderModule outlineModule = shaderModule(
+                compileShader(outlineFragmentShader, shaderc_fragment_shader, "outline.frag"));
+            const VkSpecializationMapEntry meshEntry{0, 0, sizeof(std::uint32_t)};
+            const VkSpecializationMapEntry fragmentEntry{1, 0, sizeof(std::uint32_t)};
+            const std::uint32_t maskPass = 2;
+            const VkSpecializationInfo meshSpecialization{1, &meshEntry, sizeof(maskPass), &maskPass};
+            const VkSpecializationInfo fragmentSpecialization{1, &fragmentEntry, sizeof(maskPass), &maskPass};
+            std::array stages{
+                VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    nullptr, 0, VK_SHADER_STAGE_MESH_BIT_EXT, meshModule, "main", &meshSpecialization},
+                VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragmentModule, "main", &fragmentSpecialization}
+            };
+            VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+            VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+            assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+            viewport.viewportCount = viewport.scissorCount = 1;
+            VkPipelineRasterizationStateCreateInfo rasterization{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+            rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+            rasterization.cullMode = VK_CULL_MODE_BACK_BIT;
+            rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            rasterization.lineWidth = 1.0f;
+            VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+            multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+            depth.depthTestEnable = VK_TRUE;
+            depth.depthWriteEnable = VK_FALSE;
+            depth.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
+            VkPipelineColorBlendAttachmentState attachment{};
+            attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+            VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+            blend.attachmentCount = 1;
+            blend.pAttachments = &attachment;
+            constexpr std::array states{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+            dynamic.dynamicStateCount = static_cast<std::uint32_t>(states.size());
+            dynamic.pDynamicStates = states.data();
+            const VkFormat maskFormat = VK_FORMAT_R8_UNORM;
+            VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+            rendering.colorAttachmentCount = 1;
+            rendering.pColorAttachmentFormats = &maskFormat;
+            rendering.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+            VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
+            info.stageCount = static_cast<std::uint32_t>(stages.size());
+            info.pStages = stages.data();
+            info.pVertexInputState = &vertexInput;
+            info.pInputAssemblyState = &assembly;
+            info.pViewportState = &viewport;
+            info.pRasterizationState = &rasterization;
+            info.pMultisampleState = &multisample;
+            info.pDepthStencilState = &depth;
+            info.pColorBlendState = &blend;
+            info.pDynamicState = &dynamic;
+            info.layout = pipelineLayout;
+            check(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr,
+                &selectionPipeline), "vkCreateGraphicsPipelines selection");
+
+            stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = vertexModule;
+            stages[0].pSpecializationInfo = nullptr;
+            stages[1].module = outlineModule;
+            stages[1].pSpecializationInfo = nullptr;
+            rasterization.cullMode = VK_CULL_MODE_NONE;
+            depth.depthTestEnable = VK_FALSE;
+            attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            rendering.pColorAttachmentFormats = &swapchainFormat;
+            info.layout = outlinePipelineLayout;
+            check(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr,
+                &outlinePipeline), "vkCreateGraphicsPipelines outline");
+            vkDestroyShaderModule(device, outlineModule, nullptr);
+            vkDestroyShaderModule(device, vertexModule, nullptr);
+            vkDestroyShaderModule(device, fragmentModule, nullptr);
+            vkDestroyShaderModule(device, meshModule, nullptr);
+        }
+
+        void destroySelectionTargets()
+        {
+            if (selectionDescriptorPool)
+                vkDestroyDescriptorPool(device, selectionDescriptorPool, nullptr);
+            selectionDescriptorPool = VK_NULL_HANDLE;
+            for (auto& frame : frames)
+            {
+                if (frame.selectionMask.view)
+                    vkDestroyImageView(device, frame.selectionMask.view, nullptr);
+                if (frame.selectionMask.image)
+                    vmaDestroyImage(allocator, frame.selectionMask.image, frame.selectionMask.allocation);
+                frame.selectionMask = {};
+                frame.selectionDescriptorSet = VK_NULL_HANDLE;
+            }
+        }
+
+        void ensureSelectionResources()
+        {
+            if (selectionDescriptorPool)
+                return;
+            if (!selectionDescriptorSetLayout)
+            {
+                VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+                VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+                layoutInfo.bindingCount = 1;
+                layoutInfo.pBindings = &binding;
+                check(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr,
+                    &selectionDescriptorSetLayout), "vkCreateDescriptorSetLayout selection");
+                VkPipelineLayoutCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+                pipelineInfo.setLayoutCount = 1;
+                pipelineInfo.pSetLayouts = &selectionDescriptorSetLayout;
+                check(vkCreatePipelineLayout(device, &pipelineInfo, nullptr,
+                    &outlinePipelineLayout), "vkCreatePipelineLayout outline");
+                VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+                samplerInfo.magFilter = samplerInfo.minFilter = VK_FILTER_NEAREST;
+                samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                samplerInfo.addressModeU = samplerInfo.addressModeV = samplerInfo.addressModeW
+                    = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                check(vkCreateSampler(device, &samplerInfo, nullptr,
+                    &selectionSampler), "vkCreateSampler selection");
+                createSelectionPipelines();
+            }
+            const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, frameCount};
+            VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            poolInfo.maxSets = frameCount;
+            poolInfo.poolSizeCount = 1;
+            poolInfo.pPoolSizes = &size;
+            check(vkCreateDescriptorPool(device, &poolInfo, nullptr,
+                &selectionDescriptorPool), "vkCreateDescriptorPool selection");
+            for (auto& frame : frames)
+            {
+                VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+                imageInfo.imageType = VK_IMAGE_TYPE_2D;
+                imageInfo.format = VK_FORMAT_R8_UNORM;
+                imageInfo.extent = {extent.width, extent.height, 1};
+                imageInfo.mipLevels = imageInfo.arrayLayers = 1;
+                imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+                imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+                imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                VmaAllocationCreateInfo allocationInfo{};
+                allocationInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+                check(vmaCreateImage(allocator, &imageInfo, &allocationInfo,
+                    &frame.selectionMask.image, &frame.selectionMask.allocation, nullptr),
+                    "vmaCreateImage selection");
+                VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                viewInfo.image = frame.selectionMask.image;
+                viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                viewInfo.format = VK_FORMAT_R8_UNORM;
+                viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                check(vkCreateImageView(device, &viewInfo, nullptr,
+                    &frame.selectionMask.view), "vkCreateImageView selection");
+                VkDescriptorSetAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+                allocateInfo.descriptorPool = selectionDescriptorPool;
+                allocateInfo.descriptorSetCount = 1;
+                allocateInfo.pSetLayouts = &selectionDescriptorSetLayout;
+                check(vkAllocateDescriptorSets(device, &allocateInfo,
+                    &frame.selectionDescriptorSet), "vkAllocateDescriptorSets selection");
+                VkDescriptorImageInfo descriptor{selectionSampler, frame.selectionMask.view,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                write.dstSet = frame.selectionDescriptorSet;
+                write.descriptorCount = 1;
+                write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                write.pImageInfo = &descriptor;
+                vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+            }
+        }
+
         void imageBarrier(VkCommandBuffer command, VkImage image, VkImageLayout oldLayout,
             VkImageLayout newLayout, VkImageAspectFlags aspect, std::uint32_t levelCount = 1,
             std::uint32_t baseMipLevel = 0)
@@ -2448,6 +2738,10 @@ void main()
                     ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
                     : oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
                         ? VK_PIPELINE_STAGE_2_TRANSFER_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            // First-use swapchain transitions must execute after the acquire
+            // semaphore wait, even though there is no previous image contents.
+            if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
             barrier.srcAccessMask = oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
                 ? VK_ACCESS_2_NONE : oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                     ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
@@ -2459,11 +2753,12 @@ void main()
                     : newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
                         ? VK_PIPELINE_STAGE_2_TRANSFER_BIT
                     : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
-                        | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
+                        | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT
+                        | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
             barrier.dstAccessMask = newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-                ? VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
+                ? VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
                 : newLayout == VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL
-                    ? VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                    ? VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
                     : newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                         ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
                         : newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
@@ -2534,6 +2829,9 @@ void main()
                 requestedViewport ? requestedViewport->height : extent.height,
                 extent.height - viewportY);
             const bool drawWorld = viewportWidth != 0 && viewportHeight != 0;
+            const bool drawSelection = drawWorld && !selectedInstances.empty();
+            if (drawSelection)
+                ensureSelectionResources();
 
             CameraData camera;
             camera.viewProjection = projection * view;
@@ -2662,7 +2960,8 @@ void main()
             depthAttachment.imageView = depth.view;
             depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
             depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            depthAttachment.storeOp = drawSelection
+                ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
             depthAttachment.clearValue.depthStencil = {0.0f, 0};
             VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
             rendering.renderArea.extent = extent;
@@ -2687,6 +2986,49 @@ void main()
                 vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, decalPipeline);
                 drawMeshTasksIndirect(frame.commandBuffer, frame.indirect.handle, 0, 1,
                     sizeof(VkDrawMeshTasksIndirectCommandEXT));
+            }
+            if (drawSelection)
+            {
+                vkCmdEndRendering(frame.commandBuffer);
+                // Preserve scene visibility, including LAND, water and unselected objects.
+                // Reuse the scene geometry/shader alpha and distance discard paths.
+                imageBarrier(frame.commandBuffer, depth.image,
+                    VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+                imageBarrier(frame.commandBuffer, frame.selectionMask.image,
+                    frame.selectionMask.initialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                    : VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                frame.selectionMask.initialized = true;
+                VkRenderingAttachmentInfo maskColor{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                maskColor.imageView = frame.selectionMask.view;
+                maskColor.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                maskColor.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                maskColor.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                VkRenderingInfo maskRendering = rendering;
+                maskRendering.pColorAttachments = &maskColor;
+                vkCmdBeginRendering(frame.commandBuffer, &maskRendering);
+                vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, selectionPipeline);
+                drawMeshTasksIndirect(frame.commandBuffer, frame.indirect.handle, 0, 1,
+                    sizeof(VkDrawMeshTasksIndirectCommandEXT));
+                vkCmdEndRendering(frame.commandBuffer);
+                imageBarrier(frame.commandBuffer, frame.selectionMask.image,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                imageBarrier(frame.commandBuffer, depth.image,
+                    VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+                imageBarrier(frame.commandBuffer, swapchainImages[imageIndex],
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                vkCmdBeginRendering(frame.commandBuffer, &rendering);
+                vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, outlinePipeline);
+                vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    outlinePipelineLayout, 0, 1, &frame.selectionDescriptorSet, 0, nullptr);
+                vkCmdDraw(frame.commandBuffer, 3, 1, 0, 0);
             }
             if (drawUi)
                 drawUi(frame.commandBuffer);
@@ -2817,6 +3159,12 @@ void main()
         std::span<const std::uint32_t> instances, bool active)
     {
         mImpl->setActive(instances, active);
+    }
+
+    void VulkanRenderer::setSelection(std::span<const std::uint32_t> instances,
+        std::optional<std::uint32_t> activeInstance)
+    {
+        mImpl->setSelection(instances, activeInstance);
     }
 
     const RendererStats& VulkanRenderer::stats() const noexcept

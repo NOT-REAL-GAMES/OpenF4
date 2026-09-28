@@ -1,12 +1,14 @@
 #include "editor/editor_document.hpp"
 #include "assets/asset_resolver.hpp"
 #include "assets/dem_import.hpp"
+#include "assets/lod_bake.hpp"
 #include "assets/model_import.hpp"
 #include "world/world_scene.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <iostream>
 #include <set>
 #include <stdexcept>
 
@@ -54,6 +56,7 @@ struct EditorDocument::Impl
     mutable std::optional<bool> dirtyCache;
     std::vector<State> undo, redo;
     std::optional<State> transaction;
+    std::uint32_t transactionNext = 0;
     unsigned transactionDepth = 0;
     std::map<std::uint32_t, std::string> modelPaths;
     std::map<std::uint32_t, assets::ESMReference> baselineRefs;
@@ -105,8 +108,9 @@ struct EditorDocument::Impl
     template<class F> void change(F operation)
     {
         State before = state;
+        const auto previousNext = next;
         try { operation(); }
-        catch (...) { state = std::move(before); refreshPaths(); throw; }
+        catch (...) { state = std::move(before); next = previousNext; refreshPaths(); throw; }
         dirtyCache.reset();
         if (!transactionDepth && !(before == state))
         {
@@ -148,6 +152,37 @@ struct EditorDocument::Impl
     }
     void save(std::filesystem::path target)
     {
+        std::set<assets::CellCoord> changedStaticCells;
+        std::set<std::uint32_t> changedModels;
+        for (const auto& [id, model] : state.models)
+        {
+            const auto previous = saved.models.find(id);
+            if (previous == saved.models.end() || previous->second != model)
+                changedModels.insert(id);
+        }
+        for (const auto& [id, model] : saved.models)
+            if (!state.models.contains(id)) changedModels.insert(id);
+        std::map<std::uint32_t, assets::ESMReference> oldRefs, newRefs;
+        for (const auto& reference : saved.references)
+            oldRefs.emplace(reference.placement.formId,
+                assets::ESMReference{reference.placement, reference.name});
+        for (const auto& reference : state.references)
+            newRefs.emplace(reference.placement.formId,
+                assets::ESMReference{reference.placement, reference.name});
+        for (const auto& [id, reference] : oldRefs)
+        {
+            const auto current = newRefs.find(id);
+            if (current == newRefs.end() || current->second != reference
+                || changedModels.contains(reference.placement.baseObject))
+                changedStaticCells.insert(reference.placement.cell);
+        }
+        for (const auto& [id, reference] : newRefs)
+        {
+            const auto previous = oldRefs.find(id);
+            if (previous == oldRefs.end() || previous->second != reference
+                || changedModels.contains(reference.placement.baseObject))
+                changedStaticCells.insert(reference.placement.cell);
+        }
         // Terrain tools may have saved since this document was opened. Re-index the
         // current source and apply only authored changes instead of stale file bytes.
         assets::EsmDocument output(path);
@@ -189,6 +224,22 @@ struct EditorDocument::Impl
             }
         }
         output.replaceTerrainCells(changes); output.setPath(target); output.save();
+        std::vector<assets::CellCoord> changedTerrain;
+        changedTerrain.reserve(changes.size());
+        for (const auto& change : changes)
+            changedTerrain.push_back(change.landscape.cell);
+        const std::vector<assets::CellCoord> changedStatics(
+            changedStaticCells.begin(), changedStaticCells.end());
+        try
+        {
+            assets::LodBuildIndex(target).markSavedChanges(changedTerrain, changedStatics);
+        }
+        catch (const std::exception& error)
+        {
+            // The saved ESM remains authoritative; stale derived products will
+            // be invalidated by their source fingerprint on the next bake.
+            std::cerr << "LOD build index invalidation failed: " << error.what() << '\n';
+        }
         const auto oldPath = path; path = std::filesystem::absolute(target);
         if (base == oldPath) base = path;
         const auto relocate = [&](State& snapshot) {
@@ -316,7 +367,11 @@ void EditorDocument::setVisible(std::uint32_t id, bool visible) { mImpl->change(
 void EditorDocument::setLocked(std::uint32_t id, bool locked) { mImpl->change([&] { mImpl->reference(id).locked = locked; }); }
 void EditorDocument::beginTransaction()
 {
-    if (mImpl->transactionDepth++ == 0) mImpl->transaction = mImpl->state;
+    if (mImpl->transactionDepth++ == 0)
+    {
+        mImpl->transaction = mImpl->state;
+        mImpl->transactionNext = mImpl->next;
+    }
 }
 void EditorDocument::endTransaction()
 {
@@ -329,6 +384,16 @@ void EditorDocument::endTransaction()
         }
         mImpl->transaction.reset();
     }
+}
+void EditorDocument::cancelTransaction()
+{
+    if (!mImpl->transactionDepth) return;
+    mImpl->state = std::move(*mImpl->transaction);
+    mImpl->next = mImpl->transactionNext;
+    mImpl->transaction.reset();
+    mImpl->transactionDepth = 0;
+    mImpl->dirtyCache.reset();
+    mImpl->refreshPaths();
 }
 bool EditorDocument::undo()
 {

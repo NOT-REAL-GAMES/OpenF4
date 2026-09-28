@@ -2,19 +2,25 @@
 #include "assets/esm_editor.hpp"
 #include "assets/dem_import.hpp"
 #include "editor/editor_document.hpp"
+#include "editor/editor_manipulation.hpp"
 #include "world/world_scene.hpp"
 
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <span>
 #include <stdexcept>
 #include <vector>
+
+#include <glm/gtc/matrix_transform.hpp>
 
 namespace
 {
@@ -93,6 +99,112 @@ glm::mat4 at(float x, float y = 0, float z = 0)
 {
     PlacedReference reference; reference.position[0] = x; reference.position[1] = y; reference.position[2] = z;
     return openf4::world::bethesdaReferenceTransform(reference);
+}
+bool close(const glm::vec3& a, const glm::vec3& b, float tolerance = 0.001f)
+{
+    return glm::length(a - b) <= tolerance;
+}
+bool close(const glm::mat4& a, const glm::mat4& b)
+{
+    for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r)
+        if (std::abs(a[c][r] - b[c][r]) > 0.001f) return false;
+    return true;
+}
+void testManipulation()
+{
+    using namespace openf4::editor;
+    const auto active = glm::translate(glm::mat4(1), {10, 20, 30})
+        * glm::rotate(glm::mat4(1), glm::radians(45.0f), {0, 1, 0})
+        * glm::scale(glm::mat4(1), glm::vec3(3));
+    const glm::vec3 center(4, 5, 6);
+    const auto local = makeManipulationPivot(center, active, ManipulationSpace::local);
+    const auto world = makeManipulationPivot(center, active, ManipulationSpace::world);
+    require(close(glm::vec3(local[0]), glm::vec3(active[0]) / 3.0f), "Local pivot did not strip active scale");
+    require(close(world, glm::translate(glm::mat4(1), center)), "World pivot inherited active rotation");
+    auto dragged = world; dragged[3] += glm::vec4(140, -30, 6, 0);
+    const auto translated = snapManipulationPivot(world, dragged, ManipulationOperation::translate, ManipulationSpace::world, 128);
+    require(close(glm::vec3(translated[3]), center + glm::vec3(128, 0, 0)), "World translation snap was not relative to start");
+    dragged = local; dragged[3] += local[0] * 190.0f + local[2] * 70.0f;
+    const auto localTranslated = snapManipulationPivot(local, dragged, ManipulationOperation::translate, ManipulationSpace::local, 128);
+    require(close(glm::vec3(localTranslated[3]), center + glm::vec3(local[0] + local[2]) * 128.0f), "Local translation snap used world axes");
+    const auto moved = applyManipulationDelta(active, world, translated);
+    require(close(glm::vec3(moved[3]), glm::vec3(active[3]) + glm::vec3(128, 0, 0)), "Group translation lost object offset");
+    for (int frame = 0; frame < 100; ++frame)
+        require(close(applyManipulationDelta(active, world, translated), moved), "Captured-start manipulation accumulated drift");
+    const auto axisRotation = glm::rotate(glm::mat4(1), glm::radians(31.0f), {1, 0, 0});
+    for (const auto space : {ManipulationSpace::local, ManipulationSpace::world})
+    {
+        dragged = space == ManipulationSpace::local ? local * axisRotation : axisRotation * local;
+        dragged[3] = local[3];
+        const auto snapped = snapManipulationPivot(local, dragged, ManipulationOperation::rotate, space, 15);
+        const auto expectedRotation = glm::rotate(glm::mat4(1), glm::radians(30.0f), {1, 0, 0});
+        auto expected = space == ManipulationSpace::local ? local * expectedRotation : expectedRotation * local;
+        expected[3] = local[3];
+        require(close(snapped, expected), "Rotation snap did not use captured World/Local start");
+        const auto a = glm::translate(glm::mat4(1), center + glm::vec3(10, 0, 0));
+        const auto b = glm::translate(glm::mat4(1), center + glm::vec3(-10, 0, 0));
+        const auto rotatedA = applyManipulationDelta(a, local, snapped);
+        const auto rotatedB = applyManipulationDelta(b, local, snapped);
+        require(close((glm::vec3(rotatedA[3]) + glm::vec3(rotatedB[3])) * 0.5f, center), "Group rotation moved its shared pivot");
+        require(std::abs(glm::length(glm::vec3(rotatedA[3] - rotatedB[3])) - 20.0f) < 0.001f, "Group rotation changed relative spacing");
+    }
+    for (const auto factor : {0.25f, 1.75f})
+    {
+        dragged = local; dragged[2] *= factor;
+        const auto scaled = snapManipulationPivot(local, dragged, ManipulationOperation::scale, ManipulationSpace::local);
+        for (int axis = 0; axis < 3; ++axis)
+            require(close(glm::vec3(scaled[axis]), glm::vec3(local[axis]) * factor), "Axis scale was not converted to uniform scaling");
+        require(close(glm::vec3(scaled[3]), center), "Uniform scaling moved pivot");
+        const auto scaledObject = applyManipulationDelta(active, local, scaled);
+        require(std::abs(glm::length(glm::vec3(scaledObject[0])) - 3.0f * factor) < 0.001f, "Group scale lost each object's original scale");
+    }
+    const auto normal = glm::normalize(glm::vec3(0.3f, 1.0f, -0.4f));
+    const auto aligned = alignToTerrainNormal(active, normal);
+    require(close(glm::normalize(glm::vec3(aligned[1])), normal), "Terrain alignment did not follow the normal");
+    require(close(glm::normalize(glm::vec3(aligned[2].x, 0, aligned[2].z)),
+        glm::normalize(glm::vec3(active[2].x, 0, active[2].z))), "Terrain alignment changed horizontal heading");
+    require(close(glm::vec3(aligned[3]), glm::vec3(active[3]))
+        && std::abs(glm::length(glm::vec3(aligned[0])) - 3.0f) < 0.001f, "Terrain alignment changed scale or translation");
+    const auto vertical = glm::rotate(glm::mat4(1), glm::radians(90.0f), {1, 0, 0});
+    require(close(glm::normalize(glm::vec3(alignToTerrainNormal(vertical, normal)[1])), normal), "Vertical-forward alignment was singular");
+    rejects([&] { (void)alignToTerrainNormal(active, {0, 0, 0}); }, "Zero terrain normal was accepted");
+    rejects([&] { (void)alignToTerrainNormal(active, {0, -1, 0}); }, "Downward terrain normal was accepted");
+    dragged = local; dragged[0] *= -1.0f;
+    rejects([&] { (void)snapManipulationPivot(local, dragged, ManipulationOperation::scale, ManipulationSpace::local); }, "Negative scale was accepted");
+    rejects([&] { (void)snapManipulationPivot(local, local, ManipulationOperation::translate, ManipulationSpace::local, -1); }, "Negative snap step was accepted");
+}
+void testCancelTransaction(const std::filesystem::path& root)
+{
+    openf4::editor::EditorDocument editor(root / "cancel.esm");
+    const auto model = editor.addModel("models/cancel.glb");
+    const auto id = editor.place(model, at(128));
+    editor.save();
+    editor.setTransform(id, at(700));
+    require(editor.undo(), "Cancellation fixture could not establish redo history");
+    const auto original = editor.engineTransform(id);
+    const auto terrain = *editor.terrainSnapshot();
+    const auto next = editor.nextFormId();
+    editor.beginTransaction();
+    editor.setTransform(id, at(45000, 49000));
+    editor.beginTransaction();
+    (void)editor.duplicate(id);
+    (void)editor.addModel("models/transient.glb");
+    editor.setVisible(id, false);
+    editor.endTransaction();
+    require(editor.nextFormId() > next && editor.terrainSnapshot()->containsCell({10, 11}), "Cancellation fixture did not allocate CELLs and IDs");
+    editor.cancelTransaction();
+    require(editor.nextFormId() == next, "Cancellation did not restore allocator");
+    require(editor.references().size() == 1 && editor.references()[0].visible
+        && editor.models().size() == 1 && close(editor.engineTransform(id), original), "Cancellation did not restore object snapshot");
+    require(*editor.terrainSnapshot() == terrain, "Cancellation retained new CELLs or changed terrain");
+    require(!editor.dirty(), "Cancellation did not restore saved dirty state");
+    require(editor.redo() && close(editor.engineTransform(id), at(700)), "Cancellation added history or destroyed redo");
+    require(editor.undo() && close(editor.engineTransform(id), original), "Cancellation broke existing undo history");
+    editor.cancelTransaction();
+    editor.beginTransaction(); editor.setTransform(id, at(900)); editor.endTransaction();
+    require(editor.undo() && close(editor.engineTransform(id), original), "Cancellation did not reset transaction nesting");
+    editor.save();
+    require(!EsmDocument(editor.path()).terrainCell({10, 11}), "Cancelled CELL was persisted");
 }
 void testEditing(const std::filesystem::path& root)
 {
@@ -262,6 +374,77 @@ void testDemHeader(const std::filesystem::path& root)
     require(contains(readFile(path), legacy), "Saving a legacy DEM rewrote its format marker");
 }
 
+void testConcurrentDemReads(const std::filesystem::path& root)
+{
+    auto terrain = createEditableLandscape();
+    std::vector<CellCoord> coordinates;
+    for (const int x : {-33, -32, -9, -8, -3, 0, 7, 8, 31, 32})
+        for (const int y : {30, 31, 32})
+        {
+            coordinates.push_back({x, y});
+            require(terrain.addCell({x, y}), "DEM race fixture CELL already exists");
+        }
+    for (const auto& [coord, forms] : terrain.cellForms)
+        for (int y = 0; y < 33; ++y) for (int x = 0; x < 33; ++x)
+        {
+            const EditableLandscape::SampleCoord sample{coord.x * 32 + x, coord.y * 32 + y};
+            terrain.setSample(sample, float(sample.x + sample.y) * 8.0f);
+        }
+    const auto shardPath = root / "concurrent.terrain.esm";
+    saveEditableLandscape(shardPath, terrain);
+    const auto shardBytes = readFile(shardPath);
+    auto header = rewrite(std::span(shardBytes).first(24 + get<std::uint32_t>(shardBytes, 4)), [&](Bytes& rec) {
+        append(rec, sub("MAST", text("concurrent.world.esm"))); append(rec, sub("DATA", Bytes(8)));
+        append(rec, sub("MAST", text("concurrent.terrain.esm"))); append(rec, sub("DATA", Bytes(8)));
+        const auto metadata = "OPENF4_DEM 1\nROLE OVERLAY\nSHARD concurrent.terrain.esm -33 -1 32 32 "
+            + std::to_string(terrain.cellForms.size()) + "\n";
+        append(rec, sub("EMGI", text(metadata.c_str())));
+    });
+    append(header, group(cc("WRLD"), 0,
+        record("WRLD", EditableLandscape::worldFormId, sub("EDID", text("OpenF4World")))));
+    const auto path = root / "concurrent.esm";
+    writeFile(path, header);
+    DemLandscapeProject project(path);
+    std::vector<DemLandscapeCell> expected;
+    for (const auto coord : coordinates)
+    {
+        auto forms = terrain.cellForms.at(coord);
+        forms.cell = 0x02000000u | (forms.cell & 0x00ffffffu);
+        forms.land = 0x02000000u | (forms.land & 0x00ffffffu);
+        expected.push_back({terrain.cell(coord), forms});
+    }
+    // LAND preparation and main-thread window membership used to seek the same
+    // persistent shard stream without synchronization, even though both are const.
+    std::barrier start(4);
+    std::vector<std::future<void>> readers;
+    for (int worker = 0; worker < 4; ++worker)
+        readers.push_back(std::async(std::launch::async, [&, worker] {
+            start.arrive_and_wait();
+            for (int iteration = 0; iteration < 64; ++iteration)
+                for (std::size_t i = 0; i < coordinates.size(); ++i)
+                {
+                    const auto index = (i + worker * 7 + iteration) % coordinates.size();
+                    const auto coord = coordinates[index];
+                    if (worker % 2 == 0)
+                    {
+                        const auto loaded = project.cell(coord);
+                        require(loaded && loaded->landscape.cell == coord && loaded->landscape.hasHeights
+                            && loaded->forms == expected[index].forms
+                            && loaded->landscape.heights == expected[index].landscape.heights,
+                            "Concurrent DEM load returned missing or incorrect CELL/LAND data");
+                    }
+                    else
+                        require(project.contains(coord), "Concurrent DEM lookup lost an existing CELL");
+                    // Missing cells inside existing sub-blocks must stay missing,
+                    // not spuriously resolve to another reader's current record.
+                    const CellCoord missing{coord.x + 2, coord.y};
+                    require(!project.contains(missing) && !project.cell(missing),
+                        "Concurrent DEM lookup returned a nonexistent CELL");
+                }
+        }));
+    for (auto& reader : readers) reader.get();
+}
+
 void testBrandingCompatibility(const std::filesystem::path& root)
 {
     const auto path = root / "legacy-world.esm";
@@ -303,7 +486,8 @@ try
 {
     const auto root = std::filesystem::temp_directory_path() / ("openf4-editor-doc-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directory(root);
-    testEditing(root); testRawPreservation(root); testMasterOverlay(root); testInheritedReferences(root); testSaveAs(root); testDemHeader(root); testBrandingCompatibility(root);
+    testManipulation(); testCancelTransaction(root);
+    testEditing(root); testRawPreservation(root); testMasterOverlay(root); testInheritedReferences(root); testSaveAs(root); testDemHeader(root); testConcurrentDemReads(root); testBrandingCompatibility(root);
     std::filesystem::remove_all(root);
     std::cout << "Editor document tests passed\n"; return 0;
 }

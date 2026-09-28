@@ -5,10 +5,12 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace openf4::assets
@@ -71,11 +73,17 @@ namespace openf4::assets
         DemLandscapeProject& operator=(const DemLandscapeProject&) = delete;
 
         [[nodiscard]] static bool recognizes(const std::filesystem::path& editorPath);
+        // Lookups and saves are internally serialized for streaming/editor callers.
         [[nodiscard]] bool contains(CellCoord coord) const;
         [[nodiscard]] std::optional<DemLandscapeCell> cell(CellCoord coord) const;
         [[nodiscard]] std::uint32_t nextFormId() const noexcept;
         [[nodiscard]] std::uint64_t importedCellCount() const noexcept;
         [[nodiscard]] std::size_t overlayCellCount() const noexcept;
+        // Enumerates CELL headers without decoding the corresponding LAND payloads.
+        void forEachCell(const std::function<void(CellCoord)>& visit) const;
+        [[nodiscard]] std::vector<std::filesystem::path> sourceFiles() const;
+        [[nodiscard]] std::optional<std::pair<CellCoord, CellCoord>> shardCellBounds(
+            const std::filesystem::path& source) const;
         void save(const EditableLandscape& landscape,
             const std::set<CellCoord>& changedCells);
 

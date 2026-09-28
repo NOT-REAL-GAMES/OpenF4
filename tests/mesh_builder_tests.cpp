@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include <glm/ext/matrix_transform.hpp>
+
 namespace
 {
     void require(bool condition, const char* message)
@@ -22,6 +24,77 @@ namespace
 int main()
 try
 {
+    {
+        openf4::assets::ModelGeometry geometry;
+        auto& surface = geometry.surfaces.emplace_back();
+        for (int triangle = 0; triangle < 12; ++triangle)
+        {
+            const float z = -3.0f * triangle;
+            for (const glm::vec3 position : {glm::vec3{0.0f, 0.0f, z},
+                     glm::vec3{2.0f, 0.0f, z}, glm::vec3{0.0f, 2.0f, z}})
+            {
+                surface.indices.push_back(static_cast<std::uint32_t>(surface.vertices.size()));
+                surface.vertices.push_back({position});
+            }
+        }
+        // Unreferenced source vertices must not influence grounding or selection bounds.
+        surface.vertices.push_back({glm::vec3(1.0e8f)});
+        const openf4::world::detail::PickingGeometry picking(geometry);
+        const auto hit = picking.raycast({0.5, 0.5, 5.0}, {0.0, 0.0, -1.0}, glm::mat4(1.0f));
+        require(hit && std::abs(*hit - 5.0) < 1.0e-9,
+            "BVH picking did not select the nearest triangle");
+        require(!picking.raycast({1.5, 1.5, 5.0}, {0.0, 0.0, -1.0}, glm::mat4(1.0f)),
+            "Picking accepted a sphere/box hit outside the model triangles");
+        require(!picking.raycast({0.5, 0.5, 5.0}, {0.0, 0.0, -1.0}, glm::mat4(1.0f), 4.0),
+            "Picking ignored the terrain-occlusion distance limit");
+        const auto inside = picking.raycast({0.5, 0.5, -1.0}, {0.0, 0.0, -1.0}, glm::mat4(1.0f));
+        require(inside && std::abs(*inside - 2.0) < 1.0e-9,
+            "Picking from inside the model bounds missed the next triangle");
+        const auto transform = glm::translate(glm::mat4(1.0f), glm::vec3(4000000.0f, 20.0f, -8000000.0f))
+            * glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f))
+            * glm::scale(glm::mat4(1.0f), glm::vec3(3.0f));
+        const glm::dmat4 preciseTransform(transform);
+        const auto origin = glm::dvec3(preciseTransform * glm::dvec4(0.5, 0.5, 5.0, 1.0));
+        const auto direction = glm::normalize(glm::dvec3(preciseTransform * glm::dvec4(0.0, 0.0, -1.0, 0.0)));
+        const auto transformedHit = picking.raycast(origin, direction, transform);
+        require(transformedHit && std::abs(*transformedHit - 15.0) < 1.0e-5,
+            "Large-coordinate rotated/scaled picking lost world-space distance");
+        require(!picking.raycast(origin, direction, transform, 14.0),
+            "Scaled picking interpreted the distance limit in local units");
+        require(!picking.raycast(origin, {}, transform)
+            && !picking.raycast(origin, direction, glm::mat4(0.0f)),
+            "Picking accepted an invalid ray or singular transform");
+
+        surface.indices.resize(3);
+        const openf4::world::detail::PickingGeometry triangle(geometry);
+        const auto bounds = triangle.bounds(glm::rotate(glm::mat4(1.0f),
+            glm::radians(45.0f), glm::vec3(0.0f, 0.0f, 1.0f)));
+        require(std::abs(bounds.maximum.y - std::sqrt(2.0)) < 1.0e-6,
+            "Geometry bounds used a transformed box or unreferenced vertices instead of the geometry");
+    }
+    {
+        auto landscape = openf4::assets::createEditableLandscape();
+        landscape.setSample({0, 0}, 0.0f);
+        landscape.setSample({1, 0}, 128.0f);
+        landscape.setSample({0, 1}, 256.0f);
+        landscape.setSample({1, 1}, 512.0f);
+        const auto near = openf4::world::detail::landscapeSurface(landscape, {32.0, 32.0});
+        const auto far = openf4::world::detail::landscapeSurface(landscape, {96.0, 96.0});
+        require(near && far && std::abs(near->height - 96.0) < 1.0e-9
+            && std::abs(far->height - 352.0) < 1.0e-9,
+            "LAND surface query does not match the rendered two-triangle topology");
+        require(glm::length(near->normal - glm::normalize(glm::vec3(-1.0f, 1.0f, -2.0f))) < 1.0e-6f
+            && glm::length(far->normal - glm::normalize(glm::vec3(-2.0f, 1.0f, -3.0f))) < 1.0e-6f,
+            "LAND grounding normal did not match its triangle slope");
+        const auto flat = openf4::world::detail::landscapeSurface(landscape, {4096.0, 64.0});
+        require(flat && flat->height == 0.0 && flat->normal == glm::vec3(0.0f, 1.0f, 0.0f),
+            "Flat LAND query failed at a cell seam");
+        require(!openf4::world::detail::landscapeSurface(landscape, {-8192.0, 0.0})
+            && !openf4::world::detail::landscapeSurface(landscape,
+                {std::numeric_limits<double>::infinity(), 0.0})
+            && landscape.cellForms.size() == 9,
+            "Grounding query created missing terrain or accepted invalid coordinates");
+    }
     for (const glm::vec3 angles : {glm::vec3(0.0f), glm::vec3(0.2f, -0.7f, 1.1f),
              glm::vec3(1.2f, 1.5707963f, -0.4f), glm::vec3(-2.0f, -1.5707963f, 0.8f)})
     {

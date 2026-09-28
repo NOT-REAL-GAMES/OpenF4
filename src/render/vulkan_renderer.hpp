@@ -184,6 +184,10 @@ namespace openf4::render
         void updateInstanceTransform(std::uint32_t instance,
             const glm::mat4& transform, const glm::vec4& bounds);
         void setInstancesActive(std::span<const std::uint32_t> instances, bool active);
+        // Transient editor state. The active instance must be in the selection.
+        // An empty selection performs no mask/composite work.
+        void setSelection(std::span<const std::uint32_t> instances,
+            std::optional<std::uint32_t> activeInstance = std::nullopt);
         [[nodiscard]] const RendererStats& stats() const noexcept;
         [[nodiscard]] const std::string& deviceName() const noexcept;
         [[nodiscard]] UiContext uiContext() const noexcept;
