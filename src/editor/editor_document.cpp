@@ -43,6 +43,31 @@ bool sameTerrainCell(const assets::EditableLandscape& a, const assets::EditableL
     if (!b.containsCell(c) || a.cellForms.at(c) != b.cellForms.at(c)) return false;
     return a.cell(c).heights == b.cell(c).heights;
 }
+assets::ESMReference authoredReference(const EditorReference& reference)
+{
+    return {reference.placement, reference.name, false, reference.recordSource,
+        reference.ownerCellFormId, reference.childGroupType, reference.scripts};
+}
+void validateModelKind(assets::ESMModelKind kind)
+{
+    if (kind != assets::ESMModelKind::staticObject && kind != assets::ESMModelKind::movableStatic)
+        throw std::runtime_error("Unsupported model record kind");
+}
+std::string nativePackagePath(const std::filesystem::path& root, std::string value)
+{
+    value = assets::AssetResolver::normalizePath(value);
+    std::ranges::replace(value, '\\', '/');
+    const std::filesystem::path relative(value);
+    if (value.find('\0') != std::string::npos || value.find(':') != std::string::npos
+        || relative.has_root_path() || relative.extension() != ".nif"
+        || std::any_of(relative.begin(), relative.end(), [](const auto& part) { return part == ".."; })
+        || !std::filesystem::is_regular_file(root / relative))
+        throw std::runtime_error("Native package must be published in the project's sidecar before assignment");
+    const auto resolved = std::filesystem::canonical(root / relative).lexically_relative(std::filesystem::canonical(root));
+    if (resolved.empty() || std::any_of(resolved.begin(), resolved.end(), [](const auto& part) { return part == ".."; }))
+        throw std::runtime_error("Native package resolves outside the project's sidecar");
+    return relative.lexically_normal().generic_string();
+}
 }
 
 struct EditorDocument::Impl
@@ -79,7 +104,11 @@ struct EditorDocument::Impl
         for (const auto& m : stack.models) state.models.emplace(m.formId, m);
         for (const auto& r : stack.references)
         {
-            state.references.push_back({r.placement, r.editorId}); baselineRefs[r.placement.formId] = r;
+            EditorReference reference{r.placement, r.editorId};
+            reference.recordSource = r.recordSource; reference.ownerCellFormId = r.ownerCellFormId;
+            reference.childGroupType = r.childGroupType;
+            reference.scripts = r.scripts;
+            state.references.push_back(std::move(reference)); baselineRefs[r.placement.formId] = r;
         }
         next = document->nextFormId();
         if (editableTerrain && !dem)
@@ -165,10 +194,10 @@ struct EditorDocument::Impl
         std::map<std::uint32_t, assets::ESMReference> oldRefs, newRefs;
         for (const auto& reference : saved.references)
             oldRefs.emplace(reference.placement.formId,
-                assets::ESMReference{reference.placement, reference.name});
+                authoredReference(reference));
         for (const auto& reference : state.references)
             newRefs.emplace(reference.placement.formId,
-                assets::ESMReference{reference.placement, reference.name});
+                authoredReference(reference));
         for (const auto& [id, reference] : oldRefs)
         {
             const auto current = newRefs.find(id);
@@ -187,12 +216,14 @@ struct EditorDocument::Impl
         // current source and apply only authored changes instead of stale file bytes.
         assets::EsmDocument output(path);
         output.setNextFormId(std::max(next, output.nextFormId()));
-        std::vector<assets::ESMModel> models = output.models();
+        std::vector<assets::ESMModel> models;
+        // Preserve externally added bases that this authoring session never owned.
+        for (const auto& model : output.models())
+            if (!saved.models.contains(model.formId) && !state.models.contains(model.formId)) models.push_back(model);
         for (const auto& [id, m] : state.models)
         {
-            if (m.sourceEsm != path.string()) continue;
-            auto found = std::find_if(models.begin(), models.end(), [&](const auto& v) { return v.formId == id; });
-            if (found == models.end()) models.push_back(m); else *found = m;
+            if (m.sourceEsm != path.string() && m.recordOwnerEsm != path.string()) continue;
+            models.push_back(m);
         }
         output.setModels(std::move(models));
         std::vector<assets::ESMReference> references;
@@ -202,7 +233,7 @@ struct EditorDocument::Impl
         for (const auto& r : state.references)
         {
             current.insert(r.placement.formId);
-            assets::ESMReference authored{r.placement, r.name};
+            auto authored = authoredReference(r);
             auto original = baselineRefs.find(r.placement.formId);
             if (local.contains(r.placement.formId) || original == baselineRefs.end() || original->second != authored) references.push_back(std::move(authored));
         }
@@ -210,6 +241,8 @@ struct EditorDocument::Impl
         { auto deleted = r; deleted.deleted = true; references.push_back(std::move(deleted)); }
         // Retain existing tombstones, even though they are absent from merged authoring state.
         for (const auto& r : output.references()) if (r.deleted && !current.contains(r.placement.formId)) references.push_back(r);
+        for (const auto& reference : references)
+            if (reference.childGroupType != 8) ensureCell(reference.placement.cell);
         output.setReferences(references);
         std::vector<assets::ESMTerrainCell> changes;
         if (state.terrain)
@@ -220,10 +253,42 @@ struct EditorDocument::Impl
             {
                 const bool modified = !saved.terrain || !sameTerrainCell(*state.terrain, *saved.terrain, coord);
                 const bool needsOwnership = referenceCells.contains(coord) && !output.terrainCells().contains(coord);
-                if (modified || needsOwnership) changes.push_back({state.terrain->cell(coord), forms.cell, forms.land});
+                if (modified || needsOwnership)
+                {
+                    assets::ESMTerrainCell change{state.terrain->cell(coord), forms.cell, forms.land};
+                    // The editable height grid does not own native CELL/LAND metadata.
+                    auto original = output.terrainCell(coord);
+                    if ((!original || !original->landFormId) && !editableTerrain && !dem)
+                    {
+                        if (!baseDocument) baseDocument = std::make_unique<assets::EsmDocument>(base);
+                        const auto inherited = baseDocument->terrainCell(coord);
+                        if (inherited)
+                        {
+                            if (!original) original = inherited;
+                            else { original->landFormId = inherited->landFormId; original->landSource = inherited->landSource; }
+                        }
+                    }
+                    if (original && original->cellFormId == change.cellFormId)
+                    {
+                        change.cellSource = original->cellSource;
+                        if (original->landFormId == change.landFormId) change.landSource = original->landSource;
+                    }
+                    changes.push_back(std::move(change));
+                }
             }
         }
-        output.replaceTerrainCells(changes); output.setPath(target); output.save();
+        output.replaceTerrainCells(changes); output.setPath(target);
+        bool lodIndexPrepared = false;
+        try
+        {
+            assets::LodBuildIndex(target).prepareSave();
+            lodIndexPrepared = true;
+        }
+        catch (const std::exception& error)
+        {
+            std::cerr << "LOD build index preparation failed: " << error.what() << '\n';
+        }
+        output.save();
         std::vector<assets::CellCoord> changedTerrain;
         changedTerrain.reserve(changes.size());
         for (const auto& change : changes)
@@ -232,7 +297,8 @@ struct EditorDocument::Impl
             changedStaticCells.begin(), changedStaticCells.end());
         try
         {
-            assets::LodBuildIndex(target).markSavedChanges(changedTerrain, changedStatics);
+            if (lodIndexPrepared)
+                assets::LodBuildIndex(target).markSavedChanges(changedTerrain, changedStatics);
         }
         catch (const std::exception& error)
         {
@@ -243,14 +309,25 @@ struct EditorDocument::Impl
         const auto oldPath = path; path = std::filesystem::absolute(target);
         if (base == oldPath) base = path;
         const auto relocate = [&](State& snapshot) {
-            for (auto& [id, m] : snapshot.models) if (m.sourceEsm == oldPath.string()) m.sourceEsm = path.string();
+            for (auto& [id, m] : snapshot.models)
+            {
+                if (m.sourceEsm == oldPath.string()) m.sourceEsm = path.string();
+                if (m.recordSourceEsm == oldPath.string()) m.recordSourceEsm = path.string();
+                if (m.recordOwnerEsm == oldPath.string()) m.recordOwnerEsm = path.string();
+                if (m.scripts.sourceEsm == oldPath.string()) m.scripts.sourceEsm = path.string();
+            }
+            for (auto& reference : snapshot.references)
+            {
+                if (reference.recordSource.esm == oldPath.string()) reference.recordSource.esm = path.string();
+                if (reference.scripts.sourceEsm == oldPath.string()) reference.scripts.sourceEsm = path.string();
+            }
         };
         relocate(state); for (auto& snapshot : undo) relocate(snapshot); for (auto& snapshot : redo) relocate(snapshot);
         if (transaction) relocate(*transaction);
         document = std::make_unique<assets::EsmDocument>(path); next = std::max(next, document->nextFormId());
         if (dem && path != oldPath) dem = std::make_unique<assets::DemLandscapeProject>(path);
         saved = state; dirtyCache = false;
-        baselineRefs.clear(); for (const auto& r : state.references) baselineRefs[r.placement.formId] = {r.placement, r.name};
+        baselineRefs.clear(); for (const auto& r : state.references) baselineRefs[r.placement.formId] = authoredReference(r);
     }
 };
 
@@ -266,6 +343,11 @@ std::filesystem::path EditorDocument::assetRoot() const { return assets::AssetRe
 std::uint32_t EditorDocument::worldFormId() const noexcept { return mImpl->document->worldFormId(); }
 const std::vector<EditorReference>& EditorDocument::references() const noexcept { return mImpl->state.references; }
 const std::map<std::uint32_t, std::string>& EditorDocument::models() const noexcept { return mImpl->modelPaths; }
+const assets::ESMModel* EditorDocument::model(std::uint32_t id) const noexcept
+{
+    const auto found = mImpl->state.models.find(id);
+    return found == mImpl->state.models.end() ? nullptr : &found->second;
+}
 std::optional<std::string> EditorDocument::sourcePath(std::uint32_t id) const
 {
     auto found = mImpl->state.models.find(id); if (found == mImpl->state.models.end() || found->second.sourcePath.empty()) return std::nullopt;
@@ -335,10 +417,90 @@ std::uint32_t EditorDocument::importModel(const std::filesystem::path& source)
     const auto id = reserveModelId(); auto imported = assets::importAndCopyModelAsset(source, path(), id);
     mImpl->change([&] { mImpl->state.models[id] = {id, "OpenF4Model_" + std::to_string(id), imported.modelPath, source.string(), path().string()}; }); return id;
 }
-std::uint32_t EditorDocument::addModel(std::string modelPath, std::string source)
+std::uint32_t EditorDocument::addModel(std::string modelPath, std::string source, assets::ESMModelKind kind)
 {
+    validateModelKind(kind);
     const auto id = reserveModelId();
-    mImpl->change([&] { mImpl->state.models[id] = {id, "OpenF4Model_" + std::to_string(id), std::move(modelPath), std::move(source), path().string()}; }); return id;
+    mImpl->change([&] { mImpl->state.models[id] = {id, "OpenF4Model_" + std::to_string(id), std::move(modelPath), std::move(source), path().string(), kind}; }); return id;
+}
+std::uint32_t EditorDocument::assignNativeModel(std::uint32_t id, std::string modelPath, assets::ESMModelKind kind)
+{
+    validateModelKind(kind);
+    modelPath = nativePackagePath(assetRoot(), std::move(modelPath));
+    std::uint32_t result = id;
+    mImpl->change([&] {
+        const auto found = mImpl->state.models.find(id);
+        if (found == mImpl->state.models.end()) throw std::runtime_error("Cannot assign an unknown model");
+        auto replacement = found->second;
+        if (replacement.kind != kind)
+        {
+            result = mImpl->allocate(); replacement.formId = result;
+            replacement.editorId = "OpenF4Model_" + std::to_string(result);
+            replacement.recordSourceEsm.clear(); replacement.recordSourceFormId = 0;
+            for (auto& ref : mImpl->state.references)
+                if (ref.placement.baseObject == id)
+                {
+                    ref.placement.baseObject = result;
+                    if (ref.childGroupType != 8) mImpl->ensureCell(ref.placement.cell);
+                }
+        }
+        replacement.path = std::move(modelPath); replacement.kind = kind; replacement.sourceEsm = path().string();
+        mImpl->state.models[result] = std::move(replacement);
+    });
+    return result;
+}
+std::uint32_t EditorDocument::makeUnique(std::uint32_t reference, std::string modelPath, assets::ESMModelKind kind)
+{
+    validateModelKind(kind);
+    modelPath = nativePackagePath(assetRoot(), std::move(modelPath));
+    std::uint32_t result = 0;
+    mImpl->change([&] {
+        auto& ref = mImpl->reference(reference);
+        if (ref.locked) throw std::runtime_error("Cannot make a locked reference unique");
+        auto replacement = mImpl->state.models.at(ref.placement.baseObject);
+        result = mImpl->allocate(); replacement.formId = result;
+        replacement.editorId = "OpenF4Model_" + std::to_string(result);
+        if (replacement.kind != kind) { replacement.recordSourceEsm.clear(); replacement.recordSourceFormId = 0; }
+        replacement.path = std::move(modelPath); replacement.kind = kind; replacement.sourceEsm = path().string();
+        mImpl->state.models[result] = std::move(replacement); ref.placement.baseObject = result;
+        if (ref.childGroupType != 8) mImpl->ensureCell(ref.placement.cell);
+    });
+    return result;
+}
+void EditorDocument::retarget(std::uint32_t id, std::uint32_t model)
+{
+    mImpl->change([&] {
+        if (!mImpl->state.models.contains(model)) throw std::runtime_error("Cannot retarget to an unknown model");
+        auto& ref = mImpl->reference(id);
+        if (ref.locked) throw std::runtime_error("Cannot retarget a locked reference");
+        ref.placement.baseObject = model;
+        if (ref.childGroupType != 8) mImpl->ensureCell(ref.placement.cell);
+    });
+}
+void EditorDocument::setModelScripts(std::uint32_t id, assets::PapyrusBindings scripts)
+{
+    mImpl->change([&] {
+        auto found = mImpl->state.models.find(id);
+        if (found == mImpl->state.models.end()) throw std::runtime_error("Cannot attach scripts to an unknown model");
+        if (!found->second.scripts.editable) throw std::runtime_error("Existing model VMAD is read-only: " + found->second.scripts.diagnostic);
+        scripts.present = !scripts.scripts.empty(); scripts.edited = true; scripts.sourceEsm = path().string();
+        (void)assets::encodePapyrusBindings(scripts, false);
+        if (scripts.present == found->second.scripts.present && scripts.scripts == found->second.scripts.scripts) return;
+        found->second.scripts = std::move(scripts); found->second.recordOwnerEsm = path().string();
+    });
+}
+void EditorDocument::setReferenceScripts(std::uint32_t id, assets::PapyrusBindings scripts)
+{
+    mImpl->change([&] {
+        auto& ref = mImpl->reference(id);
+        if (ref.locked) throw std::runtime_error("Cannot edit scripts on a locked reference");
+        if (!ref.scripts.editable) throw std::runtime_error("Existing reference VMAD is read-only: " + ref.scripts.diagnostic);
+        scripts.present = !scripts.scripts.empty(); scripts.edited = true; scripts.sourceEsm = path().string();
+        (void)assets::encodePapyrusBindings(scripts, false);
+        if (scripts.present == ref.scripts.present && scripts.scripts == ref.scripts.scripts) return;
+        ref.scripts = std::move(scripts);
+        if (ref.childGroupType != 8) mImpl->ensureCell(ref.placement.cell);
+    });
 }
 std::uint32_t EditorDocument::place(std::uint32_t model, const glm::mat4& transform, std::string name)
 {
@@ -348,7 +510,8 @@ void EditorDocument::setTransform(std::uint32_t id, const glm::mat4& transform)
 {
     mImpl->change([&] {
         auto& ref = mImpl->reference(id); if (ref.locked) return;
-        world::setBethesdaReferenceTransform(ref.placement, transform); const auto coord = ref.placement.cell; mImpl->ensureCell(coord);
+        world::setBethesdaReferenceTransform(ref.placement, transform);
+        if (ref.childGroupType != 8) mImpl->ensureCell(ref.placement.cell);
     });
 }
 void EditorDocument::erase(std::uint32_t id)
@@ -360,7 +523,9 @@ std::uint32_t EditorDocument::duplicate(std::uint32_t id)
 {
     std::uint32_t result = 0; mImpl->change([&] {
         auto copy = mImpl->reference(id); copy.placement.formId = mImpl->allocate(); copy.placement.instanceId = copy.placement.formId;
-        copy.name += " copy"; result = copy.placement.formId; mImpl->state.references.push_back(copy);
+        copy.name += " copy"; copy.recordSource = {}; copy.ownerCellFormId = 0; copy.childGroupType = 9;
+        mImpl->ensureCell(copy.placement.cell);
+        result = copy.placement.formId; mImpl->state.references.push_back(copy);
     }); return result;
 }
 void EditorDocument::setVisible(std::uint32_t id, bool visible) { mImpl->change([&] { mImpl->reference(id).visible = visible; }); }

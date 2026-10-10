@@ -22,6 +22,7 @@ namespace openf4::assets
         std::filesystem::path sourcePath;
         std::string format;
         std::vector<std::string> warnings;
+        std::vector<std::filesystem::path> sourceFiles;
     };
 
     struct ImportedModelAsset
@@ -36,6 +37,7 @@ namespace openf4::assets
     // CPU-only imports are safe to invoke from the stream/import worker pool.
     [[nodiscard]] ModelImportResult importModel(
         const std::filesystem::path& source, ModelImportOptions options = {});
+    [[nodiscard]] ModelImage decodeModelImage(std::span<const std::byte> bytes, bool srgb);
     [[nodiscard]] std::future<ModelImportResult> importModelAsync(
         std::filesystem::path source, ModelImportOptions options = {});
 

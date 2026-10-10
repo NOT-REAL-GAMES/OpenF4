@@ -73,5 +73,6 @@ namespace openf4::render
         std::span<const SourceVertex> vertices, std::span<const std::uint32_t> indices,
         std::uint32_t materialIndex = 0);
     [[nodiscard]] PackedMesh makeCubeMesh();
+    [[nodiscard]] glm::vec4 unionBoundingSpheres(glm::vec4 first, glm::vec4 second) noexcept;
     [[nodiscard]] MeshRange appendMesh(PackedMesh& destination, PackedMesh source);
 }

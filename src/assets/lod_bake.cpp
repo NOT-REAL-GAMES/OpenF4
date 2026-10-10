@@ -25,6 +25,8 @@ namespace
 {
     constexpr int terrainKind = 0;
     constexpr int staticKind = 1;
+    // Bump when a baker changes generated geometry or materials.
+    constexpr int recipeVersions[] = {1, 1}; // terrain, statics
 
     struct Key
     {
@@ -90,16 +92,13 @@ namespace
     {
         sqlite3* handle = nullptr;
 
-        Database(const std::filesystem::path& path, bool create)
+        Database(const std::filesystem::path& path, bool create, bool writable = false)
         {
             if (!create && !std::filesystem::exists(path)) return;
             if (create) std::filesystem::create_directories(path.parent_path());
-#ifdef _WIN32
-            const int result = sqlite3_open16(path.wstring().c_str(), &handle);
-#else
-            const int result = sqlite3_open_v2(path.string().c_str(), &handle,
-                create ? SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE : SQLITE_OPEN_READONLY, nullptr);
-#endif
+            const int flags = create ? SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
+                : writable ? SQLITE_OPEN_READWRITE : SQLITE_OPEN_READONLY;
+            const int result = sqlite3_open_v2(utf8(path).c_str(), &handle, flags, nullptr);
             if (result != SQLITE_OK)
             {
                 const std::string message = handle ? sqlite3_errmsg(handle) : "could not open database";
@@ -205,6 +204,14 @@ namespace
         return result;
     }
 
+    [[nodiscard]] bool currentRecipe(const Database& db, int kind)
+    {
+        if (!db.handle) return false;
+        Statement query(db, "SELECT value FROM metadata WHERE key=?");
+        query.bind(1, std::string(kind == terrainKind ? "terrain_recipe" : "static_recipe"));
+        return query.step() == SQLITE_ROW && sqlite3_column_int(query.handle, 0) == recipeVersions[kind];
+    }
+
     [[nodiscard]] Stamps readSources(const Database& db, int kind)
     {
         Stamps result;
@@ -218,13 +225,6 @@ namespace
                 sqlite3_column_int64(query.handle, 2)});
         }
         return result;
-    }
-
-    [[nodiscard]] bool hasDirty(const std::map<Key, Row>& rows, int kind)
-    {
-        return std::any_of(rows.begin(), rows.end(), [&](const auto& entry) {
-            return entry.first.kind == kind && entry.second.dirty;
-        });
     }
 
     [[nodiscard]] int floorDivide(int value, int divisor)
@@ -291,11 +291,11 @@ namespace
             const auto previous = readSources(db, terrainKind);
             const auto tiles = terrain.tiles();
             for (const auto& tile : tiles) current.insert(terrainKey(tile));
-            terrainFull = options.full || previous.empty();
+            terrainFull = options.full || previous.empty() || !currentRecipe(db, terrainKind);
             if (!terrainFull)
             {
-                // A changed shard may have lost CELL records. Its metadata bounds
-                // still identify every old or new tile requiring replacement.
+                // Include the one-cell normal-sampling halo; metadata bounds
+                // also retain coverage of CELL records removed from the shard.
                 if (previous.size() != result.terrainSources.size()) terrainFull = true;
                 for (const auto& [path, old] : previous)
                 {
@@ -306,10 +306,10 @@ namespace
                     const auto bounds = terrain.shardCellBounds(fromUtf8(path));
                     if (!bounds) { terrainFull = true; break; }
                     for (const auto& tile : tiles)
-                        if (static_cast<std::int64_t>(tile.origin.x) <= bounds->second.x
-                            && static_cast<std::int64_t>(tile.origin.x) + tile.level - 1 >= bounds->first.x
-                            && static_cast<std::int64_t>(tile.origin.y) <= bounds->second.y
-                            && static_cast<std::int64_t>(tile.origin.y) + tile.level - 1 >= bounds->first.y)
+                        if (static_cast<std::int64_t>(tile.origin.x) <= static_cast<std::int64_t>(bounds->second.x) + 1
+                            && static_cast<std::int64_t>(tile.origin.x) + tile.level >= bounds->first.x
+                            && static_cast<std::int64_t>(tile.origin.y) <= static_cast<std::int64_t>(bounds->second.y) + 1
+                            && static_cast<std::int64_t>(tile.origin.y) + tile.level >= bounds->first.y)
                             invalidated.insert(terrainKey(tile));
                 }
             }
@@ -320,25 +320,27 @@ namespace
             const auto previous = readSources(db, staticKind);
             const auto tiles = statics.tiles();
             for (const auto& tile : tiles) current.insert(staticKey(tile));
-            staticFull = options.full || previous.empty();
+            staticFull = options.full || previous.empty() || !currentRecipe(db, staticKind);
             if (!staticFull)
             {
                 std::set<std::string> changedFiles;
-                bool pathSetChanged = previous.size() != result.staticSources.size();
                 for (const auto& [path, old] : previous)
                 {
                     const auto found = result.staticSources.find(path);
-                    if (found == result.staticSources.end()) pathSetChanged = true;
+                    // A removed dependency may still be used by a tile whose
+                    // resolver can no longer find it. Dirty tiles elsewhere do
+                    // not account for that external change.
+                    if (found == result.staticSources.end())
+                    {
+                        if (old.bytes >= 0 && stamp(fromUtf8(path)).bytes < 0) staticFull = true;
+                    }
                     else if (found->second != old) changedFiles.insert(path);
                 }
                 for (const auto& [path, value] : result.staticSources)
                 {
                     (void)value;
-                    if (!previous.contains(path)) pathSetChanged = true;
+                    if (!previous.contains(path)) changedFiles.insert(path);
                 }
-                // Editor saves mark old and new reference tiles and update the
-                // ESM stamp; a changed model-path set is then already tracked.
-                if (pathSetChanged && !hasDirty(rows, staticKind)) staticFull = true;
                 if (changedFiles.contains(utf8(world))) staticFull = true;
                 for (const auto& path : changedFiles)
                     if (fromUtf8(path).extension() == ".esm") staticFull = true;
@@ -367,7 +369,8 @@ namespace
             const bool full = key.kind == terrainKind ? terrainFull : staticFull;
             if (!full && !invalidated.contains(key)
                 && row != rows.end() && !row->second.dirty
-                && std::filesystem::is_regular_file(output)) continue;
+                && (row->second.bytes ? std::filesystem::is_regular_file(output)
+                    : key.kind == staticKind && !std::filesystem::exists(output))) continue;
             std::uint64_t estimate = row != rows.end() ? row->second.bytes : 0;
             if (!estimate && std::filesystem::is_regular_file(output))
                 estimate = std::filesystem::file_size(output);
@@ -414,6 +417,10 @@ namespace
             insert.bind(4, value.modified);
             insert.done();
         }
+        Statement recipe(db, "INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)");
+        recipe.bind(1, std::string(kind == terrainKind ? "terrain_recipe" : "static_recipe"));
+        recipe.bind(2, recipeVersions[kind]);
+        recipe.done();
     }
 
     [[nodiscard]] std::filesystem::path temporaryPath(const std::filesystem::path& output)
@@ -564,17 +571,29 @@ LodBakeResult LodBuildIndex::bake(const TerrainLodSource& terrain,
             try
             {
                 std::vector<std::uint32_t> members;
+                bool hasGeometry = true;
                 if (item.key.kind == terrainKind)
                     terrain.bake({item.key.level, {item.key.x, item.key.y}}, temporary);
                 else
                 {
                     const LodStaticTile tile{{item.key.x, item.key.y}};
-                    statics.bake(tile, temporary);
-                    members = statics.members(tile);
+                    hasGeometry = statics.bake(tile, temporary);
+                    if (hasGeometry) members = statics.members(tile);
                 }
-                const auto bytes = std::filesystem::file_size(temporary);
-                atomicReplace(temporary, output);
-                published(db, item.key, bytes, members);
+                if (hasGeometry)
+                {
+                    const auto bytes = std::filesystem::file_size(temporary);
+                    atomicReplace(temporary, output);
+                    published(db, item.key, bytes, members);
+                    ++(item.key.kind == terrainKind ? result.terrainBaked : result.staticBaked);
+                }
+                else
+                {
+                    // Remember a skipped tile so an unchanged unresolved model
+                    // does not get retried on every changed-only bake.
+                    if (std::filesystem::remove(output)) ++result.removedTiles;
+                    published(db, item.key, 0, {});
+                }
             }
             catch (...)
             {
@@ -583,7 +602,6 @@ LodBakeResult LodBuildIndex::bake(const TerrainLodSource& terrain,
                 throw;
             }
             result.publishedPaths.push_back(output);
-            ++(item.key.kind == terrainKind ? result.terrainBaked : result.staticBaked);
         }
         ++completed;
         if (options.progress)
@@ -594,12 +612,25 @@ LodBakeResult LodBuildIndex::bake(const TerrainLodSource& terrain,
     return result;
 }
 
+void LodBuildIndex::prepareSave() const
+{
+    if (!std::filesystem::exists(indexPath(mWorldEsm))) return;
+    const Database db(indexPath(mWorldEsm), false, true);
+    const auto current = stamp(mWorldEsm);
+    Statement dirty(db, "UPDATE tiles SET dirty=1 WHERE kind IN "
+        "(SELECT kind FROM sources WHERE path=? AND (bytes<>? OR modified<>?))");
+    dirty.bind(1, utf8(mWorldEsm));
+    dirty.bind(2, current.bytes);
+    dirty.bind(3, current.modified);
+    dirty.done();
+}
+
 void LodBuildIndex::markSavedChanges(std::span<const CellCoord> terrainCells,
     std::span<const CellCoord> staticCells,
     std::span<const std::filesystem::path> sourceFiles) const
 {
     if (!std::filesystem::exists(indexPath(mWorldEsm))) return;
-    const Database db(indexPath(mWorldEsm), false);
+    const Database db(indexPath(mWorldEsm), false, true);
     db.exec("BEGIN IMMEDIATE");
     try
     {
@@ -610,8 +641,11 @@ void LodBuildIndex::markSavedChanges(std::span<const CellCoord> terrainCells,
                 for (int dx = -1; dx <= 1; ++dx)
                     for (const int level : {4, 8, 16, 32})
                     {
-                        const auto x = static_cast<int>(static_cast<std::int64_t>(cell.x) + dx);
-                        const auto y = static_cast<int>(static_cast<std::int64_t>(cell.y) + dy);
+                        const auto nearbyX = static_cast<std::int64_t>(cell.x) + dx;
+                        const auto nearbyY = static_cast<std::int64_t>(cell.y) + dy;
+                        if (!std::in_range<int>(nearbyX) || !std::in_range<int>(nearbyY)) continue;
+                        const auto x = static_cast<int>(nearbyX);
+                        const auto y = static_cast<int>(nearbyY);
                         markDirty({terrainKind, level,
                             floorDivide(x, level) * level,
                             floorDivide(y, level) * level}, dirty);
@@ -645,5 +679,17 @@ std::uint64_t LodBuildIndex::revision() const
 {
     const Database db(indexPath(mWorldEsm), false);
     return ::openf4::assets::revision(db);
+}
+
+std::vector<LodTerrainTile> LodBuildIndex::expectedTerrainTiles() const
+{
+    const Database db(indexPath(mWorldEsm), false);
+    std::vector<LodTerrainTile> result;
+    if (!db.handle) return result;
+    Statement tiles(db, "SELECT level,x,y FROM tiles WHERE kind=0 ORDER BY level,x,y");
+    while (tiles.step() == SQLITE_ROW)
+        result.push_back({sqlite3_column_int(tiles.handle, 0),
+            {sqlite3_column_int(tiles.handle, 1), sqlite3_column_int(tiles.handle, 2)}});
+    return result;
 }
 }

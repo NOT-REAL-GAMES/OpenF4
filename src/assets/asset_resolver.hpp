@@ -10,6 +10,13 @@
 
 namespace openf4::assets
 {
+    // Explicit test instrumentation; only the selected world's sidecar is captured.
+    // Configure once, before constructing resolvers or starting worker threads.
+    void beginCompatibilityAssetCapture(const std::filesystem::path& worldEsm,
+        const std::filesystem::path& outputDirectory);
+    void endCompatibilityAssetCapture(); // After scoped resolvers and workers are destroyed.
+    [[nodiscard]] std::string compatibilityJsonString(std::string_view value);
+
     enum class AssetSource
     {
         project,

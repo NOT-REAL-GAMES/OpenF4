@@ -7,6 +7,8 @@
 
 #include <filesystem>
 #include <limits>
+#include <map>
+#include <set>
 #include <optional>
 #include <memory>
 #include <string>
@@ -17,6 +19,9 @@
 
 #include "assets/esm_world.hpp"
 #include "assets/esm_editor.hpp"
+#include "assets/esm_document.hpp"
+#include "assets/nif_model.hpp"
+#include "assets/lod_terrain.hpp"
 
 namespace openf4::world
 {
@@ -75,6 +80,13 @@ namespace openf4::world
             }
         }
 
+        using DemLodSelection = std::map<assets::LodTerrainTile, glm::vec4>;
+        [[nodiscard]] DemLodSelection selectDemTerrainLod(
+            const std::map<assets::LodTerrainTile, bool>& desired,
+            const DemLodSelection& previous, bool landReady = true);
+        [[nodiscard]] std::set<assets::CellCoord> demTerrainCoverage(
+            const render::PackedMesh& mesh, assets::LodTerrainTile tile);
+
         [[nodiscard]] inline glm::vec4 demWaterLodRange() noexcept
         {
             return {0.0f, 0.0f, demHorizonFadeStart, demHorizonFadeEnd};
@@ -120,6 +132,7 @@ namespace openf4::world
         bool includeObjects = true,
         std::size_t maxPlacedObjects = std::numeric_limits<std::size_t>::max());
     [[nodiscard]] bool isRenderableModelPath(std::string_view path);
+    [[nodiscard]] render::SceneTexture modelSceneTexture(const assets::ModelImage& image);
     void eulerToQuaternion(float rotX, float rotY, float rotZ,
         float& qx, float& qy, float& qz, float& qw);
     [[nodiscard]] glm::mat4 bethesdaReferenceTransform(const assets::PlacedReference& reference);
@@ -129,6 +142,24 @@ namespace openf4::world
 
     // Shared live projection of authored references, used by the editor and runtime.
     // Camera positions include the renderer's X reflection; bounds do not.
+    struct ObjectCompatibilityState
+    {
+        std::uint32_t formId = 0;
+        bool installed = false;
+        bool movable = false;
+        bool collisionReady = false;
+        bool surroundingsReady = false;
+        bool collisionFailed = false;
+        std::size_t expectedBodies = 0;
+        glm::mat4 authoredTransform{1.0f};
+        glm::mat4 transform{1.0f};
+        std::vector<physics::BodyState> bodies;
+        std::optional<GeometryBounds> geometry;
+        std::optional<double> landHeight;
+    };
+
+    class LandscapeEditor;
+    class WorldStreamer;
     class ObjectScene
     {
     public:
@@ -156,6 +187,13 @@ namespace openf4::world
         [[nodiscard]] const std::vector<std::string>& diagnostics() const noexcept;
         void refreshDerivedLod(render::VulkanRenderer& renderer,
             std::span<const std::filesystem::path> publishedPaths);
+        // Runtime opt-in only: editor placement never simulates authored references.
+        void enablePhysics(physics::JoltWorld& world, std::span<const assets::ESMModel> models,
+            LandscapeEditor* terrain = nullptr, WorldStreamer* streamedTerrain = nullptr);
+        void stepPhysics(render::VulkanRenderer& renderer, float deltaSeconds);
+        void enableScripts(const assets::ESMMasterStack& records);
+        // Read-only diagnostics of installed objects, never a second model/physics loader.
+        [[nodiscard]] ObjectCompatibilityState compatibilityState(std::uint32_t formId) const;
 
     private:
         struct Impl;
@@ -184,6 +222,7 @@ namespace openf4::world
         [[nodiscard]] bool streamNext(render::VulkanRenderer& renderer);
         [[nodiscard]] std::size_t streamedObjects() const noexcept;
         [[nodiscard]] std::size_t pendingObjects() const noexcept;
+        [[nodiscard]] bool collisionReady(assets::CellCoord cell) const;
 
     private:
         struct Impl;
@@ -211,6 +250,8 @@ namespace openf4::world
         [[nodiscard]] assets::EditableLandscape snapshot() const;
         [[nodiscard]] std::size_t residentCells() const noexcept;
         [[nodiscard]] std::size_t pendingWork() const noexcept;
+        void enablePhysics(physics::JoltWorld& world);
+        [[nodiscard]] bool collisionReady(assets::CellCoord cell) const;
         [[nodiscard]] std::uint32_t nextFormId() const noexcept;
         void setNextFormId(std::uint32_t next) noexcept;
         void applySnapshot(render::VulkanRenderer& renderer,

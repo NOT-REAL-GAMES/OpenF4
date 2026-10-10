@@ -7,9 +7,11 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <glm/mat4x4.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 namespace openf4::assets
 {
@@ -65,10 +67,34 @@ namespace openf4::assets
         glm::mat4 skinToBone{1.0f};
     };
 
+    // A single animated channel for one bone.
+    struct ModelAnimationChannel
+    {
+        std::string boneName;
+        // Keyframe times in seconds.
+        std::vector<float> times;
+        // Corresponding positions, rotations, and scales.
+        std::vector<glm::vec3> positions;
+        std::vector<glm::quat> rotations;
+        std::vector<glm::vec3> scales;
+    };
+
+    // An animation clip containing channels for all bones.
+    struct ModelAnimationClip
+    {
+        std::string name;
+        float duration = 0.0f;
+        float ticksPerSecond = 24.0f;
+        std::vector<ModelAnimationChannel> channels;
+        // Maps bone name to channel index for fast lookup.
+        std::unordered_map<std::string, std::size_t> boneIndex;
+    };
+
     struct ModelGeometry
     {
         std::vector<ModelSurface> surfaces;
         std::vector<ModelSkinBone> skinBones;
+        std::vector<ModelAnimationClip> animations;
         struct ConnectionPoint
         {
             std::string name;
@@ -79,4 +105,13 @@ namespace openf4::assets
     };
 
     [[nodiscard]] ModelGeometry loadNifModel(std::span<const std::byte> bytes);
+
+    // Sample an animation clip at a given time and return bone transforms.
+    // The returned vector is indexed by the bone's position in skinBones.
+    [[nodiscard]] std::vector<glm::mat4> sampleAnimation(
+        const ModelGeometry& geometry, const ModelAnimationClip& clip, float time);
+
+    // Compute the bind-pose transforms for a geometry with skin bones.
+    [[nodiscard]] std::vector<glm::mat4> bindPoseTransforms(
+        const ModelGeometry& geometry);
 }

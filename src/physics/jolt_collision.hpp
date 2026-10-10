@@ -1,6 +1,7 @@
 #pragma once
 
 #include "assets/havok_packfile.hpp"
+#include "assets/coordinates.hpp"
 
 #include <Jolt/Jolt.h>
 #include <Jolt/Physics/Collision/Shape/Shape.h>
@@ -14,7 +15,15 @@
 
 namespace openf4::physics
 {
-    inline constexpr float BethesdaUnitsPerMeter = 69.99125f;
+    inline constexpr float BethesdaUnitsPerMeter = assets::bethesdaUnitsPerMeter;
+
+    // Engine-space input in Bethesda units; result is Havok Z-up meters.
+    [[nodiscard]] assets::HavokConvexPolytope makeHavokConvexHull(
+        std::span<const glm::vec3> positions, float convexRadiusUnits = 0.0f);
+    // Only geometry is captured; Fallout-specific body metadata comes from the authoring document.
+    [[nodiscard]] assets::HavokRigidBody captureJoltCollisionShape(
+        const JPH::Shape& shape, const assets::HavokRigidBody& metadata);
+    void updateHavokMassProperties(assets::HavokRigidBody& body);
 
     [[nodiscard]] JPH::ShapeRefC makeJoltConvexHull(
         const assets::HavokConvexPolytope& polytope);
@@ -45,6 +54,14 @@ namespace openf4::physics
         }
     };
 
+    struct BodyState
+    {
+        glm::mat4 transform{1.0f};
+        glm::vec3 linearVelocity{}; // Engine units per second; transforms are absolute.
+        glm::vec3 angularVelocity{};
+        bool active = true;
+    };
+
     class JoltWorld
     {
     public:
@@ -64,6 +81,11 @@ namespace openf4::physics
             const glm::vec3& position,
             const glm::quat& rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
             float mass = 0.0f, float friction = 0.5f, float restitution = 0.4f);
+        // Position/rotation place the body frame; source shape coordinates remain local.
+        [[nodiscard]] BodyHandle addCollisionBody(const assets::HavokRigidBody& body,
+            const glm::vec3& position = glm::vec3(0.0f),
+            const glm::quat& rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+            float scale = 1.0f);
         [[nodiscard]] RagdollHandle addRagdoll(const assets::HavokRagdoll& ragdoll,
             const glm::vec3& position,
             const glm::quat& rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
@@ -72,6 +94,18 @@ namespace openf4::physics
         void removeRagdoll(RagdollHandle ragdoll);
         void step(float deltaSeconds);
         [[nodiscard]] glm::mat4 bodyTransform(BodyHandle body) const;
+        [[nodiscard]] BodyState bodyState(BodyHandle body) const;
+        void restoreBodyState(BodyHandle body, const BodyState& state);
+        [[nodiscard]] bool isBodyValid(BodyHandle body) const;
+        [[nodiscard]] bool isBodyActive(BodyHandle body) const;
+        // Fallout motion types: 0 fixed, 1 dynamic, 2 keyframed. Invalid/stale handles
+        // and unsupported promotions return false. Switching preserves mass/inertia.
+        [[nodiscard]] bool setMotionType(BodyHandle body, std::uint32_t motionType,
+            bool allowActivate = true);
+        // Engine-axis direction is normalized; magnitude is an impulse in kg*m/s.
+        // A zero magnitude with a nonzero direction still wakes a dynamic body.
+        [[nodiscard]] bool applyHavokImpulse(BodyHandle body,
+            const glm::vec3& direction, float magnitude);
         [[nodiscard]] std::vector<glm::vec3> dynamicBodyPositions() const;
         [[nodiscard]] std::vector<glm::mat4> ragdollBodyTransforms(
             RagdollHandle ragdoll) const;

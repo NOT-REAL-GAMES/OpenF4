@@ -54,9 +54,11 @@ namespace openf4::assets
         {
             reader.skip(4 + 8 + 8 + 4); // Clamp, UV offset/scale, transparency.
             const bool alphaBlend = reader.read<std::uint8_t>() != 0;
+            material.alphaBlend = alphaBlend;
             reader.skip(4 + 4); // Source and destination blend modes.
             const float alphaThreshold = reader.read<std::uint8_t>() / 255.0f;
             const bool alphaTest = reader.read<std::uint8_t>() != 0;
+            material.alphaTest = alphaTest;
             material.alphaCutoff = alphaTest ? alphaThreshold : (alphaBlend ? 1.0f / 255.0f : 0.0f);
             reader.skip(4); // Depth and screen-space reflection flags.
             material.decal = reader.read<std::uint8_t>() != 0;
@@ -122,7 +124,7 @@ namespace openf4::assets
                 reader.skip(1 + 12); // Hair flag and tint.
                 reader.skip(3 + 1); // Tree/face/skin flags and tessellation.
                 if (version < 3)
-                    reader.skip(32);
+                    reader.skip(20); // Five displacement/tessellation floats.
                 const float scale = reader.read<float>();
                 result.grayscaleToPaletteScale = scale > 0.01f ? scale : 0.5f;
             }

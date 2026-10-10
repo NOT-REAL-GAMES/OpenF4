@@ -19,6 +19,8 @@ namespace openf4::assets
         bool grayscaleToPalette = false;
         bool twoSided = false;
         bool decal = false;
+        bool alphaBlend = false;
+        bool alphaTest = false;
     };
 
     [[nodiscard]] MaterialInfo loadMaterial(std::span<const std::byte> bytes);

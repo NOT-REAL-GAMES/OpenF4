@@ -190,9 +190,21 @@ namespace openf4::render
         for (std::uint32_t face = 0; face < 6; ++face)
         {
             const std::uint32_t base = face * 4;
-            indices.insert(indices.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
+            // Engine geometry is reflected once by the renderer or native NIF conversion.
+            indices.insert(indices.end(), {base, base + 2, base + 1, base, base + 3, base + 2});
         }
         return buildMeshlets(vertices, indices);
+    }
+
+    glm::vec4 unionBoundingSpheres(glm::vec4 first, glm::vec4 second) noexcept
+    {
+        const glm::vec3 offset = glm::vec3(second) - glm::vec3(first);
+        const float distance = glm::length(offset);
+        if (first.w >= distance + second.w) return first;
+        if (second.w >= distance + first.w) return second;
+        if (distance == 0.0f) return first;
+        const float radius = (distance + first.w + second.w) * 0.5f;
+        return glm::vec4(glm::vec3(first) + offset * ((radius - first.w) / distance), radius);
     }
 
     MeshRange appendMesh(PackedMesh& destination, PackedMesh source)
@@ -219,26 +231,7 @@ namespace openf4::render
         if (destinationEmpty)
             destination.bounds = range.bounds;
         else if (range.meshletCount != 0)
-        {
-            const glm::vec3 destinationCenter(destination.bounds);
-            const glm::vec3 sourceCenter(range.bounds);
-            const float destinationRadius = destination.bounds.w;
-            const float sourceRadius = range.bounds.w;
-            const glm::vec3 offset = sourceCenter - destinationCenter;
-            const float distance = glm::length(offset);
-            if (destinationRadius < distance + sourceRadius)
-            {
-                if (sourceRadius >= distance + destinationRadius)
-                    destination.bounds = range.bounds;
-                else if (distance > 0.0f)
-                {
-                    const float radius = (distance + destinationRadius + sourceRadius) * 0.5f;
-                    destination.bounds = glm::vec4(
-                        destinationCenter + offset * ((radius - destinationRadius) / distance),
-                        radius);
-                }
-            }
-        }
+            destination.bounds = unionBoundingSpheres(destination.bounds, range.bounds);
         return range;
     }
 

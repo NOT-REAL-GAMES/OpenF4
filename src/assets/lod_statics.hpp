@@ -46,8 +46,8 @@ namespace openf4::assets
         [[nodiscard]] std::vector<std::filesystem::path> sourceFilesForTile(
             LodStaticTile tile) const;
         [[nodiscard]] std::vector<std::string> diagnostics() const;
-        // Writes a single glTF 2 GLB. The caller publishes the path atomically.
-        void bake(LodStaticTile tile, const std::filesystem::path& outputPath) const;
+        // Writes a glTF 2 GLB for atomic publication; false means no resolvable parts.
+        bool bake(LodStaticTile tile, const std::filesystem::path& outputPath) const;
 
     private:
         struct Impl;

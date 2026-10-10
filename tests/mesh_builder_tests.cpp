@@ -126,6 +126,8 @@ try
         require(rejected, "ESM transform accepted unsupported nonuniform scale");
     }
     static_assert(sizeof(openf4::render::GpuVertex) == 64);
+    require(!openf4::render::SceneMaterial{}.normalMapped,
+        "Normal mapping must remain opt-in for existing Commonwealth materials");
     static_assert(offsetof(openf4::render::GpuVertex, blendWeights) == 28);
     static_assert(offsetof(openf4::render::GpuVertex, blendWeightsExtra) == 40);
     static_assert(offsetof(openf4::render::GpuVertex, color) == 44);
@@ -203,6 +205,63 @@ try
         "DEM water does not share the BTR horizon fade");
     require(openf4::world::detail::demHorizonFadeEnd < 96.0f * 4096.0f,
         "DEM horizon fade reaches beyond guaranteed BTR residency");
+
+    {
+        using openf4::assets::LodTerrainTile;
+        using openf4::world::detail::selectDemTerrainLod;
+        const LodTerrainTile fine{4, {0, 0}}, medium{8, {0, 0}},
+            distant{16, {0, 0}}, coarse{32, {0, 0}};
+        std::map<LodTerrainTile, bool> desired{
+            {fine, true}, {medium, true}, {distant, true}, {coarse, true}};
+        auto selected = selectDemTerrainLod(desired, {});
+        require(selected.size() == 4,
+            "Clipped worlds must use resident layers without requiring 49 tiles per level");
+        for (const auto key : {fine, medium, distant, coarse})
+            require(selected.at(key) == openf4::world::detail::demBtrLodRange(key.level),
+                "Complete terrain hierarchy changed its fade thresholds");
+        desired[medium] = false;
+        selected = selectDemTerrainLod(desired, selected);
+        require(!selected.contains(medium) && selected.contains(fine)
+            && selected.at(distant).x == selected.at(fine).z
+            && selected.at(distant).y == selected.at(fine).w,
+            "A loading intermediate layer must be bridged by its loaded ancestor");
+        const LodTerrainTile unpublishedSibling{4, {4, 0}};
+        desired[unpublishedSibling] = false;
+        selected = selectDemTerrainLod(desired, selected);
+        require(!selected.contains(fine) && selected.at(distant).x == fineDemRange.z,
+            "An indexed but unpublished sibling must retain ancestor coverage after cancellation");
+        desired[fine] = false;
+        selected = selectDemTerrainLod(desired, selected, false);
+        require(selected.at(distant).x == 0.0f && selected.at(distant).y == 0.0f,
+            "Coarse terrain must cover the inner window while LAND is loading");
+        desired[coarse] = false;
+        selected = selectDemTerrainLod(desired, selected);
+        require(selected.at(distant).w == openf4::world::detail::demHorizonFadeEnd,
+            "Loaded descendants must remain visible while a parent loads");
+        const LodTerrainTile negative{32, {-32, -32}};
+        desired[negative] = true;
+        selected = selectDemTerrainLod(desired, selected);
+        require(selected.contains(negative) && selected.contains(distant),
+            "Negative-coordinate regions must advance independently");
+        const auto retained = selectDemTerrainLod({{coarse, false}}, selected);
+        require(retained.contains(distant) && retained.contains(negative),
+            "Pending replacement roots must retain the displayed hierarchy");
+        const auto retainedWithoutLand = selectDemTerrainLod({{coarse, false}}, selected, false);
+        require(retainedWithoutLand.at(distant).x == 0.0f,
+            "Retained descendants must cover LAND during a pending root handoff");
+
+        std::vector<openf4::render::SourceVertex> cellVertices(4);
+        cellVertices[0].position = {0.0f, 0.0f, 0.0f};
+        cellVertices[1].position = {4096.0f, 0.0f, 0.0f};
+        cellVertices[2].position = {0.0f, 0.0f, 4096.0f};
+        cellVertices[3].position = {4096.0f, 0.0f, 4096.0f};
+        const std::vector<std::uint32_t> cellIndices{0, 1, 2, 1, 3, 2};
+        const auto clipped = openf4::render::buildMeshlets(cellVertices, cellIndices);
+        const auto coverage = openf4::world::detail::demTerrainCoverage(clipped, negative);
+        require(coverage.size() == 1 && coverage.contains({-32, -32})
+            && !coverage.contains({-31, -32}),
+            "BTR fallback must leave absent or newly authored LAND cells visible");
+    }
 
     std::vector<openf4::render::SourceVertex> legacyBtr(33 * 33);
     for (std::size_t y = 0; y < 33; ++y)
@@ -284,6 +343,17 @@ try
         result.bounds = bounds;
         return result;
     };
+    {
+        const glm::vec4 original(10.0f, -20.0f, 30.0f, 100.0f);
+        auto sceneBounds = original;
+        for (int instance = 0; instance < 10000; ++instance)
+            sceneBounds = openf4::render::unionBoundingSpheres(sceneBounds,
+                {10.0f + instance % 20, -20.0f, 30.0f, 5.0f});
+        require(sceneBounds == original,
+            "Repeated contained instances inflated the scene/shadow bounds");
+        require(openf4::render::unionBoundingSpheres(original, original) == original,
+            "Coincident scene bounds grew during preview replacement");
+    }
     openf4::render::PackedMesh combined;
     const auto firstRange = openf4::render::appendMesh(
         combined, boundedMesh({0.0f, 0.0f, 0.0f, 1.0f}));
@@ -362,6 +432,19 @@ try
     }
 
     const auto cube = openf4::render::makeCubeMesh();
+    for (const auto& meshlet : cube.meshlets)
+        for (std::uint32_t triangle = 0; triangle < meshlet.triangleCount * 3; triangle += 3)
+        {
+            const auto& first = cube.vertices[meshlet.vertexOffset + cube.indices[meshlet.indexOffset + triangle]];
+            auto a = glm::vec3(first.position);
+            auto b = glm::vec3(cube.vertices[meshlet.vertexOffset + cube.indices[meshlet.indexOffset + triangle + 1]].position);
+            auto c = glm::vec3(cube.vertices[meshlet.vertexOffset + cube.indices[meshlet.indexOffset + triangle + 2]].position);
+            auto normal = first.normal;
+            require(glm::dot(a, normal) > 0, "Cube normal points inward");
+            a.x = -a.x; b.x = -b.x; c.x = -c.x; normal.x = -normal.x;
+            require(glm::dot(glm::cross(b - a, c - a), normal) > 0,
+                "Cube winding disagrees with outward normals after renderer reflection");
+        }
     openf4::render::PackedMesh topologyScene;
     const auto topologyRange = openf4::render::appendMesh(topologyScene, cube);
     require(topologyRange.vertexOffset == 0

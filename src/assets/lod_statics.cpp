@@ -1,9 +1,13 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include "assets/lod_statics.hpp"
 
 #include "assets/asset_resolver.hpp"
 #include "assets/dds_texture.hpp"
 #include "assets/esm_document.hpp"
 #include "assets/model_import.hpp"
+#include "assets/material_file.hpp"
 #include "assets/nif_model.hpp"
 
 #include <assimp/GltfMaterial.h>
@@ -11,13 +15,13 @@
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 #include <meshoptimizer.h>
+#include <DirectXTex.h>
 
 #include <stb_image.h>
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <charconv>
 #include <cctype>
@@ -25,7 +29,6 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
-#include <iostream>
 #include <limits>
 #include <locale>
 #include <map>
@@ -63,6 +66,21 @@ namespace openf4::assets
                 return static_cast<char>(std::tolower(c));
             });
             return value;
+        }
+
+        std::string materialPath(std::string_view path)
+        {
+            auto result = AssetResolver::normalizePath(path);
+            if (!result.starts_with("materials\\")) result = "materials\\" + result;
+            if (!result.ends_with(".bgsm") && !result.ends_with(".bgem")) result += ".bgsm";
+            return result;
+        }
+
+        std::string texturePath(std::string_view path)
+        {
+            auto result = AssetResolver::normalizePath(path);
+            if (!result.empty() && !result.starts_with("textures\\")) result = "textures\\" + result;
+            return result;
         }
 
         glm::mat4 referenceTransform(const PlacedReference& reference)
@@ -104,102 +122,40 @@ namespace openf4::assets
                 engine.z / unitsPerMeter};
         }
 
-        std::uint16_t word(const std::byte* source)
-        {
-            return static_cast<std::uint16_t>(std::to_integer<unsigned char>(source[0])
-                | (std::to_integer<unsigned char>(source[1]) << 8));
-        }
-
-        std::array<std::uint8_t, 4> rgb565(std::uint16_t value)
-        {
-            const auto r = (value >> 11) & 31u, g = (value >> 5) & 63u, b = value & 31u;
-            return {static_cast<std::uint8_t>((r << 3) | (r >> 2)),
-                static_cast<std::uint8_t>((g << 2) | (g >> 4)),
-                static_cast<std::uint8_t>((b << 3) | (b >> 2)), 255};
-        }
-
         ModelImage rgbaImage(const DdsTexture& dds)
         {
-            if (dds.width > 16384 || dds.height > 16384
-                || static_cast<std::uint64_t>(dds.width) * dds.height > 16384ull * 16384ull)
+            if (!dds.width || !dds.height || dds.width > 16384 || dds.height > 16384)
                 throw std::runtime_error("LOD texture exceeds PNG decoder limits");
+            const auto format = DirectX::MakeLinear(DirectX::MakeTypelessUNORM(
+                static_cast<DXGI_FORMAT>(dds.dxgiFormat)));
+            std::size_t rowPitch = 0, slicePitch = 0;
+            if (FAILED(DirectX::ComputePitch(format, dds.width, dds.height, rowPitch, slicePitch))
+                || slicePitch > dds.pixels.size())
+                throw std::runtime_error("LOD texture has a truncated or unsupported DDS payload");
+            DirectX::Image source{dds.width, dds.height, format, rowPitch, slicePitch,
+                reinterpret_cast<std::uint8_t*>(const_cast<std::byte*>(dds.pixels.data()))};
+            DirectX::ScratchImage decoded;
+            const DirectX::Image* image = &source;
+            if (format != DXGI_FORMAT_R8G8B8A8_UNORM)
+            {
+                const auto result = DirectX::IsCompressed(format)
+                    ? DirectX::Decompress(source, DXGI_FORMAT_R8G8B8A8_UNORM, decoded)
+                    : DirectX::Convert(source, DXGI_FORMAT_R8G8B8A8_UNORM,
+                        DirectX::TEX_FILTER_DEFAULT, 0.5f, decoded);
+                if (FAILED(result))
+                    throw std::runtime_error("Cannot decode diffuse DDS format " + std::to_string(dds.dxgiFormat));
+                image = decoded.GetImage(0, 0, 0);
+            }
             ModelImage result;
             result.width = dds.width;
             result.height = dds.height;
+            result.dxgiFormat = 29;
+            result.srgb = true;
+            result.mipOffsets = {0};
             result.pixels.resize(static_cast<std::size_t>(dds.width) * dds.height * 4);
-            if (dds.dxgiFormat == 28 || dds.dxgiFormat == 29 || dds.dxgiFormat == 87)
-            {
-                std::copy_n(dds.pixels.begin(), result.pixels.size(), result.pixels.begin());
-                if (dds.dxgiFormat == 87)
-                    for (std::size_t i = 0; i < result.pixels.size(); i += 4)
-                        std::swap(result.pixels[i], result.pixels[i + 2]);
-                return result;
-            }
-            const bool bc1 = dds.dxgiFormat == 70 || dds.dxgiFormat == 71 || dds.dxgiFormat == 72;
-            const bool bc2 = dds.dxgiFormat >= 73 && dds.dxgiFormat <= 75;
-            const bool bc3 = dds.dxgiFormat >= 76 && dds.dxgiFormat <= 78;
-            if (!bc1 && !bc2 && !bc3)
-                throw std::runtime_error("Unsupported diffuse DDS compression " + std::to_string(dds.dxgiFormat));
-            const std::size_t blockSize = bc1 ? 8 : 16;
-            for (std::uint32_t by = 0; by < (dds.height + 3) / 4; ++by)
-                for (std::uint32_t bx = 0; bx < (dds.width + 3) / 4; ++bx)
-                {
-                    const auto* block = dds.pixels.data()
-                        + (static_cast<std::size_t>(by) * ((dds.width + 3) / 4) + bx) * blockSize;
-                    const auto* colorBlock = block + (bc1 ? 0 : 8);
-                    const auto c0 = word(colorBlock), c1 = word(colorBlock + 2);
-                    std::array<std::array<std::uint8_t, 4>, 4> palette{
-                        rgb565(c0), rgb565(c1), {}, {}};
-                    for (int channel = 0; channel < 3; ++channel)
-                    {
-                        if (c0 > c1 || bc2 || bc3)
-                        {
-                            palette[2][channel] = static_cast<std::uint8_t>(
-                                (2 * palette[0][channel] + palette[1][channel]) / 3);
-                            palette[3][channel] = static_cast<std::uint8_t>(
-                                (palette[0][channel] + 2 * palette[1][channel]) / 3);
-                        }
-                        else
-                            palette[2][channel] = static_cast<std::uint8_t>(
-                                (palette[0][channel] + palette[1][channel]) / 2);
-                    }
-                    palette[2][3] = 255;
-                    palette[3][3] = (c0 > c1 || bc2 || bc3) ? 255 : 0;
-                    std::uint32_t colorBits = 0;
-                    std::memcpy(&colorBits, colorBlock + 4, 4);
-                    std::array<std::uint8_t, 8> alphas{};
-                    std::uint64_t alphaBits = 0;
-                    if (bc2)
-                        std::memcpy(&alphaBits, block, 8);
-                    if (bc3)
-                    {
-                        alphas[0] = std::to_integer<std::uint8_t>(block[0]);
-                        alphas[1] = std::to_integer<std::uint8_t>(block[1]);
-                        for (int i = 2; i < 8; ++i)
-                            alphas[i] = static_cast<std::uint8_t>(
-                                alphas[0] > alphas[1]
-                                ? ((8 - i) * alphas[0] + (i - 1) * alphas[1]) / 7
-                                : (i < 6 ? ((6 - i) * alphas[0] + (i - 1) * alphas[1]) / 5
-                                    : (i == 6 ? 0 : 255)));
-                        for (int i = 0; i < 6; ++i)
-                            alphaBits |= static_cast<std::uint64_t>(
-                                std::to_integer<std::uint8_t>(block[2 + i])) << (8 * i);
-                    }
-                    for (std::uint32_t y = 0; y < 4; ++y)
-                        for (std::uint32_t x = 0; x < 4; ++x)
-                        {
-                            const auto px = bx * 4 + x, py = by * 4 + y;
-                            if (px >= dds.width || py >= dds.height) continue;
-                            const auto k = y * 4 + x;
-                            auto rgba = palette[(colorBits >> (2 * k)) & 3u];
-                            if (bc2) rgba[3] = static_cast<std::uint8_t>(
-                                ((alphaBits >> (4 * k)) & 15u) * 17u);
-                            if (bc3) rgba[3] = alphas[(alphaBits >> (3 * k)) & 7u];
-                            const auto dst = (static_cast<std::size_t>(py) * dds.width + px) * 4;
-                            for (int channel = 0; channel < 4; ++channel)
-                                result.pixels[dst + channel] = std::byte(rgba[channel]);
-                        }
-                }
+            for (std::size_t y = 0; y < dds.height; ++y)
+                std::memcpy(result.pixels.data() + y * dds.width * 4,
+                    image->pixels + y * image->rowPitch, static_cast<std::size_t>(dds.width) * 4);
             return result;
         }
 
@@ -285,7 +241,7 @@ namespace openf4::assets
             std::map<std::uint64_t, int> imageIds;
             const std::filesystem::path& world;
             const std::filesystem::path& output;
-            std::vector<std::string>* diagnostics = nullptr;
+            std::set<std::string>* diagnostics = nullptr;
 
             template<class T>
             int addView(const std::vector<T>& data, int target, int stride = 0)
@@ -333,6 +289,8 @@ namespace openf4::assets
             int material(const ModelSurface& surface, std::optional<ModelImage> diffuse)
             {
                 std::ostringstream json;
+                json.imbue(std::locale::classic());
+                json << std::setprecision(std::numeric_limits<float>::max_digits10);
                 json << "{\"pbrMetallicRoughness\":{\"baseColorFactor\":["
                     << surface.baseColor.r << ',' << surface.baseColor.g << ','
                     << surface.baseColor.b << ',' << surface.baseColor.a << "],"
@@ -394,9 +352,11 @@ namespace openf4::assets
                         const auto message = "Static LOD: " + name + " retained "
                             + std::to_string(count / 3) + " triangles over target "
                             + std::to_string(target / 3) + " at 1% error limit";
-                        std::cerr << message << '\n';
-                        if (diagnostics) diagnostics->push_back(message);
+                        if (diagnostics) diagnostics->insert(message);
                     }
+                    // Remove vertices made unreachable by simplification before serializing.
+                    vertices.resize(meshopt_optimizeVertexFetch(vertices.data(), indices.data(),
+                        indices.size(), vertices.data(), vertices.size(), sizeof(Vertex)));
                     const auto vertexView = addView(vertices, 34962, sizeof(Vertex));
                     const auto indexView = addView(indices, 34963);
                     glm::vec3 min(std::numeric_limits<float>::max());
@@ -408,6 +368,8 @@ namespace openf4::assets
                         max = glm::max(max, position);
                     }
                     std::ostringstream bounds;
+                    bounds.imbue(std::locale::classic());
+                    bounds << std::setprecision(std::numeric_limits<float>::max_digits10);
                     bounds << "\"min\":[" << min.x << ',' << min.y << ',' << min.z
                         << "],\"max\":[" << max.x << ',' << max.y << ',' << max.z << ']';
                     const int position = addAccessor(vertexView, 0, 5126,
@@ -420,17 +382,41 @@ namespace openf4::assets
                         static_cast<int>(vertices.size()), "VEC4");
                     const int index = addAccessor(indexView, 0, 5125,
                         static_cast<int>(indices.size()), "SCALAR");
-                    std::optional<ModelImage> diffuse = surface.diffuseImage;
-                    if (!diffuse && !surface.diffuseTexture.empty())
+                    ModelSurface materialSurface;
+                    materialSurface.baseColor = surface.baseColor;
+                    materialSurface.alphaBlend = surface.alphaBlend;
+                    materialSurface.alphaCutoff = surface.alphaCutoff;
+                    materialSurface.doubleSided = surface.doubleSided;
+                    materialSurface.metallicFactor = surface.metallicFactor;
+                    materialSurface.roughnessFactor = surface.roughnessFactor;
+                    auto diffusePath = surface.diffuseTexture;
+                    if (!surface.materialPath.empty())
                     {
-                        const auto bytes = resolver.extractTexture(surface.diffuseTexture);
+                        try
+                        {
+                            const auto loaded = loadMaterial(resolver.extract(materialPath(surface.materialPath)));
+                            if (!loaded.diffuseTexture.empty()) diffusePath = loaded.diffuseTexture;
+                            materialSurface.baseColor *= loaded.baseColor;
+                            materialSurface.alphaCutoff = std::max(surface.alphaCutoff, loaded.alphaCutoff);
+                            materialSurface.doubleSided = surface.doubleSided || loaded.twoSided;
+                        }
+                        catch (const std::exception& error)
+                        {
+                            if (diagnostics) diagnostics->insert("Static LOD material fallback: "
+                                + surface.materialPath + ": " + error.what());
+                        }
+                    }
+                    std::optional<ModelImage> diffuse = surface.diffuseImage;
+                    if (!diffuse && !diffusePath.empty())
+                    {
+                        const auto bytes = resolver.extractTexture(texturePath(diffusePath));
                         diffuse = rgbaImage(loadDdsTexture(bytes));
                     }
                     if (diffuse && diffuse->encoding != ModelImageEncoding::rgba8)
                         diffuse = rgbaImage({diffuse->width, diffuse->height,
                             diffuse->mipLevels, diffuse->dxgiFormat,
                             diffuse->pixels, diffuse->mipOffsets});
-                    const int mat = material(surface, std::move(diffuse));
+                    const int mat = material(materialSurface, std::move(diffuse));
                     std::ostringstream primitive;
                     primitive << "{\"attributes\":{\"POSITION\":" << position
                         << ",\"NORMAL\":" << normal << ",\"TEXCOORD_0\":" << uv
@@ -511,7 +497,8 @@ namespace openf4::assets
             }
         };
 
-        ModelGeometry loadStaticModel(const ESMModel& model, const AssetResolver& resolver)
+        ModelGeometry loadStaticModel(const ESMModel& model, const AssetResolver& resolver,
+            std::set<std::string>& diagnostics)
         {
             auto path = model.path;
             const auto ext = extension(std::filesystem::path(path).extension().string());
@@ -519,18 +506,21 @@ namespace openf4::assets
             {
                 if (!resolver.contains(path))
                     path = "meshes/" + path;
-                auto geometry = loadNifModel(resolver.extract(path));
-                if (!geometry.skinBones.empty() || !geometry.attachmentTargets.empty())
-                    throw std::runtime_error("animated or skinned NIF");
-                return geometry;
+                return loadNifModel(resolver.extract(path));
             }
             const auto loose = resolver.resolveLoose(path);
             if (!loose) throw std::runtime_error("imported source missing");
-            auto imported = importModel(*loose);
-            if (std::ranges::any_of(imported.warnings, [](const auto& warning) {
-                return warning.find("Animations") != std::string::npos;
-            }))
-                throw std::runtime_error("animated imported model");
+            ModelImportResult imported;
+            try { imported = importModel(*loose); }
+            catch (const std::exception& error)
+            {
+                throw std::runtime_error(std::string(error.what())
+                    + "; after restoring missing resources, use Bake All LOD or --full");
+            }
+            for (const auto& warning : imported.warnings)
+                diagnostics.insert("Static LOD " + model.path + ": " + warning);
+            // Animated models are now supported; their animation data is preserved
+            // but not used for LOD baking (static snapshots are used instead).
             return std::move(imported.geometry);
         }
 
@@ -557,6 +547,10 @@ namespace openf4::assets
             surface.baseColor = {color.r, color.g, color.b, color.a};
             material->Get(AI_MATKEY_METALLIC_FACTOR, surface.metallicFactor);
             material->Get(AI_MATKEY_ROUGHNESS_FACTOR, surface.roughnessFactor);
+            if (!std::isfinite(color.r) || !std::isfinite(color.g) || !std::isfinite(color.b)
+                || !std::isfinite(color.a) || !std::isfinite(surface.metallicFactor)
+                || !std::isfinite(surface.roughnessFactor))
+                throw std::runtime_error("Baked static part contains a non-finite material");
             aiString alphaMode;
             material->Get(AI_MATKEY_GLTF_ALPHAMODE, alphaMode);
             surface.alphaBlend = std::string_view(alphaMode.C_Str()) == "BLEND";
@@ -564,6 +558,8 @@ namespace openf4::assets
             {
                 surface.alphaCutoff = 0.5f;
                 material->Get(AI_MATKEY_GLTF_ALPHACUTOFF, surface.alphaCutoff);
+                if (!std::isfinite(surface.alphaCutoff))
+                    throw std::runtime_error("Baked static part contains an invalid alpha cutoff");
             }
             int doubleSided = 0;
             material->Get(AI_MATKEY_TWOSIDED, doubleSided);
@@ -584,6 +580,10 @@ namespace openf4::assets
                 stream.read(reinterpret_cast<char*>(encoded.data()), length);
                 if (!stream) throw std::runtime_error("Baked static PNG is truncated");
                 int width = 0, height = 0, channels = 0;
+                if (!stbi_info_from_memory(reinterpret_cast<const stbi_uc*>(encoded.data()),
+                        static_cast<int>(encoded.size()), &width, &height, &channels)
+                    || width <= 0 || height <= 0 || width > 16384 || height > 16384)
+                    throw std::runtime_error("Baked static PNG has invalid dimensions");
                 std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> decoded(
                     stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(encoded.data()),
                         static_cast<int>(encoded.size()), &width, &height, &channels, 4),
@@ -621,6 +621,9 @@ namespace openf4::assets
                 if (!std::isfinite(value.position.x) || !std::isfinite(value.position.y)
                     || !std::isfinite(value.position.z) || !std::isfinite(value.normal.x)
                     || !std::isfinite(value.normal.y) || !std::isfinite(value.normal.z)
+                    || !std::isfinite(value.uv.x) || !std::isfinite(value.uv.y)
+                    || !std::isfinite(value.color.r) || !std::isfinite(value.color.g)
+                    || !std::isfinite(value.color.b) || !std::isfinite(value.color.a)
                     || glm::any(glm::greaterThan(glm::abs(value.position), glm::vec3(10'000'000))))
                     throw std::runtime_error("Baked static part contains a non-finite or unbounded vertex");
                 surface.vertices.push_back(value);
@@ -670,7 +673,7 @@ namespace openf4::assets
                 const auto [end, error] = std::from_chars(
                     name.data() + 4, name.data() + 12, form, 16);
                 if (error != std::errc{} || end != name.data() + 12
-                    || !forms.insert(form).second)
+                    || !form || !forms.insert(form).second)
                     throw std::runtime_error("Baked static node has duplicate or invalid REFR identity");
                 LodStaticPart part;
                 part.referenceFormId = form;
@@ -704,7 +707,69 @@ namespace openf4::assets
         ESMMasterStack stack;
         std::map<std::uint32_t, ESMModel> models;
         std::map<LodStaticTile, std::vector<ESMReference>> byTile;
-        mutable std::vector<std::string> warnings;
+        mutable std::set<std::string> warnings;
+        mutable std::map<std::filesystem::path, std::unique_ptr<AssetResolver>> resolvers;
+        mutable std::map<std::uint32_t, std::vector<std::filesystem::path>> dependencies;
+
+        const AssetResolver& resolver(const std::filesystem::path& source) const
+        {
+            auto& result = resolvers[source];
+            if (!result) result = std::make_unique<AssetResolver>(source, data);
+            return *result;
+        }
+
+        const std::vector<std::filesystem::path>& modelDependencies(const ESMModel& model) const
+        {
+            if (const auto found = dependencies.find(model.formId); found != dependencies.end())
+                return found->second;
+            const auto source = model.sourceEsm.empty() ? world : std::filesystem::path(model.sourceEsm);
+            const auto& assets = resolver(source);
+            std::set<std::filesystem::path> files{source};
+            const auto add = [&](const std::string& path) {
+                if (path.empty()) return;
+                if (const auto loose = assets.resolveLoose(path)) files.insert(*loose);
+                // Missing higher-priority overrides must invalidate existing archive/Data products too.
+                auto relative = path;
+                std::ranges::replace(relative, '\\', '/');
+                files.insert(AssetResolver::projectAssetRoot(source) / relative);
+                if (data) files.insert(*data / relative);
+            };
+            auto path = model.path;
+            const auto ext = extension(std::filesystem::path(path).extension().string());
+            const bool nif = ext == ".nif" || ext == ".btr" || ext == ".bto";
+            add(path);
+            if (nif && !assets.contains(path)) path = "meshes/" + path;
+            add(path);
+            if (const auto loose = assets.resolveLoose(path); loose && !nif)
+            {
+                try
+                {
+                    for (const auto& dependency : importModel(*loose).sourceFiles)
+                        files.insert(dependency);
+                }
+                // ponytail: a failed parse cannot expose its dependency closure; use a full bake after repairing missing resources.
+                catch (const std::exception&) {} // Bake reports unreadable model diagnostics.
+            }
+            if (nif)
+            {
+                try
+                {
+                    const auto geometry = loadNifModel(assets.extract(path));
+                    for (const auto& surface : geometry.surfaces)
+                    {
+                        add(texturePath(surface.diffuseTexture));
+                        if (surface.materialPath.empty()) continue;
+                        const auto material = materialPath(surface.materialPath);
+                        add(material);
+                        try { add(texturePath(loadMaterial(assets.extract(material)).diffuseTexture)); }
+                        catch (const std::exception&) {} // Bake reports material fallback diagnostics.
+                    }
+                }
+                catch (const std::exception&) {} // Bake reports unreadable model diagnostics.
+            }
+            return dependencies.emplace(model.formId,
+                std::vector<std::filesystem::path>(files.begin(), files.end())).first->second;
+        }
 
         Impl(const std::filesystem::path& input, std::optional<std::filesystem::path> dataDirectory)
             : world(std::filesystem::absolute(input)), data(std::move(dataDirectory)),
@@ -712,7 +777,8 @@ namespace openf4::assets
         {
             for (auto model : stack.models) models.emplace(model.formId, std::move(model));
             for (auto reference : stack.references)
-                if (!reference.deleted && models.contains(reference.placement.baseObject))
+                if (!reference.deleted && models.contains(reference.placement.baseObject)
+                    && models.at(reference.placement.baseObject).kind == ESMModelKind::staticObject)
                     byTile[tileOf(reference.placement.cell)].push_back(std::move(reference));
         }
     };
@@ -742,7 +808,8 @@ namespace openf4::assets
 
     std::vector<std::filesystem::path> StaticLodSource::sourceFiles() const
     {
-        std::set<std::filesystem::path> result{mImpl->world, mImpl->stack.basePath};
+        std::set<std::filesystem::path> result(mImpl->stack.sourcePaths.begin(), mImpl->stack.sourcePaths.end());
+        result.insert(mImpl->world);
         for (const auto& [tile, refs] : mImpl->byTile)
             for (const auto& file : sourceFilesForTile(tile))
                 result.insert(file);
@@ -765,30 +832,17 @@ namespace openf4::assets
         {
             if (!seen.insert(ref.placement.baseObject).second) continue;
             const auto& model = mImpl->models.at(ref.placement.baseObject);
-            const auto source = model.sourceEsm.empty() ? mImpl->world
-                : std::filesystem::path(model.sourceEsm);
-            result.insert(source);
-            AssetResolver resolver(source, mImpl->data);
-            const auto loose = resolver.resolveLoose(model.path);
-            if (!loose) continue;
-            result.insert(*loose);
-            const auto project = AssetResolver::projectAssetRoot(source);
-            const auto relative = loose->lexically_relative(project);
-            if (!relative.empty() && !relative.is_absolute()
-                && *relative.begin() != "..")
-                for (const auto& entry : std::filesystem::recursive_directory_iterator(
-                    loose->parent_path(), std::filesystem::directory_options::skip_permission_denied))
-                    if (entry.is_regular_file()) result.insert(entry.path());
+            for (const auto& file : mImpl->modelDependencies(model)) result.insert(file);
         }
         return {result.begin(), result.end()};
     }
 
     std::vector<std::string> StaticLodSource::diagnostics() const
     {
-        return mImpl->warnings;
+        return {mImpl->warnings.begin(), mImpl->warnings.end()};
     }
 
-    void StaticLodSource::bake(LodStaticTile tile,
+    bool StaticLodSource::bake(LodStaticTile tile,
         const std::filesystem::path& outputPath) const
     {
         if (tile.origin.x != tileBase(tile.origin.x)
@@ -819,8 +873,10 @@ namespace openf4::assets
                 {
                     const auto source = model.sourceEsm.empty() ? mImpl->world
                         : std::filesystem::path(model.sourceEsm);
-                    AssetResolver resolver(source, mImpl->data);
-                    const auto geometry = loadStaticModel(model, resolver);
+                    const auto& resolver = mImpl->resolver(source);
+                    const auto geometry = loadStaticModel(model, resolver, mImpl->warnings);
+                    if (!geometry.skinBones.empty() || !geometry.animations.empty())
+                        mImpl->warnings.insert("Static LOD uses bind-pose snapshot: " + model.path);
                     mesh = meshByBase.emplace(model.formId,
                         glb.mesh(geometry, resolver, model.path)).first;
                 }
@@ -829,8 +885,7 @@ namespace openf4::assets
                     const auto message = "Static LOD skipped STAT "
                         + std::to_string(model.formId) + " (" + model.path + "): "
                         + error.what();
-                    std::cerr << message << '\n';
-                    mImpl->warnings.push_back(message);
+                    mImpl->warnings.insert(message);
                     meshByBase.emplace(model.formId, -1);
                     mesh = meshByBase.find(model.formId);
                 }
@@ -841,6 +896,7 @@ namespace openf4::assets
                 * referenceTransform(ref.placement) * gltfToEngine;
             std::ostringstream json;
             json.imbue(std::locale::classic());
+            json << std::setprecision(std::numeric_limits<float>::max_digits10);
             json << "{\"name\":\"ref_" << std::uppercase << std::hex
                 << std::setw(8) << std::setfill('0') << ref.placement.formId
                 << std::dec << "\",\"mesh\":" << mesh->second << ",\"matrix\":[";
@@ -857,7 +913,8 @@ namespace openf4::assets
             glb.nodes.push_back(json.str());
         }
         if (glb.nodes.empty())
-            throw std::runtime_error("Static LOD tile contains no resolvable static models");
+            return false;
         glb.write();
+        return true;
     }
 }

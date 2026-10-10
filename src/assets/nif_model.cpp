@@ -188,6 +188,7 @@ namespace openf4::assets
             if (nifly::NiShader* shader = file.GetShader(shape))
             {
                 surface.materialPath = shader->name.get();
+                surface.doubleSided = shader->IsDoubleSided();
                 if (const auto* lighting = dynamic_cast<nifly::BSLightingShaderProperty*>(shader))
                 {
                     const std::string rootMaterial = lighting->GetWetMaterialName();
@@ -200,8 +201,12 @@ namespace openf4::assets
             }
             file.GetTextureSlot(shape, surface.diffuseTexture, 0);
             file.GetTextureSlot(shape, surface.normalTexture, 1);
-            if (const auto* alpha = file.GetAlphaProperty(shape); alpha && (alpha->flags & 0x0200) != 0)
-                surface.alphaCutoff = alpha->threshold / 255.0f;
+            if (const auto* alpha = file.GetAlphaProperty(shape))
+            {
+                surface.alphaBlend = (alpha->flags & 1) != 0;
+                if ((alpha->flags & 0x0200) != 0)
+                    surface.alphaCutoff = alpha->threshold / 255.0f;
+            }
             for (std::size_t index = 0; index < positions->size(); ++index)
             {
                 const auto position = transform.ApplyTransform((*positions)[index]);
@@ -265,4 +270,97 @@ namespace openf4::assets
             throw std::runtime_error("NIF contains no renderable triangle geometry");
         return result;
     }
+
+    std::vector<glm::mat4> sampleAnimation(
+        const ModelGeometry& geometry, const ModelAnimationClip& clip, float time)
+    {
+        // Normalize time to the clip duration
+        float normalizedTime = time;
+        if (clip.duration > 0.0f)
+            normalizedTime = std::fmod(time, clip.duration);
+        if (normalizedTime < 0.0f)
+            normalizedTime += clip.duration;
+
+        // Start with bind pose transforms
+        std::vector<glm::mat4> transforms = bindPoseTransforms(geometry);
+
+        // For each bone that has animation data, compute the animated transform
+        for (const auto& channel : clip.channels)
+        {
+            auto boneIt = std::ranges::find_if(geometry.skinBones,
+                [&](const ModelSkinBone& bone) { return bone.name == channel.boneName; });
+            
+            if (boneIt == geometry.skinBones.end())
+                continue;
+
+            std::size_t boneIndex = static_cast<std::size_t>(boneIt - geometry.skinBones.begin());
+
+            // Find the two keyframes that bracket this time
+            std::size_t idx1 = 0;
+            std::size_t idx2 = 0;
+            
+            if (!channel.times.empty())
+            {
+                // Binary search or linear search for the bracketing keyframes
+                for (std::size_t i = 0; i < channel.times.size(); ++i)
+                {
+                    if (channel.times[i] <= normalizedTime)
+                        idx1 = i;
+                }
+                
+                idx2 = (idx1 + 1) % channel.times.size();
+                
+                // Compute interpolation factor
+                float t = 0.0f;
+                if (idx2 != idx1)
+                {
+                    float t1 = channel.times[idx1];
+                    float t2 = channel.times[idx2];
+                    if (t2 > t1)
+                        t = (normalizedTime - t1) / (t2 - t1);
+                }
+                
+                // Interpolate position
+                glm::vec3 position = channel.positions[idx1];
+                if (idx2 != idx1)
+                    position = glm::mix(channel.positions[idx1], channel.positions[idx2], t);
+                
+                // Interpolate rotation (SLERP)
+                glm::quat rotation = channel.rotations[idx1];
+                if (idx2 != idx1)
+                    rotation = glm::slerp(channel.rotations[idx1], channel.rotations[idx2], t);
+                
+                // Interpolate scale
+                glm::vec3 scale = channel.scales[idx1];
+                if (idx2 != idx1)
+                    scale = glm::mix(channel.scales[idx1], channel.scales[idx2], t);
+                
+                // Build the local transform
+                glm::mat4 localTransform = glm::translate(glm::mat4(1.0f), position)
+                    * glm::mat4_cast(rotation)
+                    * glm::scale(glm::mat4(1.0f), scale);
+                
+                // The skinToBone transform converts from skin space to bone space
+                // We need the inverse: bone space to skin space
+                transforms[boneIndex] = localTransform * geometry.skinBones[boneIndex].skinToBone;
+            }
+        }
+
+        return transforms;
+    }
+
+    std::vector<glm::mat4> bindPoseTransforms(const ModelGeometry& geometry)
+    {
+        std::vector<glm::mat4> transforms;
+        transforms.reserve(geometry.skinBones.size());
+        
+        for (const auto& bone : geometry.skinBones)
+        {
+            // In bind pose, the bone transform is the inverse of the skinToBone transform
+            transforms.push_back(glm::inverse(bone.skinToBone));
+        }
+        
+        return transforms;
+    }
+
 }

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <istream>
@@ -680,6 +681,40 @@ namespace openf4::assets
             }
         }
 
+        enum class MaterialProperties { None, Uniform, Unsupported };
+
+        MaterialProperties shapeMaterialProperties(const Packfile& packfile, std::uint32_t shape,
+            const HavokRigidBody& body)
+        {
+            const auto& fixups = packfile.fixups;
+            const auto& data = packfile.sections[packfile.dataSectionIndex];
+            const auto& reader = packfile.reader;
+            if (!fixups.global.contains(shape + 0x20) && !fixups.local.contains(shape + 0x20))
+                return MaterialProperties::None;
+            const auto properties = dataPointer(packfile, shape + 0x20, "Havok shape properties");
+            const auto type = fixups.classes.find(properties);
+            if (type == fixups.classes.end() || type->second != "hkRefCountedProperties")
+                return MaterialProperties::Unsupported;
+            const auto [entries, count] = arrayInfo(reader, data, fixups, properties);
+            requireArrayRange(data, entries, count, 16, "shape properties");
+            if (count != 1 || reader.read<std::uint16_t>(absolute(data, entries + 8)) != 0xf601
+                || reader.read<std::uint16_t>(absolute(data, entries + 10)) != 0)
+                return MaterialProperties::Unsupported;
+            const auto material = dataPointer(packfile, entries, "Havok shape material properties");
+            const auto materialType = fixups.classes.find(material);
+            if (materialType == fixups.classes.end() || materialType->second != "hknpBSMaterialProperties")
+                return MaterialProperties::Unsupported;
+            const auto [materials, materialCount] = arrayInfo(reader, data, fixups, material + 0x10);
+            requireArrayRange(data, materials, materialCount, 24, "Bethesda material");
+            if (materialCount != 1) return MaterialProperties::Unsupported;
+            const auto entry = absolute(data, materials);
+            if (reader.read<std::uint64_t>(entry) || reader.read<std::uint64_t>(entry + 8)
+                || reader.read<std::uint32_t>(entry + 16) != body.collisionFilterInfo
+                || reader.read<std::uint32_t>(entry + 20) != body.materialId)
+                return MaterialProperties::Unsupported;
+            return MaterialProperties::Uniform;
+        }
+
         [[nodiscard]] HavokPhysicsSystem readPhysicsSystemData(const Packfile& packfile)
         {
             const Reader& reader = packfile.reader;
@@ -689,6 +724,12 @@ namespace openf4::assets
                 reader, data, fixups, packfile.rootOffset + 0x40);
             const auto [motionOffset, motionCount] = arrayInfo(
                 reader, data, fixups, packfile.rootOffset + 0x30);
+            const auto [materialsOffset, materialCount] = arrayInfo(
+                reader, data, fixups, packfile.rootOffset + 0x10);
+            const auto [propertiesOffset, propertiesCount] = arrayInfo(
+                reader, data, fixups, packfile.rootOffset + 0x20);
+            requireArrayRange(data, materialsOffset, materialCount, 0x50, "material");
+            requireArrayRange(data, propertiesOffset, propertiesCount, 0x40, "motion properties");
             if (bodyCount > (data.localFixups - bodiesOffset) / 0x60)
                 throw std::runtime_error("Havok body array is out of bounds");
             if (motionCount > bodyCount
@@ -696,6 +737,20 @@ namespace openf4::assets
                 throw std::runtime_error("Havok motion array is out of bounds");
 
             HavokPhysicsSystem system;
+            if (reader.read<std::uint32_t>(absolute(data, packfile.rootOffset + 0x58)) != 0)
+                system.nativeRewriteBlockReason = "Havok constraints must be preserved in their original packfile";
+            if (fixups.local.contains(packfile.rootOffset + 0x70)
+                || fixups.global.contains(packfile.rootOffset + 0x70))
+                system.nativeRewriteBlockReason = "Named Havok systems require raw preservation";
+            for (const auto& [offset, name] : fixups.classes)
+            {
+                if (name != "hknpPhysicsSystemData" && name != "hknpConvexPolytopeShape"
+                    && name != "hknpConvexShape" && name != "hknpCapsuleShape"
+                    && name != "hknpDynamicCompoundShape" && name != "hknpDynamicCompoundShapeData"
+                    && name != "hknpCompressedMeshShape" && name != "hknpCompressedMeshShapeData"
+                    && name != "hkRefCountedProperties" && name != "hknpBSMaterialProperties")
+                    system.nativeRewriteBlockReason = "Unsupported Havok property objects must be preserved in their original packfile";
+            }
             system.bodies.reserve(bodyCount);
             for (std::uint32_t index = 0; index < bodyCount; ++index)
             {
@@ -710,6 +765,39 @@ namespace openf4::assets
                 const std::size_t body = absolute(data, bodyOffset);
                 HavokRigidBody result;
                 result.bodyIndex = index;
+                result.collisionFilterInfo = reader.read<std::uint32_t>(body + 0x14);
+                result.materialId = reader.read<std::uint32_t>(absolute(
+                    data, shapeFixup->second.offset + 0x18));
+                if (reader.read<std::uint32_t>(absolute(data, shapeFixup->second.offset + 0x1c)) != 0)
+                    system.nativeRewriteBlockReason = "Custom Havok shape user data requires raw preservation";
+                const auto materialProperties = shapeMaterialProperties(packfile, shapeFixup->second.offset, result);
+                bool uniformMeshMaterial = materialProperties == MaterialProperties::Uniform;
+                if (materialProperties == MaterialProperties::Unsupported)
+                    system.nativeRewriteBlockReason = "Havok shape properties require raw preservation";
+                if (reader.read<std::uint32_t>(body + 0x18) != 0
+                    || reader.read<std::uint64_t>(body + 0x28) != 0
+                    || reader.read<std::uint32_t>(body + 0x1c) != 0
+                    || fixups.local.contains(bodyOffset + 0x20) || fixups.global.contains(bodyOffset + 0x20))
+                    system.nativeRewriteBlockReason = "Havok body flags, names, or custom data require raw preservation";
+                const auto materialIndex = reader.read<std::uint16_t>(body + 0x12);
+                if (materialCount != 0)
+                {
+                    if (materialIndex >= materialCount)
+                        throw std::runtime_error("Havok body has an invalid material index");
+                    const auto material = absolute(data, materialsOffset + materialIndex * 0x50);
+                    if (reader.read<std::uint16_t>(material + 0x12) != reader.read<std::uint16_t>(material + 0x14)
+                        || reader.read<std::uint8_t>(material + 0x10) != 0
+                        || reader.read<std::uint64_t>(material + 0x40) != 0
+                        || fixups.global.contains(materialsOffset + materialIndex * 0x50 + 0x30))
+                        system.nativeRewriteBlockReason = "Custom Havok material properties require raw preservation";
+                    result.friction = std::bit_cast<float>(
+                        std::uint32_t(reader.read<std::uint16_t>(material + 0x12)) << 16);
+                    result.restitution = std::bit_cast<float>(
+                        std::uint32_t(reader.read<std::uint16_t>(material + 0x16)) << 16);
+                    if (!std::isfinite(result.friction) || result.friction < 0.0f
+                        || !std::isfinite(result.restitution) || result.restitution < 0.0f)
+                        throw std::runtime_error("Havok body has invalid contact properties");
+                }
                 const std::uint32_t motionId = reader.read<std::uint32_t>(body + 0x0c);
                 result.position = {reader.read<float>(body + 0x30),
                     reader.read<float>(body + 0x34), reader.read<float>(body + 0x38)};
@@ -732,15 +820,85 @@ namespace openf4::assets
                     const float inverseMass = reader.read<float>(inertia + 4);
                     if (!std::isfinite(inverseMass) || inverseMass < 0.0f)
                         throw std::runtime_error("Havok body has an invalid inverse mass");
-                    if (inverseMass > std::numeric_limits<float>::epsilon())
+                    if (inverseMass > 0.0f)
                         result.mass = 1.0f / inverseMass;
+                    if (!std::isfinite(result.mass))
+                        throw std::runtime_error("Havok body has an unbounded mass");
+                    const glm::vec3 inverseInertia(reader.read<float>(inertia + 0x20),
+                        reader.read<float>(inertia + 0x24), reader.read<float>(inertia + 0x28));
+                    if (!finite(inverseInertia) || glm::any(glm::lessThan(inverseInertia, glm::vec3(0))))
+                        throw std::runtime_error("Havok body has invalid inverse inertia");
+                    if (glm::all(glm::greaterThan(inverseInertia, glm::vec3(0))))
+                        result.inertiaDiagonal = glm::vec3(1) / inverseInertia;
+                    if (!finite(result.inertiaDiagonal))
+                        throw std::runtime_error("Havok body has unbounded inertia");
+                    const glm::vec3 center(reader.read<float>(inertia + 0x30),
+                        reader.read<float>(inertia + 0x34), reader.read<float>(inertia + 0x38));
+                    if (!finite(center))
+                        throw std::runtime_error("Havok body has invalid center of mass");
+                    result.centerOfMass = glm::inverse(result.rotation) * (center - result.position);
+                    const glm::quat orientation(reader.read<float>(inertia + 0x4c),
+                        reader.read<float>(inertia + 0x40), reader.read<float>(inertia + 0x44),
+                        reader.read<float>(inertia + 0x48));
+                    if (std::isfinite(glm::dot(orientation, orientation))
+                        && glm::dot(orientation, orientation) > 0.0f)
+                        result.inertiaOrientation = glm::inverse(result.rotation) * glm::normalize(orientation);
+                    const auto propertyIndex = reader.read<std::uint16_t>(inertia);
+                    for (std::uint32_t offset = 0x50; offset < 0x70; offset += 4)
+                        if (reader.read<std::uint32_t>(inertia + offset) != 0)
+                            system.nativeRewriteBlockReason = "Havok initial motion requires raw preservation";
+                    if (propertiesCount != 0 && propertyIndex != 0xffff)
+                    {
+                        if (propertyIndex >= propertiesCount)
+                            throw std::runtime_error("Havok body has invalid motion properties index");
+                        const auto properties = absolute(data, propertiesOffset + propertyIndex * 0x40);
+                        result.gravityFactor = reader.read<float>(properties + 8);
+                        result.maxLinearVelocity = reader.read<float>(properties + 0x10);
+                        result.maxAngularVelocity = reader.read<float>(properties + 0x14);
+                        result.linearDamping = reader.read<float>(properties + 0x18);
+                        result.angularDamping = reader.read<float>(properties + 0x1c);
+                        for (const float value : {result.gravityFactor, result.maxLinearVelocity,
+                                result.maxAngularVelocity, result.linearDamping, result.angularDamping})
+                            if (!std::isfinite(value))
+                                throw std::runtime_error("Havok body has invalid motion properties");
+                        const auto gravityFlag = result.gravityFactor != 1 ? 0x20000000u : 0u;
+                        const auto profile = [&](bool legacy) {
+                            return reader.read<std::uint32_t>(properties + 4) == (gravityFlag | (legacy ? 2u : 0u))
+                                && reader.read<std::uint32_t>(properties + 36) == (legacy ? 0x3efb22d1u : 0x3efb22d2u)
+                                && reader.read<std::uint32_t>(properties + 40) == (legacy ? 0x3b23d70au : 0x3b23d70bu)
+                                && reader.read<std::uint32_t>(properties + 44) == (legacy ? 0x3b23d70au : 0x3b23d70bu)
+                                && reader.read<std::uint32_t>(properties + 52) == (legacy ? 0u : 0x999b67ffu)
+                                && reader.read<std::uint32_t>(properties + 56) == (legacy ? 0u : 0x06757304u)
+                                && reader.read<std::uint32_t>(properties + 60) == (legacy ? 0u : 0x00000073u);
+                        };
+                        if (profile(true)) result.motionProfile = HavokMotionProfile::legacyOpenF4;
+                        else if (!profile(false))
+                            system.nativeRewriteBlockReason = "Unsupported Havok motion/deactivation profile requires raw preservation";
+                    }
                 }
                 if (shapeClass->second == "hknpCompressedMeshShape")
                     result.triangleMesh = readCompressedMesh(reader, data, fixups,
                         packfile.dataSectionIndex, shapeFixup->second.offset);
                 else if (shapeClass->second == "hknpDynamicCompoundShape")
+                {
                     readCompoundShapes(reader, data, fixups, packfile.dataSectionIndex,
                         shapeFixup->second.offset, result);
+                    const auto [instances, instanceCount] = arrayInfo(reader, data, fixups,
+                        shapeFixup->second.offset + 0x60);
+                    uniformMeshMaterial = true;
+                    for (std::uint32_t part = 0; part < instanceCount; ++part)
+                    {
+                        const auto child = dataPointer(packfile, instances + part * 0x80 + 0x50, "Havok compound child");
+                        if (reader.read<std::uint64_t>(absolute(data, child + 0x18)) != result.materialId)
+                            system.nativeRewriteBlockReason = "Per-part Havok materials require raw preservation";
+                        const auto properties = shapeMaterialProperties(packfile, child, result);
+                        if (properties == MaterialProperties::Unsupported)
+                            system.nativeRewriteBlockReason = "Havok child shape properties require raw preservation";
+                        if (fixups.classes.at(child) == "hknpCompressedMeshShape"
+                            && properties != MaterialProperties::Uniform)
+                            uniformMeshMaterial = false;
+                    }
+                }
                 else if (shapeClass->second == "hknpConvexPolytopeShape"
                     || shapeClass->second == "hknpConvexShape")
                     result.parts.push_back({glm::mat4(1.0f), glm::vec3(1.0f),
@@ -755,6 +913,11 @@ namespace openf4::assets
                         + shapeClass->second);
                 if (result.parts.empty() && result.capsules.empty() && !result.triangleMesh)
                     throw std::runtime_error("Havok body has an invalid shape representation");
+                if (result.triangleMesh && uniformMeshMaterial)
+                    for (auto& run : result.triangleMesh->primitiveDataRuns)
+                        if (run.value == 0) run.value = 0xffff;
+                        else if (run.value != 0xffff)
+                            system.nativeRewriteBlockReason = "Havok per-primitive materials require raw preservation";
                 system.bodies.push_back(std::move(result));
             }
             return system;
@@ -910,6 +1073,55 @@ namespace openf4::assets
         if (packfile.rootClass != "hknpPhysicsSystemData")
             throw std::runtime_error("Havok root is not hknpPhysicsSystemData");
         return readPhysicsSystemData(packfile);
+    }
+
+    HavokPhysicsSystem loadEditableHavokPhysicsSystem(std::span<const std::byte> bytes)
+    {
+        const Packfile packfile = readPackfile(bytes);
+        if (packfile.rootClass != "hknpPhysicsSystemData")
+            throw std::runtime_error("Havok root is not hknpPhysicsSystemData");
+        auto system = readPhysicsSystemData(packfile);
+        if (!system.nativeRewriteBlockReason.empty())
+            throw std::runtime_error("Collision requires untouched raw preservation: " + system.nativeRewriteBlockReason);
+        const auto encoded = serializeHavokPhysicsSystem(system);
+        const auto fail = [] {
+            throw std::runtime_error("Collision is not losslessly editable; preserve the original payload and use Save Native As");
+        };
+        if (encoded.size() != bytes.size()) fail();
+        auto comparable = std::vector<std::byte>(bytes.begin(), bytes.end());
+        const Reader rewritten(encoded);
+        const auto& data = packfile.sections[packfile.dataSectionIndex];
+        const auto [bodies, bodyCount] = arrayInfo(packfile.reader, data, packfile.fixups, packfile.rootOffset + 0x40);
+        const auto [motions, motionCount] = arrayInfo(packfile.reader, data, packfile.fixups, packfile.rootOffset + 0x30);
+        const auto roundoff = [&](std::uint32_t relative, float absoluteTolerance, float relativeTolerance) {
+            const auto offset = absolute(data, relative);
+            const float before = packfile.reader.read<float>(offset), after = rewritten.read<float>(offset);
+            const float tolerance = std::min(0.0001f, absoluteTolerance
+                + relativeTolerance * std::max(std::abs(before), std::abs(after)));
+            if (!std::isfinite(before) || !std::isfinite(after) || std::abs(before - after) > tolerance) fail();
+            std::memcpy(comparable.data() + offset, encoded.data() + offset, sizeof(float));
+        };
+        // Only represented floats may differ: converting mass frames and normalizing quaternions rounds.
+        // Every other byte (including quality, flags, solver data and shape trees) remains an exact check.
+        constexpr float relativeTolerance = 8 * std::numeric_limits<float>::epsilon();
+        for (std::uint32_t index = 0; index < bodyCount; ++index)
+            for (std::uint32_t component = 0; component < 4; ++component)
+                roundoff(bodies + index * 0x60 + 0x40 + component * 4, 0.000002f, 0);
+        for (std::uint32_t index = 0; index < motionCount; ++index)
+        {
+            const auto motion = motions + index * 0x70;
+            roundoff(motion + 4, 0, relativeTolerance);
+            for (std::uint32_t component = 0; component < 3; ++component)
+            {
+                roundoff(motion + 0x20 + component * 4, 0, relativeTolerance);
+                roundoff(motion + 0x30 + component * 4, 0.000002f, relativeTolerance);
+            }
+            for (std::uint32_t component = 0; component < 4; ++component)
+                roundoff(motion + 0x40 + component * 4, 0.000002f, 0);
+        }
+        // ponytail: Alternate native layouts stay raw-only until all their metadata can be preserved.
+        if (!std::ranges::equal(comparable, encoded)) fail();
+        return system;
     }
 
     HavokRagdoll loadHavokRagdoll(std::span<const std::byte> bytes)

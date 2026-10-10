@@ -76,7 +76,7 @@ void writeFile(const std::filesystem::path& path, const Bytes& bytes)
     require(bool(file), "Cannot write fixture");
 }
 using Edit = std::function<void(Bytes&)>;
-Bytes rewrite(std::span<const std::byte> bytes, const Edit& edit)
+Bytes rewrite(std::span<const std::byte> bytes, const Edit& edit, bool editGroups = false)
 {
     Bytes output;
     for (std::size_t p = 0; p < bytes.size();)
@@ -85,7 +85,11 @@ Bytes rewrite(std::span<const std::byte> bytes, const Edit& edit)
         const std::size_t size = get<std::uint32_t>(bytes, p + 4) + (isGroup ? 0u : 24u);
         require(size >= 24 && size <= bytes.size() - p, "Invalid group size");
         Bytes current(bytes.begin() + p, bytes.begin() + p + 24);
-        if (isGroup) append(current, rewrite(bytes.subspan(p + 24, size - 24), edit));
+        if (isGroup)
+        {
+            append(current, rewrite(bytes.subspan(p + 24, size - 24), edit, editGroups));
+            if (editGroups) edit(current);
+        }
         else { current.insert(current.end(), bytes.begin() + p + 24, bytes.begin() + p + size); edit(current); }
         patch(current, 4, std::uint32_t(current.size() - (isGroup ? 0u : 24u))); append(output, current); p += size;
     }
@@ -94,6 +98,12 @@ Bytes rewrite(std::span<const std::byte> bytes, const Edit& edit)
 bool contains(const Bytes& bytes, const Bytes& needle)
 {
     return std::search(bytes.begin(), bytes.end(), needle.begin(), needle.end()) != bytes.end();
+}
+Bytes findRecord(const Bytes& bytes, std::uint32_t id)
+{
+    Bytes result;
+    (void)rewrite(bytes, [&](Bytes& record) { if (get<std::uint32_t>(record, 12) == id) result = record; });
+    return result;
 }
 glm::mat4 at(float x, float y = 0, float z = 0)
 {
@@ -327,6 +337,330 @@ void testInheritedReferences(const std::filesystem::path& root)
     require(editor.undo(), "Inherited deletion undo failed"); editor.save();
     require(loadEsmMasterStack(editor.path()).references.size() == 1, "Undo did not replace deletion tombstone");
 }
+void testInheritedRecordPreservation(const std::filesystem::path& root)
+{
+    using openf4::editor::EditorDocument;
+    const auto base = root / "native-record-preservation.esm";
+    EditorDocument source(base);
+    const auto model = source.addModel("models/native.nif");
+    const auto reference = source.place(model, at(128)); source.save();
+    EsmDocument original(base);
+    const auto terrain = *original.terrainCell({0, 0});
+    const auto world = original.worldFormId();
+    const auto cellMetadata = sub("XCLL", text("original CELL lighting and unknown data"));
+    const auto landMetadata = sub("ZZLD", text("original normals textures and unknown data"));
+    Bytes parent; put(parent, reference); put(parent, std::uint32_t{1});
+    const auto refMetadata = sub("XESP", parent);
+    const auto bytes = rewrite(readFile(base), [&](Bytes& record) {
+        const auto type = get<std::uint32_t>(record, 0), id = get<std::uint32_t>(record, 12);
+        if (type == cc("TES4"))
+        {
+            const auto marker = text("OpenF4"); const auto found = std::search(record.begin(), record.end(), marker.begin(), marker.end());
+            require(found != record.end(), "Missing source author"); *found = std::byte{'X'};
+            patch(record, 8, get<std::uint32_t>(record, 8) | 0x80u);
+        }
+        if (id == world)
+        {
+            Bytes localizedName; put(localizedName, std::uint32_t{0x123456});
+            append(record, sub("FULL", localizedName)); append(record, sub("ZZWD", text("native world metadata")));
+            patch(record, 16, 0x87654321u);
+        }
+        if (id == terrain.cellFormId) { append(record, cellMetadata); patch(record, 16, 0x10203040u); }
+        if (id == terrain.landFormId) append(record, landMetadata);
+        if (id == reference) { append(record, refMetadata); patch(record, 8, 0x800u); patch(record, 16, 0xabcdef01u); }
+    }); writeFile(base, bytes);
+
+    EditorDocument editor(base);
+    require(findRecord(readFile(editor.path()), world) == findRecord(bytes, world), "Overlay changed native WRLD bytes or localized name ID");
+    editor.setTransform(reference, at(256)); editor.save();
+    auto saved = readFile(editor.path());
+    require(findRecord(saved, terrain.cellFormId) == findRecord(bytes, terrain.cellFormId), "Object placement rebuilt inherited CELL metadata");
+    require(findRecord(saved, terrain.landFormId).empty(), "Object-only edit wrote an unchanged inherited LAND override");
+    const auto refBytes = findRecord(saved, reference);
+    require(contains(refBytes, refMetadata) && get<std::uint32_t>(refBytes, 8) == 0x800u
+        && get<std::uint32_t>(refBytes, 16) == 0xabcdef01u, "Inherited REFR edit lost unknown fields or source header");
+    require(!editor.dirty(), "Saved inherited edit stayed dirty");
+    const auto placement = editor.place(model, at(4352)); editor.save();
+    const auto neighbor = *EsmDocument(base).terrainCell({1, 0});
+    saved = readFile(editor.path());
+    require(findRecord(saved, neighbor.cellFormId) == findRecord(bytes, neighbor.cellFormId)
+        && findRecord(saved, neighbor.landFormId).empty() && !findRecord(saved, placement).empty(),
+        "New object placement replaced inherited CELL metadata or wrote unchanged LAND");
+
+    EditorDocument reopened(editor.path());
+    reopened.setTransform(reference, at(512)); reopened.save();
+    require(findRecord(readFile(editor.path()), terrain.landFormId).empty(), "Reopened object-only edit introduced LAND override");
+    auto sculpted = *reopened.terrainSnapshot(); sculpted.nextFormId = reopened.nextFormId();
+    sculpted.setSample({8, 8}, 8); reopened.synchronizeTerrain(sculpted); reopened.save();
+    const auto landBytes = findRecord(readFile(editor.path()), terrain.landFormId);
+    require(contains(landBytes, landMetadata), "Inherited LAND edit lost source subrecords");
+    require(EsmDocument(editor.path()).terrainCell({0, 0})->landscape.heights[8 * 33 + 8] == 8,
+        "Inherited LAND height edit did not persist");
+    reopened.erase(reference); reopened.save();
+    const auto deleted = findRecord(readFile(editor.path()), reference);
+    require((get<std::uint32_t>(deleted, 8) & 0x20u) && contains(deleted, refMetadata), "Inherited tombstone lost source metadata");
+    require(reopened.undo(), "Inherited tombstone undo failed"); reopened.save();
+    require(!(get<std::uint32_t>(findRecord(readFile(editor.path()), reference), 8) & 0x20u), "Undo retained inherited deletion flag");
+    require(readFile(base) == bytes, "Inherited patching changed the protected source");
+
+    const auto bad = root / "remapped-records.openf4.esm";
+    auto wrongMasters = readFile(editor.path());
+    const auto master = text("Fallout4.esm"); auto found = std::search(wrongMasters.begin(), wrongMasters.end(), master.begin(), master.end());
+    require(found != wrongMasters.end(), "Missing master-table fixture"); *found = std::byte{'X'};
+    writeFile(bad, wrongMasters);
+    // A fresh inherited record forces the source-preservation guard rather than patching a local prototype.
+    auto inherited = EsmDocument(base).references().front(); inherited.placement.formId = 0x02009900u;
+    EsmDocument incompatible(bad); incompatible.setReferences({inherited});
+    rejects([&] { incompatible.save(); }, "Inherited REFR accepted reordered master slots");
+    require(readFile(bad) == wrongMasters, "Rejected inherited save changed its destination");
+    auto missing = inherited; missing.placement.formId = 0x01009901u; missing.recordSource = {};
+    incompatible.setReferences({missing});
+    rejects([&] { incompatible.save(); }, "Inherited REFR without provenance was rebuilt from incomplete fields");
+    require(readFile(bad) == wrongMasters, "Missing-provenance rejection changed its destination");
+}
+
+void testPersistentReferencePreservation(const std::filesystem::path& root)
+{
+    using openf4::editor::EditorDocument;
+    const auto base = root / "persistent-record-preservation.esm";
+    EditorDocument source(base); const auto model = source.addModel("models/persistent.nif"); source.save();
+    const auto world = source.worldFormId();
+    constexpr std::uint32_t cell = 0x01009800u, reference = 0x01009801u;
+    Bytes cellFields = sub("EDID", text("NativePersistentCell")); append(cellFields, sub("DATA", Bytes(2)));
+    append(cellFields, sub("ZZCL", text("persistent CELL metadata")));
+    const auto cellBytes = record("CELL", cell, cellFields);
+    Bytes refFields = sub("EDID", text("PersistentNativeRef")); Bytes name; put(name, model); append(refFields, sub("NAME", name));
+    Bytes transform; for (float value : {128.f, 128.f, 64.f, 0.f, 0.f, 0.f}) put(transform, value);
+    append(refFields, sub("DATA", transform)); const auto unknown = sub("VMAD", text("opaque persistent script metadata")); append(refFields, unknown);
+    auto refBytes = record("REFR", reference, refFields); patch(refBytes, 8, 0x400u);
+    Bytes persistent = cellBytes; append(persistent, group(cell, 6, group(cell, 8, refBytes)));
+    const auto bytes = rewrite(readFile(base), [&](Bytes& record) {
+        if (get<std::uint32_t>(record, 0) == cc("TES4"))
+        {
+            const auto marker = text("OpenF4"); const auto found = std::search(record.begin(), record.end(), marker.begin(), marker.end());
+            require(found != record.end(), "Missing persistent source author"); *found = std::byte{'X'};
+        }
+        if (get<std::uint32_t>(record, 0) == cc("GRUP") && get<std::uint32_t>(record, 8) == world
+            && get<std::uint32_t>(record, 12) == 1) append(record, persistent);
+    }, true); writeFile(base, bytes);
+    EditorDocument editor(base);
+    editor.setTransform(reference, at(17000)); editor.save();
+    auto document = EsmDocument(editor.path());
+    require(document.references().size() == 1 && document.references()[0].ownerCellFormId == cell
+        && document.references()[0].childGroupType == 8 && document.references()[0].placement.cell == CellCoord{4, 0},
+        "Persistent move changed ownership or lost its spatial streaming CELL");
+    require(document.terrainCells().empty(), "Persistent move created unrelated exterior CELL/LAND overrides");
+    const auto saved = readFile(editor.path());
+    require(findRecord(saved, cell) == cellBytes && contains(findRecord(saved, reference), unknown), "Persistent save lost raw CELL/REFR metadata");
+    EditorDocument reopened(editor.path()); reopened.setTransform(reference, at(-17000)); reopened.save();
+    document = EsmDocument(editor.path());
+    require(document.references()[0].childGroupType == 8 && document.references()[0].ownerCellFormId == cell
+        && document.references()[0].placement.cell == CellCoord{-5, 0},
+        "Reopened persistent move lost ownership");
+    reopened.erase(reference); reopened.save();
+    require(loadEsmMasterStack(editor.path()).references.empty(), "Persistent deletion did not produce a merged tombstone");
+    require(readFile(base) == bytes, "Persistent edits changed the source master");
+}
+std::uint32_t checkModelGroups(std::span<const std::byte> bytes, std::uint32_t parent = 0)
+{
+    std::uint32_t count = 0;
+    std::optional<std::uint32_t> expectedCount;
+    for (std::size_t p = 0; p < bytes.size();)
+    {
+        const auto type = get<std::uint32_t>(bytes, p);
+        const bool grouped = type == cc("GRUP");
+        const auto size = std::size_t(get<std::uint32_t>(bytes, p + 4)) + (grouped ? 0 : 24);
+        require(size >= 24 && size <= bytes.size() - p, "Broken model group size");
+        if (grouped)
+        {
+            const auto label = get<std::uint32_t>(bytes, p + 8);
+            count += checkModelGroups(bytes.subspan(p + 24, size - 24), label);
+        }
+        else if (type == cc("TES4"))
+        {
+            for (auto s = p + 24; s < p + size; s += 6 + get<std::uint16_t>(bytes, s + 4))
+                if (get<std::uint32_t>(bytes, s) == cc("HEDR")) expectedCount = get<std::uint32_t>(bytes, s + 10);
+        }
+        else if (type == cc("STAT") || type == cc("MSTT"))
+        {
+            require(parent == type, "Model was written under the wrong top-level group");
+            bool bounds = false, data = false;
+            for (auto s = p + 24; s < p + size;)
+            {
+                const auto name = get<std::uint32_t>(bytes, s);
+                const auto length = get<std::uint16_t>(bytes, s + 4);
+                bounds |= name == cc("OBND") && length == 12;
+                data |= type == cc("STAT") ? name == cc("DNAM") && length == 16 : name == cc("DATA") && length == 1;
+                s += 6 + length;
+            }
+            require(bounds && data, "New native model omitted required record fields");
+        }
+        if (type != cc("TES4")) ++count;
+        p += size;
+    }
+    if (expectedCount) require(*expectedCount == count, "HEDR did not count model records and groups correctly");
+    return count;
+}
+void testNativeModelCommands(const std::filesystem::path& root)
+{
+    using openf4::editor::EditorDocument;
+    const auto path = root / "native-commands.esm";
+    EditorDocument editor(path);
+    const auto original = editor.addModel("models/original.glb", "original-source.glb");
+    const auto first = editor.place(original, at(128));
+    const auto second = editor.place(original, at(1024));
+    editor.save();
+    const auto saved = readFile(path);
+    const std::string package = "meshes/openf4/native/model.nif";
+    std::filesystem::create_directories(editor.assetRoot() / "meshes/openf4/native");
+    writeFile(editor.assetRoot() / package, text("published package; format is tested by native_model_export"));
+    require(editor.assignNativeModel(original, package, ESMModelKind::staticObject) == original,
+        "Shared native assignment changed same-kind FormID");
+    require(editor.references()[0].placement.baseObject == original && editor.references()[1].placement.baseObject == original
+        && editor.model(original)->path == package && editor.sourcePath(original) == "original-source.glb",
+        "Shared native assignment lost reference identity or import provenance");
+    require(editor.dirty() && readFile(path) == saved, "Native assignment implicitly saved the world");
+    require(editor.undo() && !editor.dirty() && editor.model(original)->path == "models/original.glb",
+        "Native assignment undo did not restore source model");
+    require(editor.redo(), "Native assignment redo failed");
+    const auto movable = editor.assignNativeModel(original, package, ESMModelKind::movableStatic);
+    require(movable != original && editor.model(original)->kind == ESMModelKind::staticObject
+        && editor.model(movable)->kind == ESMModelKind::movableStatic, "Type change reinterpreted an existing FormID");
+    require(editor.references()[0].placement.baseObject == movable && editor.references()[1].placement.baseObject == movable,
+        "Type change did not retarget every shared reference atomically");
+    editor.save(); checkModelGroups(readFile(path));
+    EditorDocument reopened(path);
+    require(reopened.model(movable)->kind == ESMModelKind::movableStatic
+        && reopened.model(original)->kind == ESMModelKind::staticObject
+        && reopened.model(movable)->path == "openf4/native/model.nif", "Native model kind/path did not reload");
+    require(editor.undo(), "Type change undo failed"); editor.save();
+    require(!EditorDocument(path).model(movable), "Undo/save retained the now-unreferenced type-change record");
+    const auto unique = editor.makeUnique(first, package, ESMModelKind::staticObject);
+    require(unique != original && editor.references()[0].placement.baseObject == unique
+        && editor.references()[1].placement.baseObject == original, "Make Unique changed more than its selected reference");
+    require(editor.undo() && !editor.model(unique)
+        && editor.references()[0].placement.baseObject == original, "Make Unique was not one undo command");
+    require(editor.redo(), "Make Unique redo failed");
+    editor.retarget(second, unique);
+    require(editor.references()[1].placement.baseObject == unique && editor.undo()
+        && editor.references()[1].placement.baseObject == original, "Reference retarget undo failed");
+    const auto next = editor.nextFormId(); const auto refs = editor.references(); const auto paths = editor.models();
+    rejects([&] { (void)editor.assignNativeModel(unique, "meshes/missing.nif", ESMModelKind::movableStatic); }, "Missing native package was accepted");
+    rejects([&] { (void)editor.assignNativeModel(unique, (editor.assetRoot() / package).string(), ESMModelKind::movableStatic); }, "Absolute native package path was accepted");
+    rejects([&] { (void)editor.makeUnique(first, "../native-commands.assets/" + package, ESMModelKind::staticObject); }, "Traversing native package path was accepted");
+    rejects([&] { editor.retarget(first, 0); }, "Unknown model retarget was accepted");
+    require(editor.nextFormId() == next && editor.references() == refs && editor.models() == paths,
+        "Failed native command changed state or allocated a FormID");
+    editor.setLocked(first, true);
+    rejects([&] { (void)editor.makeUnique(first, package, ESMModelKind::staticObject); }, "Locked reference was made unique");
+    editor.setLocked(first, false); editor.save();
+    EditorDocument uniqueReload(path);
+    require(uniqueReload.model(unique) && uniqueReload.references()[0].placement.baseObject == unique
+        && uniqueReload.references()[1].placement.baseObject == original, "Unique model did not save/reload");
+    require(std::filesystem::exists(editor.assetRoot() / package), "Undo removed an immutable published package");
+    EsmDocument invalid(path); auto models = invalid.models();
+    models.front().kind = ESMModelKind::movableStatic; invalid.setModels(models);
+    const auto beforeFailure = readFile(path);
+    rejects([&] { invalid.save(); }, "Low-level writer allowed same-ID record type reinterpretation");
+    require(readFile(path) == beforeFailure, "Rejected type reinterpretation damaged the ESM");
+}
+void testInheritedNativeModel(const std::filesystem::path& root)
+{
+    using openf4::editor::EditorDocument;
+    const auto base = root / "inherited-native.esm";
+    EditorDocument original(base);
+    const auto model = original.addModel("models/inherited.glb");
+    const auto ref = original.place(model, at(128)); original.save();
+    const auto unknown = sub("ZZZZ", text("inherited opaque model metadata"));
+    const auto source = rewrite(readFile(base), [&](Bytes& rec) {
+        if (get<std::uint32_t>(rec, 12) == model) append(rec, unknown);
+        if (get<std::uint32_t>(rec, 0) == cc("TES4"))
+        {
+            const auto marker = text("OpenF4"); const auto found = std::search(rec.begin(), rec.end(), marker.begin(), marker.end());
+            require(found != rec.end(), "Missing inherited ownership marker"); *found = std::byte{'X'};
+        }
+    }); writeFile(base, source);
+    EditorDocument editor(base);
+    const std::string package = "meshes/new-native.nif";
+    std::filesystem::create_directories(editor.assetRoot() / "meshes");
+    writeFile(editor.assetRoot() / package, text("native fixture"));
+    require(editor.model(model)->recordSourceEsm == base.string(), "Inherited record provenance was lost");
+    require(editor.assignNativeModel(model, package, ESMModelKind::staticObject) == model, "Inherited override allocated an unnecessary ID");
+    editor.save();
+    require(readFile(base) == source && contains(readFile(editor.path()), unknown), "Inherited native override lost raw fields or changed its master");
+    auto stack = loadEsmMasterStack(editor.path());
+    require(stack.models.size() == 1 && stack.models[0].sourceEsm == editor.path().string()
+        && stack.references.size() == 1 && stack.references[0].placement.formId == ref, "Inherited native override did not resolve from project assets");
+    require(editor.undo(), "Inherited native override undo failed"); editor.save();
+    require(EsmDocument(editor.path()).models().empty(), "Undo/save retained the inherited model override");
+    stack = loadEsmMasterStack(editor.path());
+    require(stack.models[0].path == "models/inherited.glb" && stack.models[0].sourceEsm == base.string(), "Undo/save did not restore inherited asset source");
+    const auto unique = editor.makeUnique(ref, package, ESMModelKind::staticObject); editor.save();
+    require(contains(readFile(editor.path()), unknown) && EditorDocument(editor.path()).model(unique), "Inherited Make Unique lost unknown model fields");
+    require(readFile(base) == source, "Inherited Make Unique modified its master");
+    const auto bad = createEditorOverlay(editor.path());
+    EsmDocument invalid(bad);
+    invalid.setModels({{model, "WrongKind", "new-native.nif", {}, {}, ESMModelKind::movableStatic}});
+    invalid.save();
+    rejects([&] { (void)loadEsmMasterStack(bad); }, "Master stack accepted cross-master FormID type reinterpretation");
+}
+void testNativeCommandRollback(const std::filesystem::path& root)
+{
+    using openf4::editor::EditorDocument;
+    const auto base = root / "native-rollback.esm";
+    EditorDocument original(base);
+    const auto model = original.addModel("models/rollback.glb");
+    const auto other = original.addModel("models/other.glb");
+    const auto first = original.place(model, at(128));
+    (void)original.place(model, at(512)); original.save();
+    const auto source = rewrite(readFile(base), [&](Bytes& rec) {
+        if (get<std::uint32_t>(rec, 0) != cc("TES4")) return;
+        const auto marker = text("OpenF4"); const auto found = std::search(rec.begin(), rec.end(), marker.begin(), marker.end());
+        require(found != rec.end(), "Missing rollback fixture ownership marker"); *found = std::byte{'X'};
+    }); writeFile(base, source);
+    EditorDocument editor(base);
+    const auto overlayBytes = readFile(editor.path());
+    const std::string package = "meshes/published.nif";
+    const auto packageBytes = text("immutable published fixture");
+    std::filesystem::create_directories(editor.assetRoot() / "meshes");
+    writeFile(editor.assetRoot() / package, packageBytes);
+    editor.setVisible(first, false); require(editor.undo(), "Rollback fixture could not create redo history");
+    const auto refs = editor.references(); const auto models = editor.models();
+    const auto terrain = editor.terrainSnapshot(); const auto next = editor.nextFormId();
+    const auto unavailable = root / "native-rollback.offline";
+    const auto failsWithoutMaster = [&](const std::function<void()>& operation) {
+        std::filesystem::rename(base, unavailable);
+        bool failed = false;
+        try { operation(); } catch (const std::exception&) { failed = true; }
+        std::filesystem::rename(unavailable, base);
+        require(failed, "Native command unexpectedly succeeded with its original master unavailable");
+    };
+    for (const auto& operation : std::array<std::function<void()>, 3>{
+        [&] { (void)editor.assignNativeModel(model, package, ESMModelKind::movableStatic); },
+        [&] { (void)editor.makeUnique(first, package, ESMModelKind::staticObject); },
+        [&] { editor.retarget(first, other); }})
+    {
+        // These fail after changing the model/reference and, for the first two, allocating an ID.
+        failsWithoutMaster(operation);
+        require(editor.references() == refs && editor.models() == models && editor.terrainSnapshot() == terrain
+            && editor.nextFormId() == next && !editor.dirty(), "Failed native command did not roll back the complete authoring state");
+    }
+    require(editor.redo() && !editor.references()[0].visible && editor.undo(), "Failed native command destroyed redo history");
+    editor.beginTransaction();
+    const auto movable = editor.assignNativeModel(model, package, ESMModelKind::movableStatic);
+    (void)editor.makeUnique(first, package, ESMModelKind::movableStatic);
+    editor.cancelTransaction();
+    require(!editor.model(movable) && editor.references() == refs && editor.models() == models
+        && editor.nextFormId() == next && editor.terrainSnapshot() == terrain && !editor.dirty(),
+        "Cancelled native transaction retained records, ownership, or allocator changes");
+    const auto unique = editor.makeUnique(first, package, ESMModelKind::staticObject);
+    failsWithoutMaster([&] { editor.save(); });
+    require(editor.dirty() && editor.model(unique) && readFile(editor.path()) == overlayBytes
+        && readFile(base) == source && readFile(editor.assetRoot() / package) == packageBytes,
+        "Failed world save damaged its source/package or discarded unsaved native assignment");
+    editor.save();
+    require(!editor.dirty() && EditorDocument(editor.path()).model(unique), "Native assignment could not save after its master returned");
+}
 void testSaveAs(const std::filesystem::path& root)
 {
     const auto source = root / "save-as.esm"; const auto target = root / "saved-copy.esm";
@@ -487,7 +821,10 @@ try
     const auto root = std::filesystem::temp_directory_path() / ("openf4-editor-doc-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directory(root);
     testManipulation(); testCancelTransaction(root);
-    testEditing(root); testRawPreservation(root); testMasterOverlay(root); testInheritedReferences(root); testSaveAs(root); testDemHeader(root); testConcurrentDemReads(root); testBrandingCompatibility(root);
+    testEditing(root); testRawPreservation(root); testMasterOverlay(root); testInheritedReferences(root);
+    testInheritedRecordPreservation(root); testPersistentReferencePreservation(root);
+    testNativeModelCommands(root); testInheritedNativeModel(root); testNativeCommandRollback(root);
+    testSaveAs(root); testDemHeader(root); testConcurrentDemReads(root); testBrandingCompatibility(root);
     std::filesystem::remove_all(root);
     std::cout << "Editor document tests passed\n"; return 0;
 }

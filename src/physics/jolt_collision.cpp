@@ -5,6 +5,7 @@
 #include <Jolt/Core/JobSystemThreadPool.h>
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
+#include <Jolt/Physics/Body/BodyLock.h>
 #include <Jolt/Physics/Body/MassProperties.h>
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayerInterfaceTable.h>
 #include <Jolt/Physics/Collision/BroadPhase/ObjectVsBroadPhaseLayerFilterTable.h>
@@ -14,6 +15,7 @@
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
+#include <Jolt/Physics/Collision/Shape/OffsetCenterOfMassShape.h>
 #include <Jolt/Physics/Collision/Shape/ScaledShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 #include <Jolt/Physics/Constraints/HingeConstraint.h>
@@ -79,20 +81,17 @@ namespace openf4::physics
 
         glm::mat4 toEngineAxes(const glm::mat4& value)
         {
-            glm::mat4 axes(1.0f);
-            axes[1] = glm::vec4(0.0f, 0.0f, 1.0f, 0.0f);
-            axes[2] = glm::vec4(0.0f, 1.0f, 0.0f, 0.0f);
-            return axes * value * axes;
+            return assets::swapBethesdaAxes(value);
         }
 
         glm::vec3 toEngineAxes(const glm::vec3& value)
         {
-            return {value.x, value.z, value.y};
+            return assets::swapBethesdaAxes(value);
         }
 
         glm::quat toEngineAxes(const glm::quat& value)
         {
-            const glm::mat4 converted = toEngineAxes(glm::mat4_cast(value));
+            const glm::mat4 converted = toEngineAxes(glm::mat4_cast(glm::normalize(value)));
             return glm::normalize(glm::quat_cast(glm::mat3(converted)));
         }
 
@@ -142,6 +141,16 @@ namespace openf4::physics
             settings.mMassPropertiesOverride = fallback;
         }
 
+        bool hasAuthoredMassProperties(const assets::HavokRigidBody& body)
+        {
+            return std::isfinite(body.mass) && body.mass > 0.0f
+                && std::isfinite(body.inertiaDiagonal.x) && body.inertiaDiagonal.x > 0.0f
+                && std::isfinite(body.inertiaDiagonal.y) && body.inertiaDiagonal.y > 0.0f
+                && std::isfinite(body.inertiaDiagonal.z) && body.inertiaDiagonal.z > 0.0f
+                && std::isfinite(glm::dot(body.inertiaOrientation, body.inertiaOrientation))
+                && glm::dot(body.inertiaOrientation, body.inertiaOrientation) >= 1e-8f;
+        }
+
         bool identity(const glm::mat4& value)
         {
             for (glm::length_t column = 0; column < 4; ++column)
@@ -149,6 +158,26 @@ namespace openf4::physics
                     if (std::abs(value[column][row] - (column == row ? 1.0f : 0.0f)) > 0.00001f)
                         return false;
             return true;
+        }
+
+        void validateChildTransform(const glm::mat4& transform, const glm::vec3& scale)
+        {
+            for (glm::length_t column = 0; column < 4; ++column)
+                for (glm::length_t row = 0; row < 4; ++row)
+                    if (!std::isfinite(transform[column][row]))
+                        throw std::runtime_error("Havok child transform is not finite");
+            for (glm::length_t axis = 0; axis < 3; ++axis)
+                if (!std::isfinite(scale[axis]) || scale[axis] <= 0.0f
+                    || std::abs(transform[axis][3]) > 0.0001f)
+                    throw std::runtime_error("Havok child scale or affine transform is invalid");
+            const glm::mat3 basis(transform);
+            const glm::mat3 gram = glm::transpose(basis) * basis;
+            for (glm::length_t column = 0; column < 3; ++column)
+                for (glm::length_t row = 0; row < 3; ++row)
+                    if (std::abs(gram[column][row] - (column == row ? 1.0f : 0.0f)) > 0.001f)
+                        throw std::runtime_error("Havok child transform contains scale or shear");
+            if (std::abs(transform[3][3] - 1.0f) > 0.0001f || glm::determinant(basis) <= 0.0f)
+                throw std::runtime_error("Havok child transform is reflected or non-affine");
         }
 
         JPH::ShapeRefC makeJoltTriangleMesh(const assets::HavokTriangleMesh& mesh)
@@ -217,6 +246,10 @@ namespace openf4::physics
             throw std::runtime_error("Havok body has no collision shapes");
         if (body.dynamic && body.triangleMesh)
             throw std::runtime_error("Dynamic Havok triangle meshes are unsupported");
+        for (const auto& part : body.parts)
+            validateChildTransform(part.transform, part.scale);
+        for (const auto& part : body.capsules)
+            validateChildTransform(part.transform, part.scale);
         if (shapeCount == 1 && body.triangleMesh)
             return makeJoltTriangleMesh(*body.triangleMesh);
         if (shapeCount == 1 && body.parts.size() == 1
@@ -252,6 +285,8 @@ namespace openf4::physics
         }
         for (const auto& part : body.capsules)
         {
+            if (!std::isfinite(part.capsule.radius) || part.capsule.radius <= 0.0f)
+                throw std::runtime_error("Havok capsule radius must be finite and positive");
             if (!std::isfinite(part.scale.x) || !std::isfinite(part.scale.y)
                 || !std::isfinite(part.scale.z)
                 || !glm::all(glm::greaterThan(part.scale, glm::vec3(0.0f))))
@@ -309,9 +344,12 @@ namespace openf4::physics
 
     glm::mat4 havokBodyLocalTransform(const assets::HavokRigidBody& body)
     {
-        const glm::quat rotation(body.rotation.w, body.rotation.x,
-            body.rotation.z, body.rotation.y);
-        const glm::vec3 position(body.position.x, body.position.z, body.position.y);
+        if (!std::isfinite(body.position.x) || !std::isfinite(body.position.y)
+            || !std::isfinite(body.position.z) || !std::isfinite(glm::dot(body.rotation, body.rotation))
+            || glm::dot(body.rotation, body.rotation) < 1e-8f)
+            throw std::runtime_error("Havok body transform is invalid");
+        const glm::quat rotation = toEngineAxes(body.rotation);
+        const glm::vec3 position = toEngineAxes(body.position);
         return glm::translate(glm::mat4(1.0f), position * BethesdaUnitsPerMeter)
             * glm::mat4_cast(rotation);
     }
@@ -369,18 +407,42 @@ namespace openf4::physics
 
         BodyHandle addBody(const JPH::Shape* shape, const glm::vec3& position,
             const glm::quat& rotation, JPH::EMotionType motion, JPH::ObjectLayer layer,
-            float mass = 0.0f, float friction = 0.7f, float restitution = 0.0f)
+            float mass = 0.0f, float friction = 0.7f, float restitution = 0.0f,
+            const assets::HavokRigidBody* source = nullptr)
         {
+            if (motion != JPH::EMotionType::Static && shape->MustBeStatic())
+                throw std::runtime_error("Jolt moving body requires a dynamic-compatible shape");
             JPH::BodyCreationSettings settings(
                 shape, toJoltPosition(position - origin), toJolt(rotation), motion, layer);
             settings.mFriction = friction;
             settings.mRestitution = restitution;
-            if (motion == JPH::EMotionType::Dynamic)
+            // Keep authored properties available when an explicitly fixed native prop
+            // is later made dynamic. Ordinary scenery stays static-only.
+            settings.mAllowDynamicOrKinematic = !shape->MustBeStatic()
+                && source && hasAuthoredMassProperties(*source);
+            if (settings.HasMassProperties())
             {
                 if (shape->GetInnerRadius() > 0.0f)
                     settings.mMotionQuality = JPH::EMotionQuality::LinearCast;
                 if (mass > 0.0f)
                     applyMass(settings, shape, mass);
+                if (source)
+                {
+                    settings.mLinearDamping = source->linearDamping;
+                    settings.mAngularDamping = source->angularDamping;
+                    settings.mGravityFactor = source->gravityFactor;
+                    settings.mMaxLinearVelocity = source->maxLinearVelocity;
+                    settings.mMaxAngularVelocity = source->maxAngularVelocity;
+                    if (glm::all(glm::greaterThan(source->inertiaDiagonal, glm::vec3(0))))
+                    {
+                        const auto diagonal = toEngineAxes(source->inertiaDiagonal);
+                        const auto basis = JPH::Mat44::sRotation(toJolt(toEngineAxes(source->inertiaOrientation)));
+                        settings.mOverrideMassProperties = JPH::EOverrideMassProperties::MassAndInertiaProvided;
+                        settings.mMassPropertiesOverride.mMass = mass;
+                        settings.mMassPropertiesOverride.mInertia = basis * JPH::Mat44::sScale(
+                            {diagonal.x, diagonal.y, diagonal.z}) * basis.Transposed3x3();
+                    }
+                }
             }
             const JPH::BodyID body = system.GetBodyInterface().CreateAndAddBody(
                 settings, motion == JPH::EMotionType::Dynamic
@@ -459,6 +521,62 @@ namespace openf4::physics
             throw std::runtime_error("Jolt dynamic body material or mass is invalid");
         return mImpl->addBody(shape.GetPtr(), position, rotation,
             JPH::EMotionType::Dynamic, movingLayer, mass, friction, restitution);
+    }
+
+    BodyHandle JoltWorld::addCollisionBody(const assets::HavokRigidBody& source,
+        const glm::vec3& position, const glm::quat& rotation, float scale)
+    {
+        mImpl->requireOwnerThread();
+        auto body = source;
+        const auto finite = [](glm::vec3 v) {
+            return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+        };
+        if (!std::isfinite(scale) || scale <= 0
+            || !finite(position) || !finite(body.centerOfMass) || !finite(body.inertiaDiagonal)
+            || !std::isfinite(glm::dot(rotation, rotation)) || glm::dot(rotation, rotation) < 1e-8f
+            || !std::isfinite(body.friction) || body.friction < 0
+            || !std::isfinite(body.restitution) || body.restitution < 0 || body.restitution > 1
+            || !std::isfinite(body.linearDamping) || body.linearDamping < 0
+            || !std::isfinite(body.angularDamping) || body.angularDamping < 0
+            || !std::isfinite(body.gravityFactor)
+            || !std::isfinite(body.maxLinearVelocity) || body.maxLinearVelocity <= 0
+            || !std::isfinite(body.maxAngularVelocity) || body.maxAngularVelocity <= 0)
+            throw std::runtime_error("Native collision body has invalid properties");
+        if (body.dynamic)
+        {
+            if (body.triangleMesh)
+                throw std::runtime_error("Dynamic native collision requires convex or capsule shapes");
+            if (!std::isfinite(body.mass) || body.mass <= 0)
+                throw std::runtime_error("Dynamic native collision requires positive mass");
+            if (body.inertiaDiagonal == glm::vec3(0)) updateHavokMassProperties(body);
+            if (glm::any(glm::lessThanEqual(body.inertiaDiagonal, glm::vec3(0)))
+                || !std::isfinite(glm::dot(body.inertiaOrientation, body.inertiaOrientation))
+                || glm::dot(body.inertiaOrientation, body.inertiaOrientation) < 1e-8f)
+                throw std::runtime_error("Native collision body has invalid inertia");
+        }
+        auto shape = scaleJoltCollisionShape(makeJoltCollisionShape(body), glm::vec3(scale));
+        body.centerOfMass *= scale;
+        body.inertiaDiagonal *= scale * scale; // Reference scaling preserves authored mass.
+        if (!finite(body.centerOfMass) || !finite(body.inertiaDiagonal))
+            throw std::runtime_error("Native collision scale overflows its mass properties");
+        if (body.dynamic || (!shape->MustBeStatic() && hasAuthoredMassProperties(body)))
+        {
+            const auto offset = toEngineAxes(body.centerOfMass)
+                - glm::vec3(shape->GetCenterOfMass().GetX(), shape->GetCenterOfMass().GetY(),
+                    shape->GetCenterOfMass().GetZ());
+            if (glm::length(offset) > 1e-6f)
+            {
+                const auto adjusted = JPH::OffsetCenterOfMassShapeSettings(
+                    {offset.x, offset.y, offset.z}, shape.GetPtr()).Create();
+                if (!adjusted.IsValid())
+                    throw std::runtime_error("Jolt rejected native center of mass");
+                shape = adjusted.Get();
+            }
+        }
+        return mImpl->addBody(shape.GetPtr(), position, glm::normalize(rotation),
+            body.dynamic ? JPH::EMotionType::Dynamic : JPH::EMotionType::Static,
+            body.dynamic ? movingLayer : staticLayer, body.mass, body.friction,
+            body.restitution, &body);
     }
 
     RagdollHandle JoltWorld::addRagdoll(const assets::HavokRagdoll& source,
@@ -692,6 +810,128 @@ namespace openf4::physics
             static_cast<float>(position.GetX()), static_cast<float>(position.GetY()),
             static_cast<float>(position.GetZ())) * BethesdaUnitsPerMeter)
             * glm::mat4_cast(orientation);
+    }
+
+    BodyState JoltWorld::bodyState(BodyHandle body) const
+    {
+        BodyState state;
+        state.transform = bodyTransform(body);
+        const auto& interface = mImpl->system.GetBodyInterface();
+        const auto linear = interface.GetLinearVelocity(JPH::BodyID(body.value));
+        const auto angular = interface.GetAngularVelocity(JPH::BodyID(body.value));
+        state.linearVelocity = glm::vec3(linear.GetX(), linear.GetY(), linear.GetZ())
+            * BethesdaUnitsPerMeter;
+        state.angularVelocity = {angular.GetX(), angular.GetY(), angular.GetZ()};
+        state.active = interface.IsActive(JPH::BodyID(body.value));
+        return state;
+    }
+
+    void JoltWorld::restoreBodyState(BodyHandle body, const BodyState& state)
+    {
+        mImpl->requireOwnerThread();
+        if (!mImpl->bodies.contains(body.value))
+            throw std::runtime_error("Jolt body handle is invalid");
+        for (int column = 0; column < 4; ++column)
+            for (int row = 0; row < 4; ++row)
+                if (!std::isfinite(state.transform[column][row]))
+                    throw std::runtime_error("Jolt body state must be finite");
+        const glm::mat3 basis(state.transform);
+        const auto gram = glm::transpose(basis) * basis;
+        for (int column = 0; column < 3; ++column)
+        {
+            if (!std::isfinite(state.linearVelocity[column])
+                || !std::isfinite(state.angularVelocity[column]))
+                throw std::runtime_error("Jolt body velocity must be finite");
+            for (int row = 0; row < 3; ++row)
+                if (std::abs(gram[column][row] - (column == row ? 1.0f : 0.0f)) > 1e-4f)
+                    throw std::runtime_error("Jolt body state must have a rigid transform");
+        }
+        if (glm::determinant(basis) <= 0 || state.transform[0][3] != 0
+            || state.transform[1][3] != 0 || state.transform[2][3] != 0
+            || state.transform[3][3] != 1)
+            throw std::runtime_error("Jolt body state must have a rigid transform");
+        auto& interface = mImpl->system.GetBodyInterface();
+        interface.SetPositionAndRotation(JPH::BodyID(body.value),
+            toJoltPosition(glm::vec3(state.transform[3]) - mImpl->origin),
+            toJolt(glm::normalize(glm::quat_cast(basis))), JPH::EActivation::DontActivate);
+        if (interface.GetMotionType(JPH::BodyID(body.value)) != JPH::EMotionType::Static)
+        {
+            const auto velocity = state.linearVelocity / BethesdaUnitsPerMeter;
+            interface.SetLinearAndAngularVelocity(JPH::BodyID(body.value),
+                {velocity.x, velocity.y, velocity.z},
+                {state.angularVelocity.x, state.angularVelocity.y, state.angularVelocity.z});
+            if (state.active) interface.ActivateBody(JPH::BodyID(body.value));
+            else interface.DeactivateBody(JPH::BodyID(body.value));
+        }
+    }
+
+    bool JoltWorld::isBodyValid(BodyHandle body) const
+    {
+        mImpl->requireOwnerThread();
+        if (!mImpl->bodies.contains(body.value)) return false;
+        const JPH::BodyLockRead lock(mImpl->system.GetBodyLockInterface(),
+            JPH::BodyID(body.value));
+        return lock.SucceededAndIsInBroadPhase();
+    }
+
+    bool JoltWorld::isBodyActive(BodyHandle body) const
+    {
+        mImpl->requireOwnerThread();
+        if (!mImpl->bodies.contains(body.value)) return false;
+        const JPH::BodyLockRead lock(mImpl->system.GetBodyLockInterface(),
+            JPH::BodyID(body.value));
+        return lock.SucceededAndIsInBroadPhase() && lock.GetBody().IsActive();
+    }
+
+    bool JoltWorld::setMotionType(BodyHandle body, std::uint32_t motionType,
+        bool allowActivate)
+    {
+        mImpl->requireOwnerThread();
+        if (motionType > 2 || !mImpl->bodies.contains(body.value)) return false;
+        const auto motion = motionType == 0 ? JPH::EMotionType::Static
+            : motionType == 1 ? JPH::EMotionType::Dynamic : JPH::EMotionType::Kinematic;
+        const JPH::BodyID id(body.value);
+        {
+            const JPH::BodyLockRead lock(mImpl->system.GetBodyLockInterface(), id);
+            if (!lock.SucceededAndIsInBroadPhase()) return false;
+            if (motion != JPH::EMotionType::Static
+                && (!lock.GetBody().CanBeKinematicOrDynamic()
+                    || lock.GetBody().GetShape()->MustBeStatic())) return false;
+        }
+        auto& interface = mImpl->system.GetBodyInterface();
+        interface.SetMotionType(id, motion, allowActivate
+            ? JPH::EActivation::Activate : JPH::EActivation::DontActivate);
+        interface.SetObjectLayer(id, motion == JPH::EMotionType::Static ? staticLayer : movingLayer);
+        if (motion == JPH::EMotionType::Dynamic) mImpl->dynamicBodies.insert(body.value);
+        else mImpl->dynamicBodies.erase(body.value);
+        // Also wake an unchanged motion type: callers may use this as an activation request.
+        if (allowActivate && motion != JPH::EMotionType::Static) interface.ActivateBody(id);
+        return true;
+    }
+
+    bool JoltWorld::applyHavokImpulse(BodyHandle body, const glm::vec3& direction,
+        float magnitude)
+    {
+        mImpl->requireOwnerThread();
+        if (!mImpl->bodies.contains(body.value) || !std::isfinite(magnitude) || magnitude < 0
+            || !std::isfinite(direction.x) || !std::isfinite(direction.y)
+            || !std::isfinite(direction.z)) return false;
+        // Double precision keeps normalization finite for every finite float direction.
+        const double length = glm::length(glm::dvec3(direction));
+        if (length == 0) return false;
+        const JPH::BodyID id(body.value);
+        {
+            const JPH::BodyLockRead lock(mImpl->system.GetBodyLockInterface(), id);
+            if (!lock.SucceededAndIsInBroadPhase() || !lock.GetBody().IsDynamic()) return false;
+        }
+        auto& interface = mImpl->system.GetBodyInterface();
+        interface.ActivateBody(id);
+        if (magnitude > 0)
+        {
+            const glm::vec3 impulse(glm::dvec3(direction) * (magnitude / length));
+            interface.AddImpulse(id, {impulse.x, impulse.y, impulse.z});
+        }
+        return true;
     }
 
     std::vector<glm::vec3> JoltWorld::dynamicBodyPositions() const

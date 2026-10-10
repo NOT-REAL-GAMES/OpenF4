@@ -1,8 +1,8 @@
 # OpenF4
 
-OpenF4 is a clean SDL3 and Vulkan rewrite of the Fallout: Empire renderer. It does not link
-VulkanSceneGraph or inherit the previous engine's frame graph and synchronization behavior.
-OpenF4 names the runtime, editor, and shared engine; EMPIRE is the mod built on it.
+OpenF4 is a clean-room reimplementation of Fallout 4,
+meant to expand its capabilities beyond some of its more
+dated design decisions from 2015.
 
 ## Current Core
 
@@ -67,7 +67,8 @@ build/bin/RelWithDebInfo/openf4.exe --import-dem "mods\NYC.esm" `
 ```
 
 Passing a `.esm` path selects that master in read-only world mode. OpenF4 DEM
-overlays stream nearby LAND and their baked level-32 BTR tiles; use `--editor` explicitly
+overlays stream nearby LAND and their baked BTR hierarchy (including older level-32-only
+products); use `--editor` explicitly
 to sculpt. Other masters stream the first exterior worldspace contained in that file.
 OpenF4 editor overlays resolve their master stack and project-owned placed models.
 
@@ -118,6 +119,10 @@ estimated size; jobs over 10,000 tiles require editor confirmation or CLI `--yes
 Terrain BTRs are written to `<world>.btr/` at levels 4, 8, 16, and 32. Simplified
 static glTF tiles and the SQLite change index live in `<world>.assets/lod/`.
 These are derived products: the ESM and its terrain shards remain authoritative.
+Static tiles target 25% of source triangles within a 1% bounds-relative error limit;
+models that cannot reach that target retain more triangles. Animated models bake
+their imported static pose. Each distant reference disappears when its full model
+is installed, so loaded doorways do not retain coarse facades.
 
 `End` or **Drop to Ground** places each selected object's lowest geometry point at
 the loaded LAND height beneath its origin. Optional **Align to terrain** tilts local
@@ -153,6 +158,243 @@ mouse wheel for radius, Shift+wheel for strength, `Ctrl+Z`/`Ctrl+Y` for history,
 persists it automatically. Editor ESM files are intentionally OpenF4-only for now.
 The DEM importer accepts the four contiguous USGS one-arc-second NAD83 tiles in any order,
 uses true Fallout scale, and writes spatial terrain masters capped at 1,048,576 cells each.
+
+## Native asset workspace
+
+Select a placed object and choose **Edit Asset** in the Inspector, or right-click an
+Asset Browser entry and choose **Edit Asset**. Double-clicking a browser entry still
+places it in the world. The **Asset** workspace button also opens the selected
+object when no asset is open yet; its tooltip explains the selection requirement.
+The **World** and **Asset** workspace buttons keep independent
+cameras and selection; unsaved world edits survive switching, and world streaming
+pauses while the asset workspace is active.
+
+In Asset mode, RMB orbits, MMB pans, the wheel zooms, and F frames the model. Select
+surfaces in the viewport or Outliner (Ctrl adds surfaces). Edit tint, alpha cutoff,
+double-sided rendering, and diffuse/normal PNG, JPEG, or DDS textures in the Inspector;
+an empty texture path clears that texture. Asset Ctrl+Z/Y uses its own 64-entry history,
+separate from world commands. Escape cancels an active edit gesture.
+
+Generate a convex hull or static triangle collision from selected surfaces, or add
+boxes and capsules. Select collision parts to move/rotate/resize them with W/E/R and
+the Inspector. Body controls expose mass, friction, restitution, damping, and gravity.
+**Play / Pause / Reset** tests a single rigid body against an isolated Jolt ground
+plane. Editing resets the simulation; simulated poses are never authored or saved.
+Existing multi-body native assets can be inspected and, when supported, edited, but
+the isolated physics preview currently requires one body.
+
+**Save Native NIF** (Ctrl+S in Asset mode) publishes a new immutable NIF/BGSM/DDS
+package under `<world>.assets/meshes|materials|textures/openf4/<form-id>/<version>/`
+and changes the shared model assignment in one world undo step. All its placements
+use the new asset after returning to World mode. The imported source and previous
+packages remain intact; undo never deletes published files. The ESM stays dirty until
+**Save World** (Ctrl+S in World mode); normal shutdown also saves dirty world edits.
+Opening another asset/world or quitting prompts **Save / Discard / Cancel** when the
+asset has unsaved edits. Asset save errors leave those edits available to retry.
+
+Use **Make Unique** on one placed object's Inspector to publish an independent base
+model and retarget only that placement. **Movable prop (MSTT)** selects an authored
+dynamic body; ordinary scenery remains STAT. Changing between those record types
+allocates a new FormID instead of changing an existing record's type. Project-world
+runtime loads native collision without the physics-demo option, while world editing
+itself stays non-simulating. Movable props are excluded from static LOD baking.
+
+Native export supports convex hulls, capsules, compounds, and static triangle meshes
+with uniform collision materials. Dynamic bodies retain mass, principal inertia,
+center of mass, damping, and contact settings. Existing third-party NIFs use a guarded
+collision-only path that preserves other blocks byte-for-byte and keeps attachment
+identities and motion flags. Missing project dependencies are copied; conflicting
+files are rejected, never overwritten. Unsupported files remain inspectable with a
+capability reason instead of being flattened into a lossy export.
+
+The asset preview is not a full Fallout material renderer: alpha blending and advanced
+PBR/palette appearance still have limitations. Animated/skinned imports, render-mesh
+topology editing, ragdolls, and constraints are not native authoring targets yet.
+Rounded Jolt convex-hull capture is rejected until its core/radius conversion can
+preserve size. Native collision rewriting rejects unrepresented source changes; only
+bounded roundoff in represented mass-frame floats is accepted. Inherited ESM model
+overrides also reject localized display-name records and reordered master slots when
+their opaque data cannot be preserved safely.
+
+The cube, doorway, and compound export fixtures have been exercised in Fallout 4;
+this is not a general Fallout 4 or Creation Kit compatibility guarantee for authored
+worlds. Generate disposable native-game fixtures into a **new** directory with:
+
+```powershell
+build/bin/Release/openf4-native-model-export-tests.exe --export-fixtures build/native-proof
+```
+
+The command writes three models, their dependencies, and a test-only
+`OpenF4NativeCollisionProof.esp`; it does not install or activate anything. Use an
+isolated game session/save directory for validation, never an existing playthrough.
+The normal OpenF4 ESM authoring format remains separate from this proof plugin.
+
+### Native compatibility evidence
+
+Compatibility is reported per capability and build, not as general Havok/Jolt or
+Fallout 4 parity. Generated native assets, guarded collision-only preservation,
+and unsupported-file rejection have separate results. The historical doorway
+proof uses static triangle collision; it is not evidence for convex compounds.
+
+The asset-document tests include independent asymmetric geometry, doorway probes,
+mass/inertia oracles, and fresh-document native save/reload generations E0 through
+E10. Preserve the fixture packages and reports with:
+
+```powershell
+build/bin/Release/openf4-asset-document-tests.exe --compatibility-fixtures build/compatibility-fixtures
+```
+
+For source/build provenance, SHA-256 hashes, every CTest target, and fresh E0/E10
+runtime checks, use PowerShell 7.4 or newer with a **new** output directory:
+
+```powershell
+./tools/compatibility.ps1 -OutputDirectory build/compatibility/run-01
+```
+
+`-SkipRuntime` leaves the runtime gate explicitly untested. `-Mode baseline`
+archives the known local proof packages and logs without modifying them; later
+source snapshots are not represented as historical build provenance. Failed runs
+remain available for diagnosis. Neither mode installs game files, changes game
+settings, nor touches saves.
+
+The opt-in `OPENF4_COMPATIBILITY_CAPTURE_DIR` environment variable makes the normal
+runtime capture fixture-sidecar reads and installed render/physics state in a new
+directory. The driver compares the consumed NIF/BGSM/DDS bytes with the published
+packages. Capture is disabled for normal runs and never copies game archive data.
+
+Reports distinguish **Not run**, **Reported pass**, **Pass**, **Fail**, **Blocked**,
+and **N/A with reason**. Automated success alone does not mark a profile Proven:
+the applicable Fallout 4 checks, evidence, and reviewer approval are still required.
+Native packages for those checks are generated but must be staged separately for
+an isolated game session, with settings restored afterward. Do not load malformed
+negative-control fixtures into Fallout 4.
+
+After explicitly choosing to run the isolated game check, with Fallout 4 closed:
+
+```powershell
+./tools/compatibility-game.ps1 -RunDirectory build/compatibility/run-01
+# Quit the game without saving before restoring:
+./tools/compatibility-game.ps1 -Action restore -RunDirectory build/compatibility/run-01
+```
+
+This stages only runtime-verified native dependencies and two disposable ESPs,
+backs up the settings, disables autosaves, and selects a separate save directory.
+Restoration verifies hashes and recovers installed test files rather than deleting
+them. Interrupted copies and settings writes are recoverable from the journal.
+The E0/E10 ESMs are OpenF4 test worlds, **not** Fallout 4-compatible worlds. The
+ESP fixtures contain base assets only: use `coc qasmoke`, `help OF4CompatE0 4`,
+`help OF4CompatE10 4`, and `player.placeatme` with the resolved FormIDs. The four
+numbered assets are an asymmetric movable box, a static doorway, an unequal
+compound, and a compound with deliberately nonuniform mass distribution. Bright
+test textures are intentional orientation markers.
+
+Reopening, saving, and editing contact/damping/gravity settings preserve authored
+center of mass and inertia. Changing mass or collision geometry intentionally
+recalculates a uniform-density distribution. Undo and redo restore the original
+authored values, including custom distributions.
+
+### Native world export: first acceptance gate
+
+The new native world writer is an experimental **geometry proof**, not the completed
+playable-world exporter. It writes a separate ESP with native exterior groups, LAND
+heights/normals/default texture, authored water flags, native STAT/MSTT placements,
+and a persistent arrival marker. The asset packager checks collision and copies
+project NIF/BGSM/DDS dependencies without changing their bytes. Base-game dependencies
+remain references to `Fallout4.esm` and its archives.
+Animated, skinned, behavior-graph, and connection-point assets are rejected by this
+proof profile until their external dependency closure is supported; native asset
+inspection and preservation elsewhere are unchanged.
+
+For a small, new OpenF4 world whose placed assets have already been saved as native
+NIF packages, choose **File → Export to Fallout 4 (.esp)…**. Choose a **new package
+folder** (the folder picker selects its parent), then **Save World and Check Export**.
+The compatibility summary shows blockers and limitations before **Export package**
+is enabled. Export runs in the background with cancellation; conflicting editing,
+imports, saves, and compilation are blocked while the dialog is open. Canceling
+does not undo the explicit Save World step. The finished dialog displays the actual
+`Data/<world>.esp` path and arrival command without changing the open project.
+**Save As** remains an OpenF4 `.esm` authoring save, not a Fallout conversion.
+
+The equivalent test-tool entry point exports the already-saved source:
+
+```powershell
+build/bin/Release/openf4-fo4-export-tests.exe --export-proof mods/Proof.esm build/world-proof-01
+```
+
+`export-report.txt` contains capabilities, source/output SHA-256 hashes, the world
+editor ID, and test arrival instructions. This command neither saves the source nor
+installs files. It refuses existing output directories, authored sidecars, Fallout
+Data destinations, unsupported records, dependency conflicts, and changed inputs.
+Failed or cancelled publication retains an explicitly incomplete staging directory.
+
+Acceptance still requires entering the new world in Fallout 4 and checking terrain
+and object collision. **Navigation, native distant LOD, existing-world overrides,
+and NYC-scale partitioning are not implemented by this proof.** The editor command
+exposes this experimental proof exporter, not a finished playable-world export.
+The E0/E10 compatibility ESMs can be proof inputs; the source ESMs themselves remain
+OpenF4 authoring files, not drop-in Fallout worlds. Do not use a main save for testing.
+
+After explicitly choosing an isolated game check, with Fallout 4 closed:
+
+```powershell
+./tools/compatibility-game.ps1 -RunDirectory build/world-check-01 -WorldPackage build/world-proof-01
+# Quit without saving, then restore all original settings:
+./tools/compatibility-game.ps1 -Action restore -RunDirectory build/world-check-01
+```
+
+World-proof staging verifies the report's complete Data-file hashes and refuses
+conflicts before changing settings. It is a manual acceptance test, not an automated
+compatibility pass. The same journal-backed restore path is used as for asset proofs.
+
+## Project Papyrus scripts
+
+The editor's reference Inspector has a **Papyrus scripts** section. Attach to the
+selected reference, or enable **Shared base** to affect every placement of that
+STAT/MSTT. Attachments and scalar/object property edits participate in world
+undo/redo and **Save World**. Unknown VMAD data remains preserved and read-only.
+
+For a first test, select a movable prop, use **Create wake source**, **Compile**,
+**Attach / enable**, then **Save World**. The generated `OnLoad` script requests
+dynamic motion and a zero-magnitude wake impulse. This is opt-in, not an automatic
+script attached to every exported object. **Open source externally** uses your
+file association; no separate editor or compiler dependency is bundled.
+
+Compilation uses the locally installed Fallout 4 Creation Kit compiler and base
+sources. Project source lives in `<world>.assets/scripts/source/`, and compiled
+PEX in `<world>.assets/scripts/`; namespaces become subdirectories. Project/master
+sidecar sources precede installed source paths. Compilation runs in the background
+with a 60-second timeout and publishes a checked PEX atomically. Errors retain the
+previous compiled file. Source/PEX saves are separate from world undo history.
+
+Normal project-world runtime loading executes project-attached scripts through a
+standalone, MIT-licensed derivative of SkyMP's Papyrus VM (see
+`third_party/papyrus-vm/UPSTREAM.md`). Native parent metadata is supplied by OpenF4;
+it does not start the vanilla game's script population. The initial runtime supports
+scalar/reference values, automatic property overrides, functions, inheritance,
+states, control flow, `OnInit`, `OnLoad`, `OnUnload`, and `Utility.Wait`.
+
+Implemented native calls are `Form.GetFormID`, `ObjectReference.Is3DLoaded`,
+`GetPositionX/Y/Z`, `SetMotionType`, `ApplyHavokImpulse`, and `Debug.Trace`.
+Physics mutation currently requires a resident single-body MSTT. Papyrus coordinates
+use Bethesda axes; the bridge converts to OpenF4/Jolt internally. `OnLoad` waits
+for installed collision and, for movable props, surrounding terrain/static collision.
+Variables, latent waits, and motion state survive cell residency changes in the
+current session. Script execution never dirties the authored world; the editor does
+not simulate scripts while authoring.
+
+The ESP exporter writes supported VMAD and copies the compiled project dependency
+closure unchanged into `Data/scripts`. Installed Bethesda scripts remain external
+dependencies, never redistributed. Compilation/export and OpenF4 execution have
+different compatibility gates: arrays, structs, Var values, unknown natives, quests,
+actors, and Fallout savegame VM persistence are not supported by this first runtime.
+Unsupported execution produces diagnostics. Execution, recursion, event, and wait
+limits prevent runaway scripts; a stack exceeding its instruction allowance is
+stopped rather than replayed. This is not full Fallout 4 Papyrus compatibility.
+
+CTest includes checked PEX/VMAD fixtures, document/export preservation, and Jolt
+motion tests. `papyrus_integration` additionally compiles a fresh script with the
+installed CK and tests save/reload, load/unload, latent calls, physics wake/collision,
+and failed-compile rollback (skipped when CK is unavailable).
 
 ## Synchronization Policy
 

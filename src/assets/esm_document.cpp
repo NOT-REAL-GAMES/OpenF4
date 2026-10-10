@@ -1,4 +1,5 @@
 #include "assets/esm_document.hpp"
+#include "assets/asset_resolver.hpp"
 
 #include <algorithm>
 #include <array>
@@ -91,6 +92,20 @@ Bytes group(std::uint32_t label, std::uint32_t type, const Bytes& body)
     Bytes out; put(out, cc("GRUP")); put(out, static_cast<std::uint32_t>(body.size() + 24)); put(out, label);
     put(out, type); put(out, std::uint64_t{0}); append(out, body); return out;
 }
+std::uint64_t countRecords(std::span<const std::byte> bytes)
+{
+    std::uint64_t count = 0;
+    for (std::size_t p = 0; p < bytes.size();)
+    {
+        const bool grouped = read<std::uint32_t>(bytes, p) == cc("GRUP");
+        const auto size = std::uint64_t(read<std::uint32_t>(bytes, p + 4)) + (grouped ? 0 : 24);
+        if (size < 24 || size > bytes.size() - p) throw std::runtime_error("Invalid encoded ESM record size");
+        ++count;
+        if (grouped) count += countRecords(bytes.subspan(p + 24, static_cast<std::size_t>(size - 24)));
+        p += static_cast<std::size_t>(size);
+    }
+    return count;
+}
 Bytes readFile(std::ifstream& file, std::uint64_t offset, std::size_t size)
 {
     Bytes b(size); file.clear(); file.seekg(static_cast<std::streamoff>(offset));
@@ -101,7 +116,7 @@ struct Node
 {
     Bytes header;
     std::uint64_t offset = 0, size = 0;
-    std::uint32_t type = 0, form = 0, groupType = 0, world = 0, cell = 0;
+    std::uint32_t type = 0, form = 0, groupType = 0, world = 0, cell = 0, childGroupType = 0;
     std::vector<std::unique_ptr<Node>> children;
 };
 Bytes body(std::ifstream& file, const Node& n)
@@ -129,6 +144,7 @@ Bytes patchRecord(std::ifstream& file, const Node* n, std::uint32_t type, std::u
     Bytes result = n->header;
     overwrite(result, 4, static_cast<std::uint32_t>(payload.size()));
     overwrite(result, 8, read<std::uint32_t>(result, 8) & ~0x40000u);
+    overwrite(result, 12, id);
     append(result, payload); return result;
 }
 Bytes vhgt(const LandscapeCell& cell)
@@ -213,6 +229,7 @@ struct EsmDocument::Impl
     std::vector<ESMReference> refList, originalRefs;
     std::map<CellCoord, ESMTerrainCell> cells, changedTerrain;
     std::unordered_map<std::uint32_t, Node*> records, temporaryGroups, cellGroups;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, Node*> childGroups;
     std::map<std::uint32_t, CellCoord> cellCoords;
     Node* worldChildren = nullptr;
 
@@ -233,7 +250,17 @@ struct EsmDocument::Impl
         for (auto& r : refList)
         {
             auto n = records.find(r.placement.formId);
-            if (n != records.end() && cellCoords.contains(n->second->cell)) r.placement.cell = cellCoords.at(n->second->cell);
+            if (r.childGroupType == 8)
+            {
+                const auto coordinate = [](float value) {
+                    const double cell = std::floor(double(value) / 4096.0);
+                    if (!std::isfinite(cell) || cell < INT32_MIN || cell > INT32_MAX)
+                        throw std::runtime_error("Persistent reference position is outside supported CELL coordinates");
+                    return static_cast<std::int32_t>(cell);
+                };
+                r.placement.cell = {coordinate(r.placement.position[0]), coordinate(r.placement.position[1])};
+            }
+            else if (n != records.end() && cellCoords.contains(n->second->cell)) r.placement.cell = cellCoords.at(n->second->cell);
         }
         refList.erase(std::remove_if(refList.begin(), refList.end(), [&](const auto& r) {
             return records.at(r.placement.formId)->world != world;
@@ -242,7 +269,8 @@ struct EsmDocument::Impl
     }
 
     void scan(std::ifstream& file, std::vector<std::unique_ptr<Node>>& out, std::uint64_t begin,
-        std::uint64_t end, std::uint32_t contextWorld, std::uint32_t contextCell, unsigned depth)
+        std::uint64_t end, std::uint32_t contextWorld, std::uint32_t contextCell, unsigned depth,
+        std::uint32_t childGroupType = 0)
     {
         if (depth > 32) throw std::runtime_error("ESM group nesting exceeds limit");
         for (auto p = begin; p < end;)
@@ -253,16 +281,21 @@ struct EsmDocument::Impl
             auto size = read<std::uint32_t>(n.header, 4);
             n.size = n.type == cc("GRUP") ? size : std::uint64_t(size) + 24;
             if (n.size < 24 || n.size > end - p) throw std::runtime_error("ESM record or group exceeds its parent");
-            n.world = contextWorld; n.cell = contextCell;
+            n.world = contextWorld; n.cell = contextCell; n.childGroupType = childGroupType;
             if (n.type == cc("GRUP"))
             {
                 n.form = read<std::uint32_t>(n.header, 8); n.groupType = read<std::uint32_t>(n.header, 12);
                 if (n.groupType == 1) n.world = n.form;
                 if (n.groupType == 6) { n.cell = n.form; cellGroups[n.form] = &n; }
                 if (n.groupType == 9) temporaryGroups[n.form] = &n;
+                if (n.groupType == 8 || n.groupType == 9 || n.groupType == 10)
+                {
+                    n.childGroupType = n.groupType;
+                    childGroups[{n.form, n.groupType}] = &n;
+                    if (contextCell != n.form) throw std::runtime_error("Reference child group has incorrect CELL ownership");
+                }
                 if (n.groupType == 1 && n.form == world) worldChildren = &n;
-                if (n.groupType == 9 && contextCell != n.form) throw std::runtime_error("LAND temporary group has incorrect CELL ownership");
-                scan(file, n.children, p + 24, p + n.size, n.world, n.cell, depth + 1);
+                scan(file, n.children, p + 24, p + n.size, n.world, n.cell, depth + 1, n.childGroupType);
             }
             else
             {
@@ -298,6 +331,7 @@ struct EsmDocument::Impl
                         {
                             if (cells.contains(c)) throw std::runtime_error("Duplicate exterior CELL coordinate");
                             auto& entry = cells[c]; entry.cellFormId = n.form; entry.landscape.cell = c;
+                            entry.cellSource = {source.string(), n.form};
                         }
                     }
                 }
@@ -309,22 +343,34 @@ struct EsmDocument::Impl
                         auto& entry = cells.at(cellCoords.at(contextCell));
                         if (entry.landFormId) throw std::runtime_error("Duplicate LAND record in CELL");
                         entry.landFormId = n.form;
+                        entry.landSource = {source.string(), n.form};
                     }
                 }
-                else if (n.type == cc("STAT"))
+                else if (n.type == cc("STAT") || n.type == cc("MSTT"))
                 {
                     ESMModel model; model.formId = n.form; model.sourceEsm = source.string();
+                    model.kind = n.type == cc("MSTT") ? ESMModelKind::movableStatic : ESMModelKind::staticObject;
+                    model.recordSourceEsm = source.string(); model.recordSourceFormId = n.form;
+                    model.recordOwnerEsm = source.string();
                     for (const auto& s : subs(body(file, n)))
                     {
                         if (s.type == cc("EDID")) model.editorId = string(s.bytes);
                         if (s.type == cc("MODL")) model.path = string(s.bytes);
                         if (s.type == cc("ESRC")) model.sourcePath = string(s.bytes);
+                        if (s.type == cc("VMAD"))
+                        {
+                            if (!model.scripts.present) model.scripts = decodePapyrusBindings(s.bytes, source.string());
+                            else { model.scripts.editable = false; model.scripts.diagnostic = "Duplicate VMAD fields are read-only"; }
+                        }
                     }
                     if (!model.path.empty()) modelList.push_back(std::move(model));
                 }
                 else if (n.type == cc("REFR"))
                 {
                     ESMReference ref; ref.placement.formId = n.form; ref.placement.instanceId = n.form;
+                    ref.recordSource = {source.string(), n.form};
+                    ref.ownerCellFormId = n.cell;
+                    ref.childGroupType = n.childGroupType;
                     for (const auto& s : subs(body(file, n)))
                     {
                         if (s.type == cc("EDID")) ref.editorId = string(s.bytes);
@@ -333,6 +379,11 @@ struct EsmDocument::Impl
                         { std::memcpy(ref.placement.position, s.bytes.data(), 12); std::memcpy(ref.placement.rotation, s.bytes.data() + 12, 12); }
                         if (s.type == cc("XSCL")) ref.placement.scale = read<float>(s.bytes, 0);
                         if (s.type == cc("XMSP")) ref.placement.materialSwap = read<std::uint32_t>(s.bytes, 0);
+                        if (s.type == cc("VMAD"))
+                        {
+                            if (!ref.scripts.present) ref.scripts = decodePapyrusBindings(s.bytes, source.string());
+                            else { ref.scripts.editable = false; ref.scripts.diagnostic = "Duplicate VMAD fields are read-only"; }
+                        }
                     }
                     ref.deleted = (read<std::uint32_t>(n.header, 8) & 0x20u) != 0;
                     refList.push_back(std::move(ref));
@@ -348,19 +399,99 @@ struct EsmDocument::Impl
         if (!input) throw std::runtime_error("Could not reopen source ESM");
         std::unordered_map<const Node*, Bytes> replacements, additions, prefixes;
         std::set<const Node*> removed;
-        Bytes newModels, newTop;
-        std::map<CellCoord, Bytes> newRefs;
+        std::map<std::uint32_t, Bytes> newModels;
+        Bytes newTop;
+        std::map<std::uint32_t, std::map<std::uint32_t, Bytes>> newRefs;
+        std::map<std::uint32_t, ESMRecordSource> persistentOwners;
         std::map<std::uint32_t, ESMModel> oldModels;
+        const auto validateScripts = [&](const PapyrusBindings& bindings) {
+            for (const auto& script : bindings.scripts) for (const auto& property : script.properties)
+                if (const auto* object = std::get_if<PapyrusObject>(&property.value))
+                    if ((object->formId >> 24) > masterNames.size())
+                        throw std::runtime_error("VMAD object property refers outside the master table");
+        };
+        const auto patchScripts = [&](std::ifstream& file, const Node* prototype,
+            const PapyrusBindings& bindings, Bytes& fields, std::set<std::uint32_t>& replace) {
+            std::optional<Bytes> previous;
+            if (prototype) for (const auto& field : subs(body(file, *prototype)))
+                if (field.type == cc("VMAD")) { previous = Bytes(field.bytes.begin(), field.bytes.end()); break; }
+            const auto desired = encodePapyrusBindings(bindings, prototype != nullptr);
+            // An undo snapshot may predate the latest save, even when it was never edited itself.
+            if (bindings.present == previous.has_value() && (!bindings.present || *previous == desired)) return;
+            if (bindings.edited || bindings.originalBytes.empty()) validateScripts(bindings);
+            replace.insert(cc("VMAD"));
+            if (bindings.present) sub(fields, cc("VMAD"), desired);
+        };
         for (const auto& m : originalModels) oldModels.emplace(m.formId, m);
+        std::set<std::uint32_t> modelIds;
+        std::map<std::string, std::unique_ptr<Impl>> modelSources;
+        const auto inheritedRecord = [&](const ESMRecordSource& origin, std::uint32_t type)
+            -> std::pair<const Node*, std::unique_ptr<std::ifstream>> {
+            if (origin.esm.empty() || !origin.formId) throw std::runtime_error("Inherited record is missing source provenance");
+            auto& indexed = modelSources[origin.esm];
+            if (!indexed) indexed = std::make_unique<Impl>(origin.esm);
+            const auto found = indexed->records.find(origin.formId);
+            if (found == indexed->records.end() || found->second->type != type)
+                throw std::runtime_error("Original record is missing or has a different type");
+            if ((type == cc("CELL") || type == cc("LAND") || type == cc("REFR")) && found->second->world != world)
+                throw std::runtime_error("Cannot preserve an inherited record from a different world");
+            // Unknown FormID fields remain valid only when every source slot retains its meaning.
+            for (std::size_t i = 0; i < indexed->masterNames.size(); ++i)
+                if (i >= masterNames.size() || folded(indexed->masterNames[i]) != folded(masterNames[i]))
+                    throw std::runtime_error("Cannot preserve an inherited record with reordered master slots");
+            if (indexed->source != source
+                && (indexed->masterNames.size() >= masterNames.size()
+                    || folded(masterNames[indexed->masterNames.size()]) != folded(indexed->source.filename().string())))
+                throw std::runtime_error("Cannot preserve an inherited record with a remapped self slot");
+            auto file = std::make_unique<std::ifstream>(origin.esm, std::ios::binary);
+            if (!*file) throw std::runtime_error("Cannot reopen original record");
+            if (indexed->source != source && (read<std::uint32_t>(indexed->roots.front()->header, 8) & 0x80u))
+                for (const auto& field : subs(body(*file, *found->second)))
+                    if (field.type == cc("FULL"))
+                        throw std::runtime_error("Cannot preserve an inherited localized name without its string table");
+            return {found->second, std::move(file)};
+        };
         for (const auto& m : modelList)
         {
+            if (!m.formId || !modelIds.insert(m.formId).second) throw std::runtime_error("Invalid or duplicate model FormID");
             if (auto old = oldModels.find(m.formId); old != oldModels.end() && old->second == m) continue;
+            const auto type = m.kind == ESMModelKind::staticObject ? cc("STAT") : cc("MSTT");
+            if (m.kind != ESMModelKind::staticObject && m.kind != ESMModelKind::movableStatic)
+                throw std::runtime_error("Unsupported model record kind");
             const Node* node = records.contains(m.formId) ? records.at(m.formId) : nullptr;
-            Bytes fields; textSub(fields, cc("EDID"), m.editorId); textSub(fields, cc("MODL"), m.path);
+            if (node && node->type != type) throw std::runtime_error("Changing an existing FormID's record type is not allowed");
+            const Node* prototype = node;
+            std::unique_ptr<std::ifstream> inherited;
+            if (!prototype && !m.recordSourceEsm.empty() && m.recordSourceFormId)
+            {
+                auto original = inheritedRecord({m.recordSourceEsm, m.recordSourceFormId}, type);
+                prototype = original.first; inherited = std::move(original.second);
+            }
+            auto modelPath = m.path;
+            std::ranges::replace(modelPath, '\\', '/');
+            if (folded(modelPath).starts_with("meshes/") && folded(modelPath).ends_with(".nif")) modelPath.erase(0, 7);
+            Bytes fields; textSub(fields, cc("EDID"), m.editorId); textSub(fields, cc("MODL"), modelPath);
             if (!m.sourcePath.empty()) textSub(fields, cc("ESRC"), m.sourcePath);
-            auto encoded = patchRecord(input, node, cc("STAT"), m.formId, fields, {cc("EDID"), cc("MODL"), cc("ESRC")});
-            if (node) replacements[node] = std::move(encoded); else append(newModels, encoded);
+            auto& originalFile = inherited ? *inherited : input;
+            std::set<std::uint32_t> originalFields;
+            if (prototype) for (const auto& field : subs(body(originalFile, *prototype))) originalFields.insert(field.type);
+            if (!originalFields.contains(cc("OBND"))) scalar(fields, cc("OBND"), std::array<std::int16_t, 6>{});
+            if (m.kind == ESMModelKind::staticObject && !originalFields.contains(cc("DNAM")))
+            {
+                Bytes direction; put(direction, 90.0f); put(direction, std::array<std::uint32_t, 3>{});
+                sub(fields, cc("DNAM"), direction);
+            }
+            if (m.kind == ESMModelKind::movableStatic)
+            {
+                if (!originalFields.contains(cc("FULL"))) textSub(fields, cc("FULL"), m.editorId);
+                if (!originalFields.contains(cc("DATA"))) scalar(fields, cc("DATA"), std::uint8_t{1});
+            }
+            std::set<std::uint32_t> replace{cc("EDID"), cc("MODL"), cc("ESRC")};
+            patchScripts(originalFile, prototype, m.scripts, fields, replace);
+            auto encoded = patchRecord(originalFile, prototype, type, m.formId, fields, replace);
+            if (node) replacements[node] = std::move(encoded); else append(newModels[type], encoded);
         }
+        for (const auto& m : originalModels) if (!modelIds.contains(m.formId)) removed.insert(records.at(m.formId));
         std::map<std::uint32_t, ESMReference> currentRefs;
         for (const auto& r : refList) if (!currentRefs.emplace(r.placement.formId, r).second) throw std::runtime_error("Duplicate reference FormID");
         for (const auto& r : originalRefs) if (!currentRefs.contains(r.placement.formId)) removed.insert(records.at(r.placement.formId));
@@ -373,62 +504,134 @@ struct EsmDocument::Impl
             for (float v : p.rotation) if (!std::isfinite(v)) throw std::runtime_error("Reference rotation is not finite");
             if (!std::isfinite(p.scale) || p.scale <= 0) throw std::runtime_error("Reference scale must be positive and finite");
             const Node* node = records.contains(p.formId) ? records.at(p.formId) : nullptr;
+            if (node && node->type != cc("REFR")) throw std::runtime_error("Reference FormID has a different record type");
+            const Node* prototype = node;
+            std::unique_ptr<std::ifstream> inherited;
+            if (!prototype && r.recordSource.esm.empty() && (p.formId >> 24) < masterNames.size())
+                throw std::runtime_error("Inherited reference is missing source provenance");
+            if (!prototype && !r.recordSource.esm.empty())
+            {
+                auto original = inheritedRecord(r.recordSource, cc("REFR"));
+                prototype = original.first; inherited = std::move(original.second);
+            }
+            const auto childType = prototype ? prototype->childGroupType : r.childGroupType;
+            if (childType != 8 && childType != 9 && childType != 10)
+                throw std::runtime_error("Unsupported reference child-group ownership");
+            std::uint32_t owner = 0;
+            if (childType == 8)
+            {
+                if (!prototype || !prototype->cell) throw std::runtime_error("Persistent reference is missing original CELL ownership");
+                owner = prototype->cell;
+                if (!records.contains(owner)) persistentOwners[owner] = {r.recordSource.esm, owner};
+            }
+            else if (const auto changed = changedTerrain.find(p.cell); changed != changedTerrain.end()) owner = changed->second.cellFormId;
+            else if (const auto existing = cells.find(p.cell); existing != cells.end()) owner = existing->second.cellFormId;
+            if (!owner) throw std::runtime_error("Reference destination has no CELL ownership");
             Bytes fields; if (!r.editorId.empty()) textSub(fields, cc("EDID"), r.editorId);
             scalar(fields, cc("NAME"), p.baseObject); Bytes transform;
             for (float v : p.position) put(transform, v); for (float v : p.rotation) put(transform, v);
             sub(fields, cc("DATA"), transform); scalar(fields, cc("XSCL"), p.scale);
             if (p.materialSwap) scalar(fields, cc("XMSP"), p.materialSwap);
-            auto encoded = patchRecord(input, node, cc("REFR"), p.formId, fields,
-                {cc("EDID"), cc("NAME"), cc("DATA"), cc("XSCL"), cc("XMSP")});
+            std::set<std::uint32_t> replace{cc("EDID"), cc("NAME"), cc("DATA"), cc("XSCL"), cc("XMSP")};
+            patchScripts(inherited ? *inherited : input, prototype, r.scripts, fields, replace);
+            auto encoded = patchRecord(inherited ? *inherited : input, prototype, cc("REFR"), p.formId, fields, replace);
             overwrite(encoded, 8, (read<std::uint32_t>(encoded, 8) & ~0x20u) | (r.deleted ? 0x20u : 0u));
-            if (node && cellCoords.contains(node->cell) && cellCoords.at(node->cell) == p.cell) replacements[node] = std::move(encoded);
-            else { if (node) removed.insert(node); append(newRefs[p.cell], encoded); }
+            if (node && node->cell == owner) replacements[node] = std::move(encoded);
+            else { if (node) removed.insert(node); append(newRefs[owner][childType], encoded); }
         }
 
         std::map<CellCoord, ESMTerrainCell> newCells;
+        std::map<std::uint32_t, Bytes> newLand;
         for (const auto& [coord, terrain] : changedTerrain)
         {
-            Bytes fields; sub(fields, cc("VHGT"), vhgt(terrain.landscape));
+            if (!cells.contains(coord)) newCells[coord] = terrain;
+            Bytes fields; const auto heights = vhgt(terrain.landscape); sub(fields, cc("VHGT"), heights);
             const Node* node = records.contains(terrain.landFormId) ? records.at(terrain.landFormId) : nullptr;
-            auto encoded = patchRecord(input, node, cc("LAND"), terrain.landFormId, fields, {cc("VHGT")});
+            if (node && node->type != cc("LAND")) throw std::runtime_error("LAND FormID has a different record type");
+            const Node* prototype = node;
+            std::unique_ptr<std::ifstream> inherited;
+            if (!prototype && !dem && terrain.landSource.esm.empty() && (terrain.landFormId >> 24) < masterNames.size())
+                throw std::runtime_error("Inherited LAND is missing source provenance");
+            if (!prototype && !terrain.landSource.esm.empty())
+            {
+                auto original = inheritedRecord(terrain.landSource, cc("LAND"));
+                if (terrain.landFormId != original.first->form)
+                    throw std::runtime_error("Cannot remap inherited LAND ownership");
+                prototype = original.first; inherited = std::move(original.second);
+            }
+            auto& originalFile = inherited ? *inherited : input;
+            // Object placement needs a CELL anchor, not an unchanged LAND override.
+            bool unchanged = false;
+            if (prototype) for (const auto& s : subs(body(originalFile, *prototype)))
+                if (s.type == cc("VHGT")) unchanged = s.bytes == heights;
+            if (unchanged) continue;
+            auto encoded = patchRecord(originalFile, prototype, cc("LAND"), terrain.landFormId, fields, {cc("VHGT")});
             if (node) replacements[node] = std::move(encoded);
-            else if (cells.contains(coord) && temporaryGroups.contains(terrain.cellFormId))
-            {
-                // LAND must precede REFR in DEM temporary groups.
-                prefixes[temporaryGroups.at(terrain.cellFormId)] = std::move(encoded);
-            }
-            else if (cells.contains(coord))
-            {
-                append(encoded, newRefs[coord]);
-                newRefs.erase(coord);
-                auto temporary = group(terrain.cellFormId, 9, encoded);
-                if (cellGroups.contains(terrain.cellFormId)) append(additions[cellGroups.at(terrain.cellFormId)], temporary);
-                else append(additions[records.at(terrain.cellFormId)], group(terrain.cellFormId, 6, temporary));
-            }
-            else newCells[coord] = terrain;
+            else newLand[terrain.cellFormId] = std::move(encoded);
         }
-        for (const auto& [coord, refs] : newRefs)
-        {
-            if (newCells.contains(coord)) continue;
-            auto existing = cells.find(coord);
-            if (existing == cells.end()) throw std::runtime_error("Reference destination has no CELL/LAND ownership");
-            const auto id = existing->second.cellFormId;
-            if (temporaryGroups.contains(id)) append(additions[temporaryGroups.at(id)], refs);
-            else if (cellGroups.contains(id)) append(additions[cellGroups.at(id)], group(id, 9, refs));
-            else throw std::runtime_error("Reference CELL is missing its children group");
-        }
+        const auto encodeChildren = [&](std::uint32_t id) {
+            auto children = std::move(newRefs[id]);
+            if (auto land = newLand.find(id); land != newLand.end())
+            {
+                append(land->second, children[9]); children[9] = std::move(land->second); newLand.erase(land);
+            }
+            newRefs.erase(id);
+            Bytes encoded;
+            for (const auto& [type, data] : children) if (!data.empty()) append(encoded, group(id, type, data));
+            return group(id, 6, encoded);
+        };
         std::map<std::uint32_t, std::map<std::uint32_t, Bytes>> trees;
         for (const auto& [coord, terrain] : newCells)
         {
-            Bytes fields; textSub(fields, cc("EDID"), "OpenF4Cell_" + std::to_string(coord.x) + "_" + std::to_string(coord.y));
-            scalar(fields, cc("DATA"), static_cast<std::uint16_t>(dem ? 2 : 0));
-            scalar(fields, cc("XCLC"), std::array<std::int32_t, 3>{coord.x, coord.y, 0});
-            if (dem) scalar(fields, cc("XCLW"), 0.0f);
-            Bytes tree = record(cc("CELL"), terrain.cellFormId, fields);
-            Bytes landFields; sub(landFields, cc("VHGT"), vhgt(terrain.landscape));
-            Bytes temporary = record(cc("LAND"), terrain.landFormId, landFields); append(temporary, newRefs[coord]);
-            append(tree, group(terrain.cellFormId, 6, group(terrain.cellFormId, 9, temporary)));
+            Bytes tree;
+            if (!terrain.cellSource.esm.empty())
+            {
+                auto original = inheritedRecord(terrain.cellSource, cc("CELL"));
+                if (terrain.cellFormId != original.first->form)
+                    throw std::runtime_error("Cannot remap inherited CELL ownership");
+                tree = readFile(*original.second, original.first->offset, static_cast<std::size_t>(original.first->size));
+            }
+            else
+            {
+                if (!dem && (terrain.cellFormId >> 24) < masterNames.size())
+                    throw std::runtime_error("Inherited CELL is missing source provenance");
+                Bytes fields; textSub(fields, cc("EDID"), "OpenF4Cell_" + std::to_string(coord.x) + "_" + std::to_string(coord.y));
+                scalar(fields, cc("DATA"), static_cast<std::uint16_t>(dem ? 2 : 0));
+                scalar(fields, cc("XCLC"), std::array<std::int32_t, 3>{coord.x, coord.y, 0});
+                if (dem) scalar(fields, cc("XCLW"), 0.0f);
+                tree = record(cc("CELL"), terrain.cellFormId, fields);
+            }
+            append(tree, encodeChildren(terrain.cellFormId));
             append(trees[coordLabel(coord, 32)][coordLabel(coord, 8)], tree);
+        }
+        for (const auto& [id, origin] : persistentOwners)
+        {
+            auto original = inheritedRecord(origin, cc("CELL"));
+            if (original.first->world != world || !worldChildren)
+                throw std::runtime_error("Persistent reference belongs to a different world");
+            if (modelSources.at(origin.esm)->cellCoords.contains(id))
+                throw std::runtime_error("Persistent reference CELL must retain its original world-level ownership");
+            auto tree = readFile(*original.second, original.first->offset, static_cast<std::size_t>(original.first->size));
+            append(tree, encodeChildren(id)); append(additions[worldChildren], tree);
+        }
+        for (auto& [id, land] : newLand)
+        {
+            if (temporaryGroups.contains(id)) prefixes[temporaryGroups.at(id)] = std::move(land);
+            else { append(land, newRefs[id][9]); newRefs[id][9] = std::move(land); }
+        }
+        for (const auto& [id, groups] : newRefs)
+        {
+            if (!records.contains(id) || records.at(id)->type != cc("CELL"))
+                throw std::runtime_error("Reference CELL ownership is missing");
+            Bytes fresh;
+            for (const auto& [type, refs] : groups)
+                if (childGroups.contains({id, type})) append(additions[childGroups.at({id, type})], refs);
+                else append(fresh, group(id, type, refs));
+            if (!fresh.empty())
+            {
+                if (cellGroups.contains(id)) append(additions[cellGroups.at(id)], fresh);
+                else append(additions[records.at(id)], group(id, 6, fresh));
+            }
         }
         if (!trees.empty() && !worldChildren) throw std::runtime_error("ESM has no active world children group");
         for (const auto& [block, subblocks] : trees)
@@ -444,16 +647,29 @@ struct EsmDocument::Impl
             }
             if (blockNode) append(additions[blockNode], freshBlock); else append(additions[worldChildren], group(block, 4, freshBlock));
         }
-        if (!newModels.empty())
+        for (const auto& [type, encoded] : newModels)
         {
             Node* statGroup = nullptr;
-            for (const auto& n : roots) if (n->type == cc("GRUP") && n->groupType == 0 && n->form == cc("STAT")) statGroup = n.get();
-            if (statGroup) append(additions[statGroup], newModels); else newTop = group(cc("STAT"), 0, newModels);
+            for (const auto& n : roots) if (n->type == cc("GRUP") && n->groupType == 0 && n->form == type) statGroup = n.get();
+            if (statGroup) append(additions[statGroup], encoded); else append(newTop, group(type, 0, encoded));
         }
+        std::function<std::uint64_t(const Node&)> count = [&](const Node& n) -> std::uint64_t {
+            if (removed.contains(&n)) return 0;
+            std::uint64_t total = 1 + countRecords(additions[&n]) + countRecords(prefixes[&n]);
+            for (const auto& child : n.children) total += count(*child);
+            return total;
+        };
+        auto recordCount = countRecords(newTop);
+        for (const auto& n : roots) if (n->type != cc("TES4")) recordCount += count(*n);
+        if (recordCount > UINT32_MAX) throw std::runtime_error("ESM record count exceeds HEDR limit");
         Bytes header;
         for (auto s : subs(body(input, *roots.front())))
         {
-            if (s.type == cc("HEDR")) overwrite(s.bytes, 8, next & 0xFFFFFFu);
+            if (s.type == cc("HEDR"))
+            {
+                overwrite(s.bytes, 4, static_cast<std::uint32_t>(recordCount));
+                overwrite(s.bytes, 8, next & 0xFFFFFFu);
+            }
             sub(header, s.type, s.bytes);
         }
         auto tes4 = roots.front()->header;
@@ -571,6 +787,7 @@ ESMMasterStack loadEsmMasterStack(const std::filesystem::path& path, std::option
         const auto name = folded(canonical[fileIndex]);
         if (name.find(".terrain.r") != std::string::npos) continue;
         if (selected.isOpenF4Owned() && selected.worldFormId() != 0x3Cu && name == "fallout4.esm") continue;
+        result.sourcePaths.push_back(std::filesystem::absolute(source).lexically_normal());
         EsmDocument document(source);
         auto remap = [&](std::uint32_t form) {
             if (!form) return form;
@@ -582,12 +799,29 @@ ESMMasterStack loadEsmMasterStack(const std::filesystem::path& path, std::option
             if (match == canonical.end()) throw std::runtime_error("Selected ESM omits a transitive master: " + owner);
             return (static_cast<std::uint32_t>(match - canonical.begin()) << 24) | (form & 0xFFFFFFu);
         };
-        for (auto m : document.models()) { m.formId = remap(m.formId); m.sourceEsm = source.string(); models[m.formId] = std::move(m); }
+        for (auto m : document.models())
+        {
+            m.formId = remap(m.formId); m.sourceEsm = source.string();
+            remapPapyrusBindings(m.scripts, remap);
+            if (const auto previous = models.find(m.formId); previous != models.end())
+            {
+                if (previous->second.kind != m.kind) throw std::runtime_error("ESM overlay changes an existing model FormID's record type");
+                if (AssetResolver::normalizePath(m.path) == AssetResolver::normalizePath(previous->second.path))
+                {
+                    AssetResolver project(source);
+                    if (!project.resolveLoose(m.path) && !project.resolveLoose("meshes/" + m.path))
+                        m.sourceEsm = previous->second.sourceEsm;
+                }
+            }
+            models[m.formId] = std::move(m);
+        }
         if (remap(document.worldFormId()) != result.worldFormId) continue;
         for (auto r : document.references())
         {
             r.placement.formId = remap(r.placement.formId); r.placement.instanceId = r.placement.formId;
             r.placement.baseObject = remap(r.placement.baseObject); r.placement.materialSwap = remap(r.placement.materialSwap);
+            r.ownerCellFormId = remap(r.ownerCellFormId);
+            remapPapyrusBindings(r.scripts, remap);
             if (r.deleted) refs.erase(r.placement.formId);
             else refs[r.placement.formId] = std::move(r);
         }
@@ -607,8 +841,13 @@ std::filesystem::path createEditorOverlay(const std::filesystem::path& master)
     textSub(header, cc("MAST"), master.filename().string()); scalar(header, cc("DATA"), std::uint64_t{0});
     textSub(header, cc("SNAM"), "OPENF4_OVERLAY\nBASE " + master.filename().string());
     Bytes bytes = record(cc("TES4"), 0, header, 1);
-    Bytes fields; textSub(fields, cc("EDID"), "OpenF4World");
-    Bytes world = record(cc("WRLD"), source.worldFormId(), fields); append(world, group(source.worldFormId(), 1, {}));
+    const auto original = source.mImpl->records.find(source.worldFormId());
+    if (original == source.mImpl->records.end() || original->second->type != cc("WRLD"))
+        throw std::runtime_error("Cannot create an overlay without its original WRLD record");
+    std::ifstream input(master, std::ios::binary);
+    // ponytail: retain localized string IDs for authoring; native export must resolve their source tables first.
+    Bytes world = readFile(input, original->second->offset, static_cast<std::size_t>(original->second->size));
+    append(world, group(source.worldFormId(), 1, {}));
     append(bytes, group(cc("WRLD"), 0, world));
     auto temporary = temporaryPath(target);
     try

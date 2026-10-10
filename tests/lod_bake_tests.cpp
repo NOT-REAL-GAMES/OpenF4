@@ -5,6 +5,8 @@
 #include "assets/lod_statics.hpp"
 #include "assets/lod_terrain.hpp"
 
+#include <sqlite3.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -13,6 +15,10 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace
 {
@@ -86,11 +92,51 @@ namespace
         const auto partial = index.bake(terrain, statics, cancel);
         require(partial.cancelled && partial.terrainBaked == 2 && partial.revision == 2,
             "Cancellation did not preserve completed tiles");
+        require(index.expectedTerrainTiles() == terrain.tiles(),
+            "Streaming lost expected terrain coverage after an interrupted initial build");
         const auto resumed = index.bake(terrain, statics);
         require(!resumed.cancelled && resumed.terrainBaked == first.terrainTiles - 2,
             "Interrupted bake did not resume remaining tiles");
         require(index.preflight(terrain, statics).totalTiles() == 0,
             "Unchanged sources still require tile work");
+
+        LodBakeOptions interrupted;
+        interrupted.full = true;
+        interrupted.progress = [](const LodBakeProgress&) {
+            throw std::runtime_error("Simulated interruption after publication");
+        };
+        bool stopped = false;
+        try { (void)index.bake(terrain, statics, interrupted); }
+        catch (const std::runtime_error&) { stopped = true; }
+        require(stopped && index.preflight(terrain, statics).terrainTiles == first.terrainTiles - 1,
+            "Interrupted publication did not keep completed work current and unfinished work dirty");
+        (void)index.bake(terrain, statics);
+
+#ifdef _WIN32
+        const auto lockedOutput = LodBuildIndex::terrainTilePath(world, terrain.tiles().front());
+        const auto publishedSize = std::filesystem::file_size(lockedOutput);
+        const auto publishedTime = std::filesystem::last_write_time(lockedOutput);
+        const auto publishedRevision = index.revision();
+        const HANDLE lock = CreateFileW(lockedOutput.c_str(), GENERIC_READ,
+            FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        require(lock != INVALID_HANDLE_VALUE, "Could not lock published tile fixture");
+        LodBakeOptions replacement;
+        replacement.full = true;
+        bool rejected = false;
+        try { (void)index.bake(terrain, statics, replacement); }
+        catch (const std::exception&) { rejected = true; }
+        CloseHandle(lock);
+        require(rejected && index.revision() == publishedRevision
+                && std::filesystem::file_size(lockedOutput) == publishedSize
+                && std::filesystem::last_write_time(lockedOutput) == publishedTime,
+            "Failed atomic replacement damaged the published tile or marked it current");
+        require(index.preflight(terrain, statics).terrainTiles == first.terrainTiles,
+            "Failed publication lost pending work");
+        for (const auto& entry : std::filesystem::directory_iterator(lockedOutput.parent_path()))
+            require(entry.path().filename().string().find(".tmp.") == std::string::npos,
+                "Failed publication leaked a temporary tile");
+        (void)index.bake(terrain, statics);
+#endif
 
         const std::vector<CellCoord> terrainChanges{{6, 6}};
         const std::vector<CellCoord> staticChanges{{-1, 0}, {4, 4}};
@@ -108,11 +154,31 @@ namespace
         require(index.preflight(terrain, statics).totalTiles() == 0,
             "Changed-only bake left stale work");
 
+        sqlite3* legacy = nullptr;
+        const auto databasePath = LodBuildIndex::indexPath(world).generic_u8string();
+        require(sqlite3_open(reinterpret_cast<const char*>(databasePath.c_str()), &legacy) == SQLITE_OK,
+            "Could not open legacy build-index fixture");
+        const auto legacyResult = sqlite3_exec(legacy,
+            "DELETE FROM metadata WHERE key='terrain_recipe'", nullptr, nullptr, nullptr);
+        sqlite3_close(legacy);
+        require(legacyResult == SQLITE_OK, "Could not remove legacy recipe version");
+        const auto legacyPlan = index.preflight(terrain, statics);
+        require(legacyPlan.full && legacyPlan.terrainTiles == first.terrainTiles,
+            "Older baker outputs were treated as current");
+        (void)index.bake(terrain, statics);
+        require(index.preflight(terrain, statics).totalTiles() == 0,
+            "Baker recipe migration did not settle after rebuilding");
+
         std::filesystem::last_write_time(world,
             std::filesystem::last_write_time(world) + std::chrono::seconds(2));
         const auto external = index.preflight(terrain, statics);
         require(external.full && external.terrainTiles == first.terrainTiles,
             "External ESM modification did not invalidate published terrain");
+        index.prepareSave();
+        index.markSavedChanges({}, {});
+        const auto afterSave = index.preflight(terrain, statics);
+        require(!afterSave.full && afterSave.terrainTiles == first.terrainTiles,
+            "An editor save masked existing external ESM changes");
     }
 
     void testStaticMembership()
@@ -160,6 +226,28 @@ namespace
         require(std::filesystem::is_regular_file(oldTile),
             "Published static tile is missing");
 
+        index.markSavedChanges({}, std::vector<CellCoord>{{4, 4}});
+        std::filesystem::remove(modelPath);
+        StaticLodSource unavailable(world);
+        require(index.preflight(terrain, unavailable, staticOnly).staticTiles == 2,
+            "An unrelated dirty tile hid an externally removed model dependency");
+        const auto skipped = index.bake(terrain, unavailable, staticOnly);
+        require(skipped.staticBaked == 0 && skipped.removedTiles == 2
+                && !skipped.diagnostics.empty() && !std::filesystem::exists(oldTile),
+            "An unresolved static did not report its omission and retire stale geometry");
+        require(index.preflight(terrain, unavailable, staticOnly).totalTiles() == 0,
+            "An unchanged unresolved tile was queued again");
+
+        writeTriangle(modelPath);
+        index.markSavedChanges({}, std::vector<CellCoord>{{4, 4}});
+        StaticLodSource restored(world);
+        const auto restoredPlan = index.preflight(terrain, restored, staticOnly);
+        require(!restoredPlan.full && restoredPlan.staticTiles == 2,
+            "An unrelated dirty tile hid a newly available model dependency");
+        const auto restoredBake = index.bake(terrain, restored, staticOnly);
+        require(restoredBake.staticBaked == 1 && std::filesystem::is_regular_file(oldTile),
+            "Restoring a missing model did not restore its distant geometry");
+
         std::filesystem::last_write_time(modelPath,
             std::filesystem::last_write_time(modelPath) + std::chrono::seconds(2));
         StaticLodSource changedModel(world);
@@ -196,6 +284,65 @@ namespace
         require(removal.removedTiles == 1 && !std::filesystem::exists(newTile),
             "Deleting the final reference left a stale coarse tile");
     }
+
+    void testShardNormalInvalidation()
+    {
+        const auto folder = std::filesystem::temp_directory_path()
+            / ("openf4-lod-shard-" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(folder);
+        const auto base = folder / "Base.esm";
+        saveEditableLandscape(base, createEditableLandscape());
+        StaticLodSource statics(base);
+        auto shard = createEditableLandscape();
+        (void)shard.addCell({31, 0});
+        const auto shardPath = folder / "Shard.esm";
+        saveEditableLandscape(shardPath, shard);
+        auto overlay = createEditableLandscape();
+        (void)overlay.addCell({32, 0});
+        (void)overlay.addCell({128, 0});
+        const auto world = folder / "Overlay.esm";
+        saveEditableLandscape(world, overlay);
+
+        std::vector<std::byte> extra;
+        const auto subrecord = [&](const char* tag, const std::string& value) {
+            for (int i = 0; i < 4; ++i) extra.push_back(std::byte(tag[i]));
+            append(extra, static_cast<std::uint16_t>(value.size()));
+            for (const char byte : value) extra.push_back(std::byte(byte));
+        };
+        for (const auto* master : {"Base.esm", "Shard.esm"})
+        {
+            subrecord("MAST", std::string(master) + '\0');
+            subrecord("DATA", std::string(8, '\0'));
+        }
+        subrecord("EMGI", std::string("OPENF4_DEM 1\nROLE OVERLAY\nSHARD Shard.esm -1 -1 31 1 10\n") + '\0');
+        {
+            std::ifstream input(world, std::ios::binary | std::ios::ate);
+            std::vector<std::byte> bytes(static_cast<std::size_t>(input.tellg()));
+            input.seekg(0);
+            input.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+            require(bool(input), "Could not read DEM overlay fixture");
+            input.close();
+            std::uint32_t headerSize;
+            std::memcpy(&headerSize, bytes.data() + 4, sizeof(headerSize));
+            bytes.insert(bytes.begin() + 24 + headerSize, extra.begin(), extra.end());
+            headerSize += static_cast<std::uint32_t>(extra.size());
+            std::memcpy(bytes.data() + 4, &headerSize, sizeof(headerSize));
+            std::ofstream output(world, std::ios::binary | std::ios::trunc);
+            output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            require(bool(output), "Could not write DEM overlay fixture");
+        }
+        TerrainLodSource terrain(world);
+        LodBuildIndex index(world);
+        LodBakeOptions terrainOnly;
+        terrainOnly.statics = false;
+        const auto first = index.bake(terrain, statics, terrainOnly);
+        std::filesystem::last_write_time(shardPath,
+            std::filesystem::last_write_time(shardPath) + std::chrono::seconds(2));
+        const auto affected = index.preflight(terrain, statics, terrainOnly);
+        require(!affected.full && affected.terrainTiles == first.terrainBaked - 4,
+            "Changed shard omitted adjacent BTR normals or dirtied unrelated terrain");
+    }
 }
 
 int main()
@@ -204,6 +351,7 @@ int main()
     {
         testIncrementalBake();
         testStaticMembership();
+        testShardNormalInvalidation();
         std::cout << "LOD build index tests passed\n";
         return 0;
     }

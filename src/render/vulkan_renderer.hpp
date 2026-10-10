@@ -105,6 +105,8 @@ namespace openf4::render
         bool terrainLod = false;
         bool water = false;
         bool decal = false;
+        bool doubleSided = false;
+        bool normalMapped = false;
     };
 
     struct SceneInstance
@@ -176,6 +178,15 @@ namespace openf4::render
             const UiDrawCallback& drawUi = {});
         [[nodiscard]] std::uint32_t addTexture(SceneTexture texture);
         [[nodiscard]] std::uint32_t addMaterial(const SceneMaterial& material);
+        void updateMaterial(std::uint32_t material, const SceneMaterial& value);
+        // Preview owns a recyclable tail of the scene. World uploads pause until endPreview.
+        // Texture index zero remains the default; preview textures are numbered from one.
+        [[nodiscard]] std::uint32_t replacePreviewScene(PackedMesh mesh,
+            std::span<const SceneInstance> instances, std::span<const SceneMaterial> materials,
+            std::span<const SceneTexture> textures = {});
+        void endPreview();
+        [[nodiscard]] std::uint32_t previewMaterialOffset() const noexcept;
+        [[nodiscard]] std::uint32_t previewTextureOffset() const noexcept;
         [[nodiscard]] MeshRange addMesh(PackedMesh mesh);
         void updateMesh(const MeshRange& range, PackedMesh mesh);
         [[nodiscard]] std::uint32_t addInstance(SceneInstance instance);
@@ -183,6 +194,7 @@ namespace openf4::render
         void updateSkinPalette(std::uint32_t offset, std::span<const glm::mat4> transforms);
         void updateInstanceTransform(std::uint32_t instance,
             const glm::mat4& transform, const glm::vec4& bounds);
+        void updateInstanceLodRange(std::uint32_t instance, glm::vec4 lodRange);
         void setInstancesActive(std::span<const std::uint32_t> instances, bool active);
         // Transient editor state. The active instance must be in the selection.
         // An empty selection performs no mask/composite work.

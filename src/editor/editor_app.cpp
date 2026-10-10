@@ -1,7 +1,10 @@
 #include "editor/editor_app.hpp"
 #include "editor/editor_document.hpp"
 #include "editor/editor_manipulation.hpp"
+#include "editor/asset_workspace.hpp"
+#include "editor/scripts_panel.hpp"
 #include "assets/fo4_install.hpp"
+#include "assets/fo4_export.hpp"
 #include "assets/lod_bake.hpp"
 #include "assets/lod_statics.hpp"
 #include "assets/lod_terrain.hpp"
@@ -165,7 +168,7 @@ namespace openf4::editor
             bool mPlatformAttached = false;
         };
 
-        enum class FileAction { open, create, saveAs, import };
+        enum class FileAction { open, create, saveAs, import, exportFolder };
         struct DialogResult
         {
             FileAction action;
@@ -222,6 +225,13 @@ namespace openf4::editor
             std::atomic<std::uint64_t> completed{0}, total{0};
         };
 
+        struct ExportProgressState
+        {
+            std::atomic<bool> cancel{false};
+            std::mutex mutex;
+            assets::Fo4ExportProgress progress;
+        };
+
         assets::LodBakePreflight preflightLod(const std::filesystem::path& world,
             const std::optional<std::filesystem::path>& data, const assets::LodBakeOptions& options)
         {
@@ -242,9 +252,11 @@ namespace openf4::editor
         {
         public:
             EditorApp(std::filesystem::path data, std::filesystem::path path,
-                int frameLimit, std::filesystem::path smokeImport, bool smokeTest, bool smokeBake)
+                int frameLimit, std::filesystem::path smokeImport, bool smokeTest, bool smokeBake, bool smokeAsset,
+                std::filesystem::path smokeExport)
                 : mData(std::move(data)), mFrameLimit(frameLimit),
-                  mSmokeImport(std::move(smokeImport)), mSmokeTest(smokeTest), mSmokeBake(smokeBake)
+                  mSmokeExport(std::move(smokeExport)), mSmokeImport(std::move(smokeImport)),
+                  mSmokeTest(smokeTest), mSmokeBake(smokeBake), mSmokeAsset(smokeAsset)
             {
                 mWindow.reset(SDL_CreateWindow("OpenF4 Editor", 1600, 1000,
                     SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY));
@@ -256,6 +268,7 @@ namespace openf4::editor
 
             ~EditorApp()
             {
+                stopExport();
                 // The UI backend owns Vulkan resources and must be destroyed first.
                 mUi.reset();
             }
@@ -273,9 +286,10 @@ namespace openf4::editor
                     const float delta = std::clamp(std::chrono::duration<float>(now - previous).count(),
                         0.0001f, 0.1f);
                     previous = now;
+                    if (mNextFrameAction) { auto action = std::move(mNextFrameAction); mNextFrameAction = {}; attempt(action); }
                     events();
                     handleDialogs();
-                    finishImport();
+                    if (!mAssetMode) finishImport();
                     if (mSmokeReopen)
                     {
                         mSmokeReopen = false;
@@ -328,31 +342,44 @@ namespace openf4::editor
                     ImGui_ImplSDL3_NewFrame();
                     ImGui::NewFrame();
                     ImGuizmo::BeginFrame();
-                    pollBake();
+                    mScripts.poll();
+                    if (!mAssetMode) pollBake();
+                    pollExport();
                     shell();
-                    navigate(delta);
-                    reconcileSelection();
-                    viewport(delta);
-                    inspector();
-                    outliner();
+                    ImGui::BeginDisabled(mExportDialog);
+                    if (mAssetMode && mAsset)
+                    {
+                        // Asset shortcuts include saves; keep its preview frozen behind the export modal.
+                        if (!mExportDialog) mAsset->draw(*mRenderer, delta, mViewportPosition, mViewportSize);
+                    }
+                    else
+                    {
+                        if (!mExportDialog) navigate(delta);
+                        reconcileSelection();
+                        viewport(delta);
+                        inspector();
+                        outliner();
+                    }
                     assetsPanel();
                     diagnostics();
-                    shortcuts();
-                    projectObjects();
+                    ImGui::EndDisabled();
+                    if (!mAssetMode) { shortcuts(); projectObjects(); }
                     smokeStep();
                     ImGui::Render();
-                    const glm::dvec3 origin = renderOrigin(mPosition);
-                    const glm::vec3 local(mPosition - origin);
-                    const glm::mat4 view = glm::lookAtRH(local, local + forward(), {0.0f, 1.0f, 0.0f});
+                    const glm::dvec3 origin = mAssetMode ? glm::dvec3(0) : renderOrigin(mPosition);
+                    const glm::vec3 local = mAssetMode ? mAsset->cameraPosition() : glm::vec3(mPosition - origin);
+                    const glm::mat4 view = mAssetMode ? mAsset->view() : glm::lookAtRH(local, local + forward(), {0.0f, 1.0f, 0.0f});
                     auto projection = render::reverseZInfinitePerspectiveRH_ZO(glm::radians(70.0f),
                         std::max(mViewportSize.x, 1.0f) / std::max(mViewportSize.y, 1.0f), 0.1f);
                     projection[1][1] *= -1.0f;
+                    if (mAssetMode) projection = mAsset->projection();
                     const auto scale = ImGui::GetIO().DisplayFramebufferScale;
-                    const render::RenderViewport rectangle{
+                    render::RenderViewport rectangle{
                         static_cast<std::int32_t>(mViewportPosition.x * scale.x),
                         static_cast<std::int32_t>(mViewportPosition.y * scale.y),
                         static_cast<std::uint32_t>(std::max(mViewportSize.x, 0.0f) * scale.x),
                         static_cast<std::uint32_t>(std::max(mViewportSize.y, 0.0f) * scale.y)};
+                    if (mAssetMode && !mAsset->renderable()) rectangle.width = rectangle.height = 0;
                     mRenderer->render(view, projection, local, glm::vec3(origin), rectangle,
                         [](VkCommandBuffer commands) {
                             ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commands);
@@ -362,6 +389,7 @@ namespace openf4::editor
                         mRunning = false;
                 }
                 finishStroke();
+                if (mAsset) mAsset->suspend(*mRenderer);
                 finishManipulation(true);
                 // Do not abandon a source copy on shutdown: finish and commit its result.
                 if (mImport)
@@ -369,6 +397,9 @@ namespace openf4::editor
                     mImport->future.wait();
                     finishImport();
                 }
+                // Compilation publishes into this world's sidecar; finish before final save/teardown.
+                while (mScripts.busy()) { mScripts.poll(); if (mScripts.busy()) SDL_Delay(10); }
+                stopExport();
                 if (mBakeProgress) mBakeProgress->cancel.store(true);
                 if (mBakePreview.valid()) mBakePreview.wait();
                 if (mBakeJob.valid()) mBakeJob.wait();
@@ -390,7 +421,10 @@ namespace openf4::editor
                     std::cerr << "Editor smoke did not complete menu input, imports, commands, reopen, and streaming drain\n";
                     mSmokeFailed = true;
                 }
-                if (mSmokeTest && mSmokeFailed) return 1;
+                if (mSmokeAsset && mAssetSmokeStage != 6) { std::cerr << "Asset smoke did not finish\n"; return 1; }
+                if (!mSmokeExport.empty() && (!mSmokeExportDone || mSmokeFailed))
+                { std::cerr << "Editor export smoke did not finish\n"; return 1; }
+                if ((mSmokeTest || mSmokeAsset) && mSmokeFailed) return 1;
                 return 0;
             }
 
@@ -399,7 +433,7 @@ namespace openf4::editor
             {
                 mMessages.push_back(error.what());
                 std::cerr << "Editor: " << error.what() << '\n';
-                mSmokeFailed |= mSmokeTest;
+                mSmokeFailed |= mSmokeTest || mSmokeAsset || !mSmokeExport.empty();
             }
 
             template<class Operation>
@@ -414,8 +448,164 @@ namespace openf4::editor
                 return mBakePreview.valid() || mBakeJob.valid() || mBakeAwaitingConfirmation;
             }
 
+            bool exportBusy() const { return mExportPreview.valid() || mExportJob.valid(); }
+
+            void stopExport()
+            {
+                if (mExportProgress) mExportProgress->cancel.store(true);
+                if (mExportPreview.valid()) mExportPreview.wait();
+                if (mExportJob.valid()) mExportJob.wait();
+                pollExport();
+                mExportPreview = {}; mExportJob = {};
+                mExportDialog = false;
+            }
+
+            void requestExport()
+            {
+                if (mExportDialog) return;
+                if (bakeBusy() || mImport || mScripts.busy())
+                    throw std::runtime_error("Finish the current bake, import, or script compilation before exporting");
+                { std::scoped_lock lock(mDialogMailbox->mutex);
+                  if (mDialogMailbox->pending) throw std::runtime_error("Finish the current file dialog before exporting"); }
+                if (mAsset && mAsset->dirty())
+                { guardAsset([this] { requestExport(); }); return; }
+                finishManipulation(true); finishStroke();
+                mNavigating = false;
+                SDL_SetWindowRelativeMouseMode(mWindow.get(), false);
+                const auto destination = mDocument->path().parent_path()
+                    / (mDocument->path().stem().string() + "-Fallout4");
+                setExportDestination(destination);
+                mExportPreflight.reset(); mExportResult.reset(); mExportError.clear();
+                mExportProgress = std::make_shared<ExportProgressState>();
+                mExportDialog = mExportOpenPopup = true;
+            }
+
+            void setExportDestination(const std::filesystem::path& path)
+            {
+                const auto utf8 = path.u8string();
+                if (utf8.size() >= mExportDestination.size()) throw std::runtime_error("Export path is too long");
+                SDL_strlcpy(mExportDestination.data(), reinterpret_cast<const char*>(utf8.c_str()), mExportDestination.size());
+            }
+
+            assets::Fo4ExportOptions exportOptions() const
+            {
+                assets::Fo4ExportOptions options;
+                options.dataDirectory = mData;
+                options.cancelled = [progress = mExportProgress] { return progress->cancel.load(); };
+                options.progress = [progress = mExportProgress](const assets::Fo4ExportProgress& update) {
+                    std::scoped_lock lock(progress->mutex); progress->progress = update;
+                };
+                return options;
+            }
+
+            void inspectExport()
+            {
+                save();
+                mExportWorld = mDocument->path();
+                mExportError.clear(); mExportPreflight.reset();
+                mExportProgress->cancel.store(false);
+                mExportPreview = std::async(std::launch::async,
+                    [world = mExportWorld, options = exportOptions()] { return assets::inspectFo4Export(world, options); });
+            }
+
+            void launchExport()
+            {
+                const auto destination = std::filesystem::u8path(mExportDestination.data());
+                if (destination.empty() || std::filesystem::exists(destination))
+                    throw std::runtime_error("Choose a new, nonempty package directory; existing directories are never overwritten");
+                if (!mExportPreflight || !mExportPreflight->canWriteWorldProof())
+                    throw std::runtime_error("Export preflight must pass first");
+                mExportProgress->cancel.store(false);
+                mExportError.clear();
+                mExportJob = std::async(std::launch::async,
+                    [world = mExportWorld, destination, options = exportOptions()] {
+                        return assets::exportFo4WorldProof(world, destination, options);
+                    });
+            }
+
+            void pollExport()
+            {
+                try
+                {
+                    if (mExportPreview.valid() && mExportPreview.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+                        mExportPreflight = mExportPreview.get();
+                    if (mExportJob.valid() && mExportJob.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+                    {
+                        mExportResult = mExportJob.get();
+                        mMessages.push_back("Fallout 4 package exported: " + mExportResult->pluginPath.string());
+                        std::cout << mMessages.back() << '\n';
+                    }
+                }
+                catch (const std::exception& error)
+                {
+                    mExportError = error.what();
+                    mMessages.push_back("Fallout 4 export: " + mExportError);
+                    std::cerr << mMessages.back() << '\n';
+                }
+            }
+
+            void exportPanel()
+            {
+                if (mExportOpenPopup) { ImGui::OpenPopup("Export to Fallout 4 (.esp)"); mExportOpenPopup = false; }
+                ImGui::SetNextWindowSize({680, 0}, ImGuiCond_Appearing);
+                if (!ImGui::BeginPopupModal("Export to Fallout 4 (.esp)", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+                ImGui::TextWrapped("Experimental world geometry export, not a complete playable-world export. Navigation and native distant LOD are not generated. DEM/overlay worlds are not supported yet.");
+                ImGui::TextWrapped("Your .esm remains the authoring project. Export creates a new package containing Data/<world>.esp, native assets, scripts, and export-report.txt. Nothing is installed into Fallout 4.");
+                ImGui::Separator();
+                const bool busy = exportBusy();
+                ImGui::BeginDisabled(busy || mExportResult.has_value());
+                ImGui::InputText("New package folder", mExportDestination.data(), mExportDestination.size());
+                if (ImGui::Button("Choose parent folder...")) showDialog(FileAction::exportFolder);
+                ImGui::EndDisabled();
+                if (mExportResult)
+                {
+                    ImGui::TextWrapped("Export complete: %s", mExportResult->pluginPath.string().c_str());
+                    ImGui::TextWrapped("Read export-report.txt before testing in a separate Fallout 4 profile. Your editor world is still %s.", mDocument->path().filename().string().c_str());
+                    ImGui::Text("Arrival: cow %s %d %d", mExportResult->worldEditorId.c_str(),
+                        mExportResult->arrivalCell.x, mExportResult->arrivalCell.y);
+                }
+                else if (busy)
+                {
+                    assets::Fo4ExportProgress progress;
+                    { std::scoped_lock lock(mExportProgress->mutex); progress = mExportProgress->progress; }
+                    ImGui::TextWrapped("%s", mExportProgress->cancel.load() ? "Canceling safely..."
+                        : progress.phase.empty() ? "Checking world and dependencies..." : progress.phase.c_str());
+                    if (progress.total) ImGui::ProgressBar(static_cast<float>(progress.completed) / progress.total);
+                    ImGui::BeginDisabled(mExportProgress->cancel.load());
+                    if (ImGui::Button("Cancel export")) mExportProgress->cancel.store(true);
+                    ImGui::EndDisabled();
+                }
+                else if (mExportPreflight)
+                {
+                    const auto& preflight = *mExportPreflight;
+                    ImGui::Text("%llu cells, %llu references, %llu models; estimated %.1f MiB",
+                        static_cast<unsigned long long>(preflight.cells), static_cast<unsigned long long>(preflight.references),
+                        static_cast<unsigned long long>(preflight.models), preflight.estimatedBytes / 1048576.0);
+                    for (const auto& limitation : preflight.limitations) ImGui::TextWrapped("- %s", limitation.c_str());
+                    for (const auto& blocker : preflight.blockers) ImGui::TextWrapped("Cannot export: %s", blocker.c_str());
+                    ImGui::BeginDisabled(!preflight.canWriteWorldProof());
+                    if (ImGui::Button("Export package"))
+                        try { launchExport(); } catch (const std::exception& error) { mExportError = error.what(); }
+                    ImGui::EndDisabled();
+                }
+                else
+                {
+                    ImGui::TextWrapped("The next step saves current world edits, then checks export compatibility. Canceling export does not undo that save.");
+                    if (ImGui::Button("Save World and Check Export"))
+                        try { inspectExport(); } catch (const std::exception& error) { mExportError = error.what(); }
+                }
+                if (!mExportError.empty()) ImGui::TextWrapped("%s", mExportError.c_str());
+                bool dialogPending;
+                { std::scoped_lock lock(mDialogMailbox->mutex); dialogPending = mDialogMailbox->pending; }
+                ImGui::BeginDisabled(busy || dialogPending);
+                if (ImGui::Button("Close")) { mExportDialog = false; ImGui::CloseCurrentPopup(); }
+                ImGui::EndDisabled();
+                ImGui::EndPopup();
+            }
+
             void requestBake(bool full)
             {
+                if (mExportDialog) throw std::runtime_error("Close the export dialog before baking");
                 if (bakeBusy()) return;
                 save();
                 mBakeWorld = mDocument->path();
@@ -480,6 +670,7 @@ namespace openf4::editor
                 {
                     attempt([&] {
                         auto result = mBakeJob.get();
+                        mMessages.insert(mMessages.end(), result.diagnostics.begin(), result.diagnostics.end());
                         mMessages.push_back(std::string(result.cancelled ? "LOD bake canceled: "
                             : "LOD bake complete: ") + std::to_string(result.terrainBaked)
                             + " terrain, " + std::to_string(result.staticBaked) + " static tiles");
@@ -512,6 +703,8 @@ namespace openf4::editor
 
             void openWorld(const std::filesystem::path& path)
             {
+                if (mExportDialog) throw std::runtime_error("Close the export dialog before opening a world");
+                if (mScripts.busy()) throw std::runtime_error("Wait for script compilation before opening a world");
                 if (bakeBusy())
                     throw std::runtime_error("Wait for or cancel the current LOD bake before opening a world");
                 if (mDocument) finishManipulation(true);
@@ -519,6 +712,11 @@ namespace openf4::editor
                     save();
                 if (mImport)
                     throw std::runtime_error("Wait for the current model import before opening a world");
+                if (mAsset)
+                {
+                    if (mAsset->dirty()) throw std::runtime_error("Save or discard the asset before opening a world");
+                    mAsset->suspend(*mRenderer); mAsset.reset(); mAssetMode = false;
+                }
                 auto next = std::make_unique<EditorDocument>(path, mData);
                 std::unique_ptr<world::LandscapeEditor> terrain;
                 std::unique_ptr<world::WorldStreamer> streamer;
@@ -593,11 +791,14 @@ namespace openf4::editor
                 while (SDL_PollEvent(&event))
                 {
                     ImGui_ImplSDL3_ProcessEvent(&event);
+                    if (mExportDialog && event.type != SDL_EVENT_QUIT && event.type != SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
+                        continue;
                     switch (event.type)
                     {
-                    case SDL_EVENT_QUIT: mRunning = false; break;
+                    case SDL_EVENT_QUIT: guardAsset([this] { mRunning = false; }); break;
                     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: mRenderer->resize(); break;
                     case SDL_EVENT_WINDOW_FOCUS_LOST:
+                        if (mAsset) mAsset->cancelGesture();
                         finishManipulation(true);
                         mNavigating = false;
                         SDL_SetWindowRelativeMouseMode(mWindow.get(), false);
@@ -617,6 +818,7 @@ namespace openf4::editor
                         }
                         break;
                     case SDL_EVENT_MOUSE_WHEEL:
+                        if (mAssetMode) break;
                         if (mViewportHovered && mTerrainMode && mTerrain)
                         {
                             if (SDL_GetModState() & SDL_KMOD_SHIFT)
@@ -628,7 +830,7 @@ namespace openf4::editor
                             mMoveSpeed = std::clamp(mMoveSpeed * std::pow(1.25f, event.wheel.y), 10.0f, 1.0e6f);
                         break;
                     case SDL_EVENT_DROP_FILE:
-                        if (event.drop.data)
+                        if (event.drop.data && !mAssetMode)
                             attempt([&] { startImport(std::filesystem::u8path(event.drop.data)); });
                         break;
                     default: break;
@@ -638,6 +840,17 @@ namespace openf4::editor
 
             void showDialog(FileAction action)
             {
+                if (mExportDialog && action != FileAction::exportFolder)
+                { mMessages.push_back("Close the export dialog before changing files"); return; }
+                if (mScripts.busy() && action != FileAction::import)
+                { mMessages.push_back("Wait for script compilation before changing worlds"); return; }
+                if (mAsset && mAsset->dirty() && action != FileAction::import)
+                { guardAsset([this, action] { showDialog(action); }); return; }
+                if (bakeBusy() && action != FileAction::import)
+                {
+                    mMessages.push_back("Finish or cancel the LOD bake before opening or saving another world");
+                    return;
+                }
                 finishManipulation(true);
                 std::scoped_lock lock(mDialogMailbox->mutex);
                 if (mDialogMailbox->pending || mImport)
@@ -647,7 +860,9 @@ namespace openf4::editor
                 static constexpr SDL_DialogFileFilter esmFilter[]{ {"Bethesda master", "esm"} };
                 static constexpr SDL_DialogFileFilter modelFilter[]{
                     {"3D model", "glb;gltf;obj;fbx;dae;ply;stl;blend;3ds"}, {"All files", "*"} };
-                if (action == FileAction::saveAs || action == FileAction::create)
+                if (action == FileAction::exportFolder)
+                    SDL_ShowOpenFolderDialog(fileDialogResult, request, mWindow.get(), nullptr, false);
+                else if (action == FileAction::saveAs || action == FileAction::create)
                     SDL_ShowSaveFileDialog(fileDialogResult, request, mWindow.get(), esmFilter, 1,
                         nullptr);
                 else
@@ -667,6 +882,17 @@ namespace openf4::editor
                     attempt([&] {
                         if (!result.error.empty())
                             throw std::runtime_error(result.error);
+                        if (result.action == FileAction::exportFolder)
+                        {
+                            if (mExportDialog && !exportBusy())
+                                setExportDestination(result.path / std::filesystem::u8path(mExportDestination.data()).filename());
+                            return;
+                        }
+                        if (mExportDialog) throw std::runtime_error("Close the export dialog before changing files");
+                        if (mScripts.busy() && result.action != FileAction::import)
+                            throw std::runtime_error("Wait for script compilation before changing worlds");
+                        if (bakeBusy() && result.action != FileAction::import)
+                            throw std::runtime_error("Finish or cancel the LOD bake before opening or saving another world");
                         if (result.action == FileAction::import)
                             startImport(result.path);
                         else if (result.action == FileAction::saveAs)
@@ -718,27 +944,29 @@ namespace openf4::editor
                     {
                         if (ImGui::MenuItem("New world...", "Ctrl+N")) showDialog(FileAction::create);
                         if (ImGui::MenuItem("Open world...", "Ctrl+O")) showDialog(FileAction::open);
-                        if (ImGui::MenuItem("Save", "Ctrl+S")) attempt([&] { save(); });
+                        if (ImGui::MenuItem("Save World", mAssetMode ? nullptr : "Ctrl+S")) attempt([&] { save(); });
+                        if (mAsset && ImGui::MenuItem("Save Native NIF", mAssetMode ? "Ctrl+S" : nullptr)) attempt([&] { mAsset->save(); });
                         if (ImGui::MenuItem("Save as...")) showDialog(FileAction::saveAs);
+                        if (ImGui::MenuItem("Export to Fallout 4 (.esp)...")) attempt([&] { requestExport(); });
                         ImGui::Separator();
                         if (ImGui::MenuItem("Import model...")) showDialog(FileAction::import);
                         ImGui::Separator();
-                        if (ImGui::MenuItem("Exit")) mRunning = false;
+                        if (ImGui::MenuItem("Exit")) guardAsset([this] { mRunning = false; });
                         if (smokeMenuPhase() == 3) ImGui::CloseCurrentPopup();
                         ImGui::EndMenu();
                     }
                     if (ImGui::BeginMenu("Edit"))
                     {
-                        if (ImGui::MenuItem("Undo", "Ctrl+Z")) history(false);
-                        if (ImGui::MenuItem("Redo", "Ctrl+Y")) history(true);
+                        if (ImGui::MenuItem("Undo", "Ctrl+Z")) { if(mAssetMode) mAsset->history(false); else history(false); }
+                        if (ImGui::MenuItem("Redo", "Ctrl+Y")) { if(mAssetMode) mAsset->history(true); else history(true); }
                         ImGui::Separator();
-                        if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, !mSelection.empty())) duplicate();
-                        if (ImGui::MenuItem("Delete", "Delete", false, !mSelection.empty())) erase();
+                        if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, !mAssetMode && !mSelection.empty())) duplicate();
+                        if (ImGui::MenuItem("Delete", "Delete", false, !mAssetMode && !mSelection.empty())) erase();
                         ImGui::EndMenu();
                     }
                     if (ImGui::BeginMenu("Build"))
                     {
-                        ImGui::BeginDisabled(bakeBusy());
+                        ImGui::BeginDisabled(bakeBusy() || mAssetMode);
                         if (ImGui::MenuItem("Bake Changed LOD"))
                             attempt([&] { requestBake(false); });
                         if (ImGui::MenuItem("Bake All LOD"))
@@ -757,15 +985,40 @@ namespace openf4::editor
                         ImGui::EndMenu();
                     }
                     ImGui::Separator();
+                    if (ImGui::MenuItem("World", nullptr, !mAssetMode)) switchWorkspace(false);
+                    if (ImGui::MenuItem("Asset", nullptr, mAssetMode, mAsset != nullptr || selectedReference() != nullptr)) activateAssetWorkspace();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("Open the selected object's asset, or return to the open asset.\nSelect an object first, or right-click a model in Asset Browser > Edit Asset.");
+                    ImGui::BeginDisabled(mAssetMode);
                     if (ImGui::MenuItem("Objects", nullptr, !mTerrainMode))
                     { finishManipulation(true); finishStroke(); mTerrainMode = false; }
                     if (ImGui::MenuItem("Landscape", nullptr, mTerrainMode, mTerrain != nullptr))
                     { finishManipulation(true); mTerrainMode = true; }
+                    ImGui::EndDisabled();
                     ImGui::Separator();
                     ImGui::TextUnformatted(mDocument->path().filename().string().c_str());
                     if (mDocument->dirty()) { ImGui::SameLine(); ImGui::TextUnformatted("*"); }
                     if (mImport) { ImGui::SameLine(); ImGui::TextUnformatted("Importing..."); }
                     ImGui::EndMenuBar();
+                }
+                if (mAssetPending) ImGui::OpenPopup("Unsaved asset");
+                if (ImGui::BeginPopupModal("Unsaved asset", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+                {
+                    ImGui::TextUnformatted("Save native asset changes before continuing?\nThe world assignment remains dirty until Save World.");
+                    if (ImGui::Button("Save")) attempt([&] {
+                        mAsset->save(); auto action = std::move(mAssetPending); mAssetPending = {};
+                        ImGui::CloseCurrentPopup(); action();
+                    });
+                    ImGui::SameLine();
+                    if (ImGui::Button("Discard"))
+                    {
+                        mAsset->suspend(*mRenderer); mAsset.reset(); mAssetMode = false;
+                        auto action = std::move(mAssetPending); mAssetPending = {};
+                        ImGui::CloseCurrentPopup(); attempt(action);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel")) { mAssetPending = {}; ImGui::CloseCurrentPopup(); }
+                    ImGui::EndPopup();
                 }
                 if (mBakeAwaitingConfirmation)
                     ImGui::OpenPopup("Confirm large LOD bake");
@@ -791,6 +1044,7 @@ namespace openf4::editor
                     }
                     ImGui::EndPopup();
                 }
+                exportPanel();
                 const ImGuiID dock = ImGui::GetID("EditorDockspace");
                 if (!ImGui::DockBuilderGetNode(dock))
                 {
@@ -962,8 +1216,13 @@ namespace openf4::editor
                 // Reserve the viewport without claiming an active/hovered item ID:
                 // ImGuizmo deliberately refuses drags while another widget owns it.
                 ImGui::Dummy(mViewportSize);
-                mViewportHovered = ImGui::IsItemHovered();
-                mViewportFocused = ImGui::IsWindowFocused();
+                mViewportHovered = !mExportDialog && ImGui::IsItemHovered();
+                mViewportFocused = !mExportDialog && ImGui::IsWindowFocused();
+                if (mExportDialog)
+                {
+                    // ImGuizmo/raw mouse handlers do not honor ImGui's disabled widget flag.
+                    ImGui::End(); ImGui::PopStyleVar(); return;
+                }
                 // Decide after ImGui has processed this frame's popup/capture state,
                 // not from the previous frame's hover position in the SDL event loop.
                 if (mViewportHovered && !mGizmoDragging && !mInspectorEditing && !ImGui::GetIO().WantTextInput
@@ -1210,7 +1469,9 @@ namespace openf4::editor
                     const auto baseObject = reference->placement.baseObject;
                     const bool locked = reference->locked;
                     ImGui::Text("%s", reference->name.empty() ? "Placed object" : reference->name.c_str());
-                    ImGui::Text("REFR %08X  /  STAT %08X", id, reference->placement.baseObject);
+                    const auto* base = mDocument->model(reference->placement.baseObject);
+                    ImGui::Text("REFR %08X  /  %s %08X", id,
+                        base && base->kind == assets::ESMModelKind::movableStatic ? "MSTT" : "STAT", reference->placement.baseObject);
                     ImGui::Text("Cell (%d, %d)", reference->placement.cell.x, reference->placement.cell.y);
                     if (mSelection.size() > 1)
                         ImGui::Text("%zu selected; gizmo moves the selection", mSelection.size());
@@ -1271,8 +1532,21 @@ namespace openf4::editor
                     if (ImGui::Button("Frame selected")) frameSelection();
                     ImGui::SameLine();
                     if (ImGui::Button("Duplicate")) duplicate();
+                    if (ImGui::Button("Edit Asset")) requestAsset(baseObject);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Make Unique")) mNextFrameAction = [this, id] { guardAsset([this, id] {
+                        const auto found = std::ranges::find_if(mDocument->references(), [id](const auto& ref) { return ref.placement.formId == id; });
+                        if (found == mDocument->references().end()) throw std::runtime_error("Selected reference no longer exists");
+                        auto next = std::make_unique<AssetWorkspace>(*mDocument, found->placement.baseObject, mData);
+                        next->makeUnique(id);
+                        if (mAsset) mAsset->suspend(*mRenderer);
+                        mAsset = std::move(next); mAssetMode = true;
+                    }); };
                     if (auto source = mDocument->sourcePath(baseObject))
                         ImGui::TextWrapped("Source: %s", source->c_str());
+                    ImGui::BeginDisabled(mGizmoDragging || mInspectorEditing || locked);
+                    mScripts.draw(*mDocument, id, mData);
+                    ImGui::EndDisabled();
                 }
                 else
                     ImGui::TextWrapped("Select an object in the viewport or outliner. Drop a GLB file into the viewport to import and place it.");
@@ -1306,7 +1580,7 @@ namespace openf4::editor
             void assetsPanel()
             {
                 ImGui::Begin("Asset Browser");
-                ImGui::BeginDisabled(mImport.has_value());
+                ImGui::BeginDisabled(mImport.has_value() || mAssetMode);
                 if (ImGui::Button("Import model...")) showDialog(FileAction::import);
                 ImGui::EndDisabled();
                 ImGui::SameLine();
@@ -1317,7 +1591,12 @@ namespace openf4::editor
                     ImGui::PushID(static_cast<int>(id));
                     if (ImGui::Selectable(path.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick)
                         && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                        attempt([&] { placeModel(id); });
+                        if (!mAssetMode) attempt([&] { placeModel(id); });
+                    if (ImGui::BeginPopupContextItem())
+                    {
+                        if (ImGui::MenuItem("Edit Asset")) requestAsset(id);
+                        ImGui::EndPopup();
+                    }
                     if (ImGui::BeginDragDropSource())
                     {
                         ImGui::SetDragDropPayload("OPENF4_MODEL", &id, sizeof(id));
@@ -1327,6 +1606,48 @@ namespace openf4::editor
                     ImGui::PopID();
                 }
                 ImGui::End();
+            }
+
+            void guardAsset(std::function<void()> action)
+            {
+                if (mAsset) mAsset->cancelGesture();
+                if (mAsset && mAsset->dirty()) mAssetPending = std::move(action);
+                else attempt(action);
+            }
+
+            void switchWorkspace(bool asset)
+            {
+                if (mExportDialog) return;
+                if (asset == mAssetMode || (asset && !mAsset)) return;
+                finishManipulation(true); finishStroke();
+                mNavigating = false; SDL_SetWindowRelativeMouseMode(mWindow.get(), false);
+                if (!asset) mAsset->suspend(*mRenderer);
+                mAssetMode = asset;
+            }
+
+            void activateAssetWorkspace()
+            {
+                if (mAsset) switchWorkspace(true);
+                else if (const auto* reference = selectedReference()) requestAsset(reference->placement.baseObject);
+            }
+
+            void requestAsset(std::uint32_t id)
+            {
+                mNextFrameAction = [this, id] { openAssetNow(id); };
+            }
+
+            void openAssetNow(std::uint32_t id)
+            {
+                if (mExportDialog) return;
+                if (mImport || bakeBusy()) { mMessages.push_back("Finish the import or LOD bake before editing an asset"); return; }
+                if (mAsset && mAsset->modelId() == id) { switchWorkspace(true); return; }
+                guardAsset([this,id] {
+                    auto next = std::make_unique<AssetWorkspace>(*mDocument, id, mData);
+                    if (mAsset) mAsset->suspend(*mRenderer);
+                    finishManipulation(true); finishStroke();
+                    mNavigating = false; SDL_SetWindowRelativeMouseMode(mWindow.get(), false);
+                    mAsset = std::move(next); mAssetMode = true;
+                });
             }
 
             void diagnostics()
@@ -1362,6 +1683,7 @@ namespace openf4::editor
 
             void shortcuts()
             {
+                if (mExportDialog) return;
                 if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { finishManipulation(true); return; }
                 if (mGizmoDragging || mInspectorEditing) return;
                 if (ImGui::GetIO().WantTextInput || mNavigating) return;
@@ -1395,6 +1717,7 @@ namespace openf4::editor
 
             void startImport(const std::filesystem::path& source)
             {
+                if (mExportDialog) throw std::runtime_error("Close the export dialog before importing");
                 finishManipulation(true);
                 if (mImport) throw std::runtime_error("Another import is still running");
                 if (!std::filesystem::is_regular_file(source))
@@ -1561,6 +1884,7 @@ namespace openf4::editor
 
             void save()
             {
+                if (exportBusy()) throw std::runtime_error("Export is using the saved source; cancel or finish it before saving");
                 if (bakeBusy())
                     throw std::runtime_error("LOD bake is using the saved source; cancel or finish it before saving");
                 finishManipulation(false);
@@ -1573,8 +1897,14 @@ namespace openf4::editor
 
             void smokeStep()
             {
+                if (!mSmokeExport.empty()) { exportSmokeStep(); return; }
                 if (!mSmokeImport.empty() && mFrames == 3)
                     attempt([&] { startImport(mSmokeImport); });
+                if (mSmokeAsset)
+                {
+                    assetSmokeStep();
+                    return;
+                }
                 if (!mSmokeTest) return;
                 if (mFrames == 8) SDL_SetWindowSize(mWindow.get(), 1280, 800);
                 if (mFrames == 15) SDL_SetWindowSize(mWindow.get(), 1440, 900);
@@ -1758,12 +2088,142 @@ namespace openf4::editor
                     });
             }
 
+            void assetSmokeStep()
+            {
+                if (mFrames < mAssetSmokeFrame + 15 || mSmokeFailed || mAssetSmokeStage >= 6) return;
+                attempt([&] {
+                    if (mAssetSmokeStage == 0)
+                    {
+                        if (!mSmokeImported || mObjects->pending() || !mObjects->loaded()) return;
+                        mSmokeReference = mDocument->references().back().placement.formId;
+                        mSmokeBakeCamera = mPosition; mSmokeBakeSelection = mSelection;
+                        mSmokeTransform = mDocument->engineTransform(*mSmokeReference);
+                        mSmokeTransform[3].x += 16;
+                        mDocument->setTransform(*mSmokeReference, mSmokeTransform);
+                        if(mTerrain)
+                        {
+                            const auto before=mTerrain->snapshot();
+                            const auto cell=before.cellForms.begin()->first;
+                            const auto heights=before.cell(cell).heights;
+                            const glm::dvec3 above(-(cell.x+.5)*cellSize,heights[16*assets::LandscapeCell::side+16]+1024,(cell.y+.5)*cellSize);
+                            mDocument->beginTransaction();
+                            mTerrain->setTool(world::LandscapeTool::raise);mTerrain->setBrushEnabled(true);
+                            mTerrain->update(*mRenderer,above,{0,-1,0},.125f,true);
+                            mTerrain->update(*mRenderer,above,{0,-1,0},0,false);mTerrain->setBrushEnabled(false);
+                            synchronizeTerrain();mDocument->endTransaction();
+                            mSmokeTerrainCell=cell;mSmokeTerrainHeights=mTerrain->snapshot().cell(cell).heights;
+                            if(mSmokeTerrainHeights==heights) throw std::runtime_error("Asset smoke did not sculpt LAND");
+                        }
+                        if (mAsset || !selectedReference()) throw std::runtime_error("Asset smoke requires a selected object without an open asset");
+                        activateAssetWorkspace();
+                    }
+                    else if (mAssetSmokeStage == 1)
+                    {
+                        if (!mAsset || !mAssetMode || !mAsset->renderable()) throw std::runtime_error("Asset workspace command did not open the selected object");
+                        std::cout << "Asset workspace command opened selected object without a prior asset session\n";
+                        mAsset->smokeEdit();
+                        SDL_SetWindowSize(mWindow.get(), 1280, 800);
+                    }
+                    else if (mAssetSmokeStage == 2)
+                    {
+                        mAsset->smokeVerifyPhysics();
+                        const auto cameras = mPosition == mSmokeBakeCamera && mSelection == mSmokeBakeSelection;
+                        if (!cameras || mDocument->engineTransform(*mSmokeReference) != mSmokeTransform || !mDocument->dirty())
+                            throw std::runtime_error("Asset preview changed world state");
+                        if(mTerrain && mSmokeTerrainCell && mTerrain->snapshot().cell(*mSmokeTerrainCell).heights!=mSmokeTerrainHeights)
+                            throw std::runtime_error("Asset preview lost unsaved LAND");
+                        mAsset->save();
+                        if (mAsset->dirty() || !mDocument->dirty()) throw std::runtime_error("Asset save dirty boundary failed");
+                        const auto* model = mDocument->model(mAsset->modelId());
+                        if (!model || model->kind != assets::ESMModelKind::movableStatic) throw std::runtime_error("Native asset did not assign MSTT");
+                        switchWorkspace(false);
+                    }
+                    else if (mAssetSmokeStage == 3)
+                    {
+                        if (mObjects->pending()) return;
+                        if (!mDocument->undo() || !mDocument->redo()) throw std::runtime_error("Native assignment world undo failed");
+                        save();
+                        const auto id=mAsset->modelId();
+                        mAsset.reset(); openAssetNow(id);
+                        if (!mAsset->document().movable()) throw std::runtime_error("Native asset reload lost movable collision");
+                    }
+                    else if (mAssetSmokeStage == 4)
+                    {
+                        // Draw between replacements so the check exercises uploaded resources and fences.
+                        const auto current=mRenderer->stats();
+                        if(mAssetSmokePreviewStats && (current.residentTextures!=mAssetSmokePreviewStats->residentTextures
+                            || current.textureResidentBytes!=mAssetSmokePreviewStats->textureResidentBytes
+                            || current.sourceCandidates!=mAssetSmokePreviewStats->sourceCandidates))
+                            throw std::runtime_error("Preview resources accumulated");
+                        mAssetSmokePreviewStats=current;
+                        if(mAssetSmokeReplacements++<4)
+                        {switchWorkspace(false);switchWorkspace(true);mAssetSmokeFrame=mFrames;return;}
+                        mAsset->makeUnique(*mSmokeReference);
+                        mAsset->save();switchWorkspace(false);save();
+                    }
+                    else if (mAssetSmokeStage == 5)
+                    {
+                        if(mObjects->pending()) return;
+                        const auto path=mDocument->path();openWorld(path);
+                        if(mDocument->engineTransform(*mSmokeReference)!=mSmokeTransform) throw std::runtime_error("Asset smoke reopen changed placement");
+                        if(mTerrain && mSmokeTerrainCell && mTerrain->snapshot().cell(*mSmokeTerrainCell).heights!=mSmokeTerrainHeights)
+                            throw std::runtime_error("Native asset save/reopen lost sculpted LAND");
+                        std::cout<<"Asset smoke verified: edit, physics preview, undo, native save, MSTT assignment, unique, reopen, viewport resize and world preservation\n";
+                    }
+                    ++mAssetSmokeStage;mAssetSmokeFrame=mFrames;
+                });
+            }
+
+            void exportSmokeStep()
+            {
+                if (mFrames < 20 || mSmokeFailed || mSmokeExportDone || mObjects->pending()) return;
+                attempt([&] {
+                    if (!mExportDialog)
+                    {
+                        if (!mDocument->references().empty())
+                        {
+                            const auto id = mDocument->references().front().placement.formId;
+                            select(id);
+                            auto transform = mDocument->engineTransform(id);
+                            transform[3].y += 16.0f;
+                            mDocument->setTransform(id, transform);
+                            if (!mDocument->dirty()) throw std::runtime_error("Export smoke did not create unsaved work");
+                        }
+                        mSmokeExportCamera = mPosition; mSmokeExportSelection = mSelection;
+                        mSmokeExportWorld = mDocument->path();
+                        requestExport(); setExportDestination(mSmokeExport);
+                    }
+                    else if (!mExportError.empty()) throw std::runtime_error(mExportError);
+                    else if (!exportBusy())
+                    {
+                        if (mExportResult)
+                        {
+                            if (!std::filesystem::is_regular_file(mExportResult->pluginPath)
+                                || !std::filesystem::is_regular_file(mExportResult->packageDirectory / "export-report.txt")
+                                || mDocument->path() != mSmokeExportWorld || mPosition != mSmokeExportCamera
+                                || mSelection != mSmokeExportSelection || mDocument->dirty())
+                                throw std::runtime_error("Export smoke changed editor state or failed to publish package");
+                            mSmokeExportDone = true;
+                            std::cout << "Editor export smoke verified: save, preflight, native package, camera/selection/project preserved\n";
+                        }
+                        else if (mExportPreflight) launchExport();
+                        else inspectExport();
+                    }
+                });
+            }
+
             SdlLifetime mSdl;
             std::filesystem::path mData;
             std::unique_ptr<SDL_Window, WindowDeleter> mWindow;
             std::unique_ptr<render::VulkanRenderer> mRenderer;
             std::unique_ptr<EditorUi> mUi;
             std::unique_ptr<EditorDocument> mDocument;
+            std::unique_ptr<AssetWorkspace> mAsset;
+            bool mAssetMode = false;
+            unsigned mAssetSmokeReplacements = 0;
+            std::optional<render::RendererStats> mAssetSmokePreviewStats;
+            std::function<void()> mAssetPending;
+            std::function<void()> mNextFrameAction;
             std::unique_ptr<world::LandscapeEditor> mTerrain;
             std::unique_ptr<world::WorldStreamer> mStreamer;
             std::unique_ptr<world::ObjectScene> mObjects;
@@ -1776,10 +2236,24 @@ namespace openf4::editor
             std::shared_ptr<BakeProgressState> mBakeProgress;
             std::filesystem::path mBakeWorld;
             bool mBakeAwaitingConfirmation = false;
+            bool mExportDialog = false, mExportOpenPopup = false;
+            std::array<char, 4096> mExportDestination{};
+            std::filesystem::path mExportWorld;
+            std::shared_ptr<ExportProgressState> mExportProgress;
+            std::future<assets::Fo4ExportPreflight> mExportPreview;
+            std::future<assets::Fo4ExportResult> mExportJob;
+            std::optional<assets::Fo4ExportPreflight> mExportPreflight;
+            std::optional<assets::Fo4ExportResult> mExportResult;
+            std::string mExportError;
+            std::filesystem::path mSmokeExport, mSmokeExportWorld;
+            glm::dvec3 mSmokeExportCamera{};
+            std::set<std::uint32_t> mSmokeExportSelection;
+            bool mSmokeExportDone = false;
             std::set<std::uint32_t> mSelection;
             std::vector<std::uint32_t> mSelectionOrder;
             std::optional<std::uint32_t> mActiveReference;
             std::vector<std::string> mMessages;
+            ScriptsPanel mScripts;
             glm::dvec3 mPosition{};
             float mYaw = 0.0f, mPitch = 0.0f;
             float mMoveSpeed = 4096.0f;
@@ -1809,6 +2283,8 @@ namespace openf4::editor
             int mFrames = 0, mFrameLimit = 0;
             std::filesystem::path mSmokeImport;
             bool mSmokeTest = false;
+            bool mSmokeAsset = false;
+            int mAssetSmokeStage = 0, mAssetSmokeFrame = 0;
             bool mSmokeBake = false, mSmokeBakeStarted = false, mSmokeBakeCompleted = false;
             glm::dvec3 mSmokeBakeCamera{};
             std::set<std::uint32_t> mSmokeBakeSelection;
@@ -1835,8 +2311,9 @@ namespace openf4::editor
     {
         std::filesystem::path path = "mods/OpenF4World.esm";
         std::filesystem::path smokeImport;
+        std::filesystem::path smokeExport;
         int frameLimit = 0;
-        bool pathSet = false, smokeTest = false, smokeBake = false;
+        bool pathSet = false, smokeTest = false, smokeBake = false, smokeAsset = false;
         bool headlessBake = false, bakeFull = false, bakeYes = false;
         bool terrainOnly = false, staticsOnly = false;
         for (int index = 1; index < argc; ++index)
@@ -1854,6 +2331,12 @@ namespace openf4::editor
                 smokeImport = argv[index];
             }
             else if (argument == "--smoke-test") smokeTest = true;
+            else if (argument == "--smoke-export")
+            {
+                if (++index >= argc) throw std::runtime_error("--smoke-export expects a new package directory");
+                smokeExport = argv[index];
+            }
+            else if (argument == "--smoke-asset") smokeAsset = true;
             else if (argument == "--smoke-bake") { smokeTest = true; smokeBake = true; }
             else if (argument == "--bake-lod") headlessBake = true;
             else if (argument == "--full") bakeFull = true;
@@ -1862,7 +2345,8 @@ namespace openf4::editor
             else if (argument == "--statics-only") staticsOnly = true;
             else if (argument == "--help")
             {
-                std::cout << "openf4-editor [world.esm] [--frames N] [--smoke-import model.glb] [--smoke-test]\n"
+                std::cout << "openf4-editor [world.esm] [--frames N] [--smoke-import model.glb] [--smoke-test|--smoke-asset]\n"
+                    << "openf4-editor world.esm --smoke-export new-package-directory [--frames N]\n"
                     << "openf4-editor world.esm --bake-lod [--full] [--terrain-only|--statics-only] [--yes]\n";
                 return 0;
             }
@@ -1880,7 +2364,7 @@ namespace openf4::editor
         const auto data = assets::findFallout4Data();
         if (headlessBake)
         {
-            if (!pathSet || frameLimit || smokeTest || !smokeImport.empty())
+            if (!pathSet || frameLimit || smokeTest || smokeAsset || !smokeImport.empty() || !smokeExport.empty())
                 throw std::runtime_error("Headless bake expects a world.esm and bake options only");
             assets::LodBakeOptions options;
             options.full = bakeFull;
@@ -1903,14 +2387,20 @@ namespace openf4::editor
                 }
             };
             const auto result = bakeLod(path, data, options);
+            for (const auto& diagnostic : result.diagnostics)
+                std::cout << diagnostic << '\n';
             std::cout << "LOD bake complete: " << result.terrainBaked << " terrain, "
                 << result.staticBaked << " static tiles, " << result.removedTiles
                 << " removed; revision " << result.revision << '\n';
             return result.cancelled ? 1 : 0;
         }
         if (!data) throw std::runtime_error("Editor requires Fallout 4 data; set FALLOUT4_PATH");
-        if (smokeTest && frameLimit == 0) frameLimit = 180;
-        EditorApp app(*data, path, frameLimit, smokeImport, smokeTest, smokeBake);
+        if (!smokeExport.empty() && (!pathSet || smokeTest || smokeAsset || !smokeImport.empty()))
+            throw std::runtime_error("Export smoke requires only a proof world, output directory, and optional --frames");
+        if (frameLimit == 0 && !smokeExport.empty()) frameLimit = 360;
+        if ((smokeTest || smokeAsset) && frameLimit == 0) frameLimit = 240;
+        if (smokeAsset && (smokeImport.empty() || smokeTest)) throw std::runtime_error("--smoke-asset requires --smoke-import and is separate from --smoke-test");
+        EditorApp app(*data, path, frameLimit, smokeImport, smokeTest, smokeBake, smokeAsset, smokeExport);
         return app.run();
     }
 }

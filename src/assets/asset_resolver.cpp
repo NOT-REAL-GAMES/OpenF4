@@ -7,15 +7,95 @@
 #include <array>
 #include <cctype>
 #include <fstream>
+#include <iomanip>
 #include <map>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 
 namespace openf4::assets
 {
+    std::string compatibilityJsonString(std::string_view value)
+    {
+        std::string result = "\"";
+        constexpr char hex[] = "0123456789abcdef";
+        for (const unsigned char c : value)
+        {
+            if (c == '"' || c == '\\') { result += '\\'; result += static_cast<char>(c); }
+            else if (c < 0x20)
+            {
+                result += "\\u00"; result += hex[c >> 4]; result += hex[c & 15];
+            }
+            else result += static_cast<char>(c);
+        }
+        return result + '"';
+    }
+
     namespace
     {
+        std::string utf8(const std::filesystem::path& path)
+        {
+            const auto value = path.generic_u8string();
+            return {value.begin(), value.end()};
+        }
+
+        bool inside(const std::filesystem::path& path, const std::filesystem::path& root)
+        {
+            auto a = path.begin();
+            for (auto b = root.begin(); b != root.end(); ++a, ++b)
+                if (a == path.end() || AssetResolver::normalizePath(a->string())
+                    != AssetResolver::normalizePath(b->string())) return false;
+            return a != path.end();
+        }
+
+        struct CompatibilityCapture
+        {
+            std::filesystem::path root;
+            std::filesystem::path directory;
+            std::mutex mutex;
+            std::ofstream log;
+            std::size_t reads = 0;
+
+            void record(std::string_view requested, const AssetBytes& asset)
+            {
+                const std::lock_guard lock(mutex);
+                const auto id = ++reads;
+                std::string captured;
+                // Never copy archive/loose Data bytes, or a sidecar symlink escaping its root.
+                const bool allowed = asset.source == AssetSource::project
+                    && inside(std::filesystem::canonical(asset.resolvedPath), root);
+                if (allowed)
+                {
+                    std::ostringstream filename;
+                    filename << "consumed/" << std::setw(6) << std::setfill('0') << id << ".bin";
+                    captured = filename.str();
+                    std::ofstream output(directory / captured, std::ios::binary);
+                    output.write(reinterpret_cast<const char*>(asset.bytes.data()),
+                        static_cast<std::streamsize>(asset.bytes.size()));
+                    output.close();
+                    if (!output) throw std::runtime_error("Cannot write consumed compatibility asset");
+                }
+                log << "{\"read\":" << id << ",\"requestedPath\":" << compatibilityJsonString(requested)
+                    << ",\"resolvedPath\":" << compatibilityJsonString(utf8(asset.resolvedPath))
+                    << ",\"source\":" << compatibilityJsonString(asset.source == AssetSource::project
+                        ? "project" : asset.source == AssetSource::looseData ? "looseData" : "archive")
+                    << ",\"bytes\":" << asset.bytes.size()
+                    << ",\"capturedPath\":" << (allowed ? compatibilityJsonString(captured) : "null")
+                    << ",\"excludedOutsideFixtureSidecar\":" << (allowed ? "false" : "true") << "}\n";
+                log.flush();
+                if (!log) throw std::runtime_error("Cannot write compatibility asset provenance");
+                if (asset.source == AssetSource::project && !allowed)
+                    throw std::runtime_error("Compatibility fixture asset escapes its sidecar");
+                const auto normalized = AssetResolver::normalizePath(requested);
+                if (!allowed && (normalized.starts_with("meshes\\openf4\\")
+                    || normalized.starts_with("materials\\openf4\\")
+                    || normalized.starts_with("textures\\openf4\\")))
+                    throw std::runtime_error("Generated compatibility asset resolved outside its fixture sidecar");
+            }
+        };
+        std::shared_ptr<CompatibilityCapture> compatibilityCapture;
+
         std::vector<std::byte> readFile(const std::filesystem::path& path)
         {
             std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -84,20 +164,27 @@ namespace openf4::assets
         {
             std::vector<std::unique_ptr<Ba2Archive>> general;
             std::vector<std::unique_ptr<Dx10Archive>> textures;
+            std::vector<std::filesystem::path> generalPaths, texturePaths;
 
             explicit Archives(const std::filesystem::path& data)
             {
                 for (const char* name : {"Fallout4 - MeshesExtra.ba2", "Fallout4 - Meshes.ba2",
-                         "Fallout4 - Materials.ba2"})
+                         "Fallout4 - Materials.ba2", "Fallout4 - Misc.ba2"})
                     if (const auto path = data / name; std::filesystem::is_regular_file(path))
+                    {
                         general.emplace_back(std::make_unique<Ba2Archive>(path));
+                        generalPaths.push_back(path);
+                    }
                 for (const char* name : {"Fallout4 - TexturesPatch.ba2", "Fallout4 - Textures1.ba2",
                          "Fallout4 - Textures2.ba2", "Fallout4 - Textures3.ba2",
                          "Fallout4 - Textures4.ba2", "Fallout4 - Textures5.ba2",
                          "Fallout4 - Textures6.ba2", "Fallout4 - Textures7.ba2",
                          "Fallout4 - Textures8.ba2", "Fallout4 - Textures9.ba2"})
                     if (const auto path = data / name; std::filesystem::is_regular_file(path))
+                    {
                         textures.emplace_back(std::make_unique<Dx10Archive>(path));
+                        texturePaths.push_back(path);
+                    }
             }
         };
 
@@ -115,11 +202,40 @@ namespace openf4::assets
         }
     }
 
+    void beginCompatibilityAssetCapture(const std::filesystem::path& worldEsm,
+        const std::filesystem::path& outputDirectory)
+    {
+        if (compatibilityCapture)
+            throw std::runtime_error("Compatibility capture is already configured");
+        const auto root = std::filesystem::canonical(AssetResolver::projectAssetRoot(worldEsm));
+        const auto output = std::filesystem::weakly_canonical(std::filesystem::absolute(outputDirectory));
+        if (output == root || inside(output, root) || inside(root, output))
+            throw std::runtime_error("Compatibility evidence must be separate from the fixture sidecar");
+        if (std::filesystem::exists(output))
+            throw std::runtime_error("Compatibility output directory already exists");
+        std::filesystem::create_directories(output.parent_path());
+        if (!std::filesystem::create_directory(output))
+            throw std::runtime_error("Cannot create compatibility output directory");
+        std::filesystem::create_directory(output / "consumed");
+        auto capture = std::make_shared<CompatibilityCapture>();
+        capture->root = root;
+        capture->directory = output;
+        capture->log.open(output / "assets.jsonl", std::ios::binary);
+        if (!capture->log) throw std::runtime_error("Cannot create compatibility asset log");
+        compatibilityCapture = std::move(capture);
+    }
+
+    void endCompatibilityAssetCapture()
+    {
+        compatibilityCapture.reset();
+    }
+
     struct AssetResolver::Impl
     {
         std::filesystem::path project;
         std::filesystem::path data;
         std::shared_ptr<Archives> archives;
+        std::shared_ptr<CompatibilityCapture> capture;
     };
 
     AssetResolver::AssetResolver(const std::filesystem::path& worldEsm,
@@ -127,6 +243,8 @@ namespace openf4::assets
         : mImpl(std::make_unique<Impl>())
     {
         mImpl->project = projectAssetRoot(worldEsm);
+        if (compatibilityCapture && std::filesystem::weakly_canonical(mImpl->project)
+            == compatibilityCapture->root) mImpl->capture = compatibilityCapture;
         if (!dataDirectory)
             return;
         mImpl->data = *dataDirectory;
@@ -179,20 +297,24 @@ namespace openf4::assets
 
     AssetBytes AssetResolver::read(std::string_view path) const
     {
+        const auto finish = [&](AssetBytes result) {
+            if (mImpl->capture) mImpl->capture->record(path, result);
+            return result;
+        };
         const auto relative = relativePath(path);
         if (const auto found = loosePath(mImpl->project, relative))
-            return {readFile(*found), *found, AssetSource::project};
+            return finish({readFile(*found), *found, AssetSource::project});
         if (const auto found = loosePath(mImpl->data, relative))
-            return {readFile(*found), *found, AssetSource::looseData};
+            return finish({readFile(*found), *found, AssetSource::looseData});
         const auto normalized = relative.generic_string();
         if (mImpl->archives)
-        for (const auto& archive : mImpl->archives->general)
-            if (archive->contains(normalized))
-                return {archive->extract(normalized), {}, AssetSource::archive};
+        for (std::size_t i = 0; i < mImpl->archives->general.size(); ++i)
+            if (mImpl->archives->general[i]->contains(normalized))
+                return finish({mImpl->archives->general[i]->extract(normalized), mImpl->archives->generalPaths[i], AssetSource::archive});
         if (mImpl->archives)
-        for (const auto& archive : mImpl->archives->textures)
-            if (archive->contains(normalized))
-                return {archive->extractDds(normalized), {}, AssetSource::archive};
+        for (std::size_t i = 0; i < mImpl->archives->textures.size(); ++i)
+            if (mImpl->archives->textures[i]->contains(normalized))
+                return finish({mImpl->archives->textures[i]->extractDds(normalized), mImpl->archives->texturePaths[i], AssetSource::archive});
         throw std::runtime_error("Asset is not present in project, Data, or archives: "
             + std::string(path));
     }

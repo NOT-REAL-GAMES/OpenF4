@@ -77,6 +77,9 @@ namespace openf4::assets
         [[nodiscard]] LodBakeResult bake(const TerrainLodSource& terrain,
             const StaticLodSource& statics, const LodBakeOptions& options = {}) const;
 
+        // Before authoring overwrites the ESM, retain any untracked external
+        // changes as dirty work. A failed save may safely leave extra dirty tiles.
+        void prepareSave() const;
         // Call only after an authoring save succeeded. Include old and new
         // reference cells, and every cell using a changed model, in staticCells.
         // No-op before the first bake.
@@ -84,6 +87,9 @@ namespace openf4::assets
             std::span<const CellCoord> staticCells,
             std::span<const std::filesystem::path> sourceFiles = {}) const;
         [[nodiscard]] std::uint64_t revision() const;
+        // Includes unfinished tiles so streaming can retain coarse fallback
+        // while an initial build or a rebake is only partially published.
+        [[nodiscard]] std::vector<LodTerrainTile> expectedTerrainTiles() const;
 
     private:
         std::filesystem::path mWorldEsm;

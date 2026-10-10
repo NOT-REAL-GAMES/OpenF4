@@ -1,4 +1,5 @@
 #include "assets/ba2_archive.hpp"
+#include "assets/asset_resolver.hpp"
 #include "assets/dem_import.hpp"
 #include "assets/esm_document.hpp"
 #include "assets/fo4_install.hpp"
@@ -16,8 +17,11 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <limits>
@@ -35,6 +39,263 @@ namespace
 {
     constexpr double worldCellSize = 4096.0;
     bool headless = false;
+    std::optional<std::filesystem::path> compatibilityOutput;
+
+    void jsonNumber(std::ostream& out, double value)
+    {
+        if (std::isfinite(value)) out << value;
+        else out << "null";
+    }
+
+    template<class Vector> void jsonVector(std::ostream& out, const Vector& value)
+    {
+        out << '[';
+        for (int i = 0; i < value.length(); ++i)
+        {
+            if (i) out << ',';
+            jsonNumber(out, value[i]);
+        }
+        out << ']';
+    }
+
+    void jsonMatrix(std::ostream& out, const glm::mat4& value)
+    {
+        out << '[';
+        for (int column = 0; column < 4; ++column)
+        {
+            if (column) out << ',';
+            jsonVector(out, value[column]);
+        }
+        out << ']';
+    }
+
+    double matrixDrift(const glm::mat4& a, const glm::mat4& b)
+    {
+        double result = 0;
+        for (int c = 0; c < 4; ++c)
+            for (int r = 0; r < 4; ++r)
+            {
+                if (!std::isfinite(a[c][r]) || !std::isfinite(b[c][r]))
+                    return std::numeric_limits<double>::infinity();
+                result = std::max(result, std::abs(static_cast<double>(a[c][r]) - b[c][r]));
+            }
+        return result;
+    }
+
+    struct CompatibilityRun
+    {
+        using State = openf4::world::ObjectCompatibilityState;
+        static constexpr int simulationSteps = 360;
+        static constexpr double groundTolerance = 4.2;
+        struct Reference
+        {
+            std::uint32_t formId = 0;
+            std::uint32_t baseId = 0;
+            std::string model;
+            bool movable = false;
+            State initial;
+            State final;
+            double staticDrift = 0;
+            int restingSteps = 0;
+        };
+        std::filesystem::path world;
+        std::vector<Reference> references;
+        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+        bool ready = false;
+        bool done = false;
+        bool passed = false;
+        int steps = 0;
+        std::string reason;
+
+        CompatibilityRun(const std::filesystem::path& path,
+            const openf4::assets::ESMMasterStack& records) : world(path)
+        {
+            for (const auto& record : records.references)
+            {
+                if (record.deleted) continue;
+                const auto model = std::ranges::find(records.models, record.placement.baseObject,
+                    &openf4::assets::ESMModel::formId);
+                if (model == records.models.end())
+                    throw std::runtime_error("Compatibility reference has no base model");
+                const auto source = model->sourceEsm.empty() ? path : std::filesystem::path(model->sourceEsm);
+                if (!std::filesystem::equivalent(source, path))
+                    throw std::runtime_error("Compatibility fixtures must own every reference's model");
+                references.push_back({record.placement.formId, record.placement.baseObject, model->path,
+                    model->kind == openf4::assets::ESMModelKind::movableStatic});
+            }
+            if (references.empty()) throw std::runtime_error("Compatibility world has no references");
+        }
+
+        void fail(std::string message)
+        {
+            done = true; passed = false; reason = std::move(message);
+        }
+
+        bool beforeStep(const openf4::world::ObjectScene& objects, std::size_t terrainPending)
+        {
+            if (done) return false;
+            if (std::chrono::steady_clock::now() - started > std::chrono::seconds(60))
+            {
+                fail("Timed out waiting for fixture residency or post-readiness simulation");
+                return false;
+            }
+            if (!objects.diagnostics().empty())
+            {
+                fail("Runtime asset diagnostics were emitted");
+                return false;
+            }
+            bool allReady = objects.pending() == 0 && terrainPending == 0;
+            for (auto& reference : references)
+            {
+                reference.final = objects.compatibilityState(reference.formId);
+                const auto& state = reference.final;
+                if (state.collisionFailed)
+                {
+                    fail("Fixture native collision failed to install");
+                    return false;
+                }
+                if (state.installed && state.collisionReady && state.expectedBodies == 0)
+                {
+                    fail("Fixture installed without any native collision bodies");
+                    return false;
+                }
+                allReady = allReady && state.installed && state.collisionReady && state.surroundingsReady
+                    && state.expectedBodies > 0 && state.bodies.size() == state.expectedBodies
+                    && state.movable == reference.movable;
+            }
+            if (!allReady)
+            {
+                if (ready) fail("Fixture lost residency/readiness during its measured simulation");
+                return false;
+            }
+            if (!ready)
+            {
+                ready = true;
+                for (auto& reference : references) reference.initial = reference.final;
+            }
+            return true;
+        }
+
+        void afterStep(const openf4::world::ObjectScene& objects)
+        {
+            ++steps;
+            for (auto& reference : references)
+            {
+                reference.final = objects.compatibilityState(reference.formId);
+                const auto& state = reference.final;
+                if (!state.installed || !state.collisionReady || !state.surroundingsReady
+                    || state.bodies.size() != reference.initial.bodies.size())
+                {
+                    fail("Fixture lost installed render or physics state");
+                    return;
+                }
+                if (!reference.movable)
+                {
+                    reference.staticDrift = std::max(reference.staticDrift,
+                        matrixDrift(state.transform, reference.initial.transform));
+                    for (std::size_t i = 0; i < state.bodies.size(); ++i)
+                        reference.staticDrift = std::max(reference.staticDrift,
+                            matrixDrift(state.bodies[i].transform, reference.initial.bodies[i].transform));
+                    if (reference.staticDrift > 0.001)
+                    {
+                        fail("STAT render or native body moved during simulation");
+                        return;
+                    }
+                }
+                else
+                {
+                    const auto& body = state.bodies.front();
+                    const bool onLand = state.geometry && state.landHeight
+                        && std::abs(state.geometry->minimum.y - *state.landHeight) <= groundTolerance;
+                    const bool resting = onLand && glm::length(body.linearVelocity) < 3.5f
+                        && glm::length(body.angularVelocity) < 0.05f
+                        && std::isfinite(matrixDrift(body.transform, reference.initial.bodies.front().transform));
+                    reference.restingSteps = resting ? reference.restingSteps + 1 : 0;
+                }
+            }
+            if (steps < simulationSteps) return;
+            for (const auto& reference : references)
+                if (reference.movable)
+                {
+                    const auto& initialBody = reference.initial.bodies.front();
+                    const auto& finalBody = reference.final.bodies.front();
+                    if (reference.restingSteps < 30
+                        || !(initialBody.transform[3].y - finalBody.transform[3].y > 1.0f))
+                    {
+                        fail("MSTT did not fall and remain resting on LAND for the final 30 steps");
+                        return;
+                    }
+                }
+            passed = done = true;
+            reason = "All expected references and native bodies installed; STAT immobile; MSTT fell and rested on LAND";
+        }
+
+        static void writeState(std::ostream& out, const State& state)
+        {
+            out << "{\"installed\":" << state.installed << ",\"movable\":" << state.movable
+                << ",\"collisionReady\":" << state.collisionReady
+                << ",\"surroundingsReady\":" << state.surroundingsReady
+                << ",\"collisionFailed\":" << state.collisionFailed
+                << ",\"expectedBodies\":" << state.expectedBodies << ",\"transform\":";
+            jsonMatrix(out, state.transform);
+            out << ",\"authoredTransform\":"; jsonMatrix(out, state.authoredTransform);
+            out << ",\"landHeight\":";
+            if (state.landHeight) jsonNumber(out, *state.landHeight); else out << "null";
+            out << ",\"geometryMinimum\":";
+            if (state.geometry) jsonVector(out, state.geometry->minimum); else out << "null";
+            out << ",\"geometryMaximum\":";
+            if (state.geometry) jsonVector(out, state.geometry->maximum); else out << "null";
+            out << ",\"bodies\":[";
+            for (std::size_t i = 0; i < state.bodies.size(); ++i)
+            {
+                if (i) out << ',';
+                out << "{\"transform\":"; jsonMatrix(out, state.bodies[i].transform);
+                out << ",\"linearVelocity\":"; jsonVector(out, state.bodies[i].linearVelocity);
+                out << ",\"angularVelocity\":"; jsonVector(out, state.bodies[i].angularVelocity);
+                out << '}';
+            }
+            out << "]}";
+        }
+
+        void write(const openf4::world::ObjectScene& objects, std::size_t terrainPending, int frames)
+        {
+            if (!done) fail("Compatibility run was interrupted before completing its checks");
+            std::ofstream out(*compatibilityOutput / "runtime.json", std::ios::binary);
+            out << std::boolalpha << std::setprecision(17)
+                << "{\"schema\":1,\"status\":" << openf4::assets::compatibilityJsonString(passed ? "Pass" : "Fail")
+                << ",\"reason\":" << openf4::assets::compatibilityJsonString(reason)
+                << ",\"world\":" << openf4::assets::compatibilityJsonString(world.generic_string())
+                << ",\"ready\":" << ready << ",\"renderedFrames\":" << frames
+                << ",\"simulationSteps\":" << steps << ",\"requiredSimulationSteps\":" << simulationSteps
+                << ",\"stepSeconds\":" << 1.0 / 60.0 << ",\"groundToleranceUnits\":" << groundTolerance
+                << ",\"groundCheck\":\"fell_and_resting_on_land_not_contact_callback\""
+                << ",\"pendingObjects\":" << objects.pending() << ",\"pendingTerrain\":" << terrainPending
+                << ",\"loadedObjects\":" << objects.loaded() << ",\"diagnostics\":[";
+            for (std::size_t i = 0; i < objects.diagnostics().size(); ++i)
+            {
+                if (i) out << ',';
+                out << openf4::assets::compatibilityJsonString(objects.diagnostics()[i]);
+            }
+            out << "],\"references\":[";
+            for (std::size_t i = 0; i < references.size(); ++i)
+            {
+                if (i) out << ',';
+                const auto& reference = references[i];
+                out << "{\"formId\":" << reference.formId << ",\"baseId\":" << reference.baseId
+                    << ",\"modelPath\":" << openf4::assets::compatibilityJsonString(reference.model)
+                    << ",\"kind\":" << openf4::assets::compatibilityJsonString(reference.movable ? "MSTT" : "STAT")
+                    << ",\"maximumStaticDrift\":";
+                jsonNumber(out, reference.staticDrift);
+                out << ",\"consecutiveRestingSteps\":" << reference.restingSteps << ",\"initial\":";
+                writeState(out, reference.initial);
+                out << ",\"final\":"; writeState(out, objects.compatibilityState(reference.formId));
+                out << '}';
+            }
+            out << "]}\n";
+            out.close();
+            if (!out) throw std::runtime_error("Cannot write runtime compatibility evidence");
+        }
+    };
 
     glm::dvec3 cellAlignedRenderOrigin(const glm::dvec3& position)
     {
@@ -113,6 +374,9 @@ try
 {
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
+    const char* compatibilityEnvironment = std::getenv("OPENF4_COMPATIBILITY_CAPTURE_DIR");
+    const bool compatibilityRequested = compatibilityEnvironment && *compatibilityEnvironment;
+    if (compatibilityRequested) headless = true; // Never block an automated failure on a dialog.
     int benchmarkFrames = 0;
     bool cubesOnly = false;
     bool resizeTest = false;
@@ -258,6 +522,17 @@ try
     if (editorPath && editorConflict)
         throw std::runtime_error(
             "--editor is mutually exclusive with model, physics, benchmark, and streamed-world options");
+    if (compatibilityRequested)
+    {
+        if (!masterPath || editorPath || demImportPath || cubesOnly || requestedModel
+            || physicsSample || landOnly || cellCrossTest || resizeTest || requestedCell)
+            throw std::runtime_error("Compatibility capture requires only a fixture master ESM (and optional --benchmark)");
+        openf4::assets::EsmDocument fixture(*masterPath);
+        if (!fixture.isOpenF4Owned())
+            throw std::runtime_error("Compatibility capture requires an OpenF4-owned fixture world");
+        openf4::assets::beginCompatibilityAssetCapture(*masterPath, compatibilityEnvironment);
+        compatibilityOutput = std::filesystem::absolute(compatibilityEnvironment);
+    }
     if (demImportPath)
     {
         headless = true;
@@ -455,6 +730,23 @@ try
             initialPosition = initialTarget + glm::vec3(500.0f, 320.0f, 500.0f);
         }
     }
+    if (projectObjects && !landscapeEditing)
+    {
+        if (!physicsWorld)
+            physicsWorld = std::make_unique<openf4::physics::JoltWorld>();
+        if (landscapeEditor)
+            landscapeEditor->enablePhysics(*physicsWorld);
+        projectObjects->enablePhysics(*physicsWorld, projectRecords->models,
+            landscapeEditor.get(), worldStreamer.get());
+        projectObjects->enableScripts(*projectRecords);
+    }
+    std::optional<CompatibilityRun> compatibility;
+    if (compatibilityRequested)
+    {
+        if (!projectObjects || !projectRecords || !landscapeEditor)
+            throw std::runtime_error("Compatibility capture requires the normal project terrain/object runtime");
+        compatibility.emplace(*masterPath, *projectRecords);
+    }
     std::optional<std::uint32_t> physicsPlayButton;
     std::optional<std::uint32_t> physicsPauseButton;
     if (physicsWorld && physicsSample)
@@ -517,9 +809,9 @@ try
         std::cout << "Master ESM: " << masterPath->string() << '\n';
 
     bool running = true;
-    bool physicsRunning = false;
+    bool physicsRunning = projectObjects && !landscapeEditing;
     bool editorSculpting = false;
-    bool mouseCaptured = !physicsPlayButton;
+    bool mouseCaptured = !physicsPlayButton && !compatibility;
     SDL_SetWindowRelativeMouseMode(window, mouseCaptured);
     const auto setPhysicsRunning = [&](bool active) {
         physicsRunning = active;
@@ -553,6 +845,8 @@ try
                 running = false;
             else if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
                 renderer->resize();
+            else if (compatibility)
+                continue;
             else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE)
             {
                 mouseCaptured = !mouseCaptured;
@@ -616,7 +910,8 @@ try
         const glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
         const bool* keys = SDL_GetKeyboardState(nullptr);
         const float baseSpeed = std::max(25.0f, sceneScale * 0.15f);
-        const float speed = baseSpeed * (keys[SDL_SCANCODE_LSHIFT] ? 4.0f : 1.0f) * delta;
+        const float speed = compatibility ? 0.0f
+            : baseSpeed * (keys[SDL_SCANCODE_LSHIFT] ? 4.0f : 1.0f) * delta;
         position += glm::dvec3(forward) * static_cast<double>(speed)
             * static_cast<double>(keys[SDL_SCANCODE_W] - keys[SDL_SCANCODE_S]);
         position += glm::dvec3(right) * static_cast<double>(speed)
@@ -624,7 +919,7 @@ try
         position.y += speed * static_cast<float>(keys[SDL_SCANCODE_SPACE] - keys[SDL_SCANCODE_C]);
 
         const auto streamStart = std::chrono::steady_clock::now();
-        if (physicsWorld && physicsRunning)
+        if (physicsWorld && physicsRunning && !projectObjects)
             physicsWorld->step(delta);
         if (landscapeEditor)
             landscapeEditor->update(*renderer, position, forward, delta, editorSculpting);
@@ -648,6 +943,17 @@ try
                 }
             }
         }
+        if (compatibility)
+        {
+            if (compatibility->beforeStep(*projectObjects, landscapeEditor->pendingWork()))
+            {
+                projectObjects->stepPhysics(*renderer, 1.0f / 60.0f);
+                compatibility->afterStep(*projectObjects);
+            }
+            if (compatibility->done) running = false;
+        }
+        else if (projectObjects && physicsRunning)
+            projectObjects->stepPhysics(*renderer, delta);
         const auto streamEnd = std::chrono::steady_clock::now();
 
         int width = 0;
@@ -684,7 +990,7 @@ try
             position.x -= 4096.0f;
         if (resizeTest && renderedFrames == 10)
             SDL_SetWindowSize(window, 1280, 720);
-        if (benchmarkFrames > 0 && renderedFrames >= benchmarkFrames)
+        if (!compatibility && benchmarkFrames > 0 && renderedFrames >= benchmarkFrames)
             running = false;
 
         if (now - lastTitleUpdate > std::chrono::milliseconds(250))
@@ -704,11 +1010,19 @@ try
     }
 
     const auto finalStats = renderer->stats();
+    if (compatibility)
+        compatibility->write(*projectObjects, landscapeEditor->pendingWork(), renderedFrames);
     if (landscapeEditing && landscapeEditor && landscapeEditor->dirty())
         landscapeEditor->save(*renderer);
     if (projectObjects)
         std::cout << "Project objects: " << projectObjects->loaded() << " loaded, "
                   << projectObjects->pending() << " pending\n";
+    if (projectObjects && physicsWorld)
+        std::cout << "Project physics: " << physicsWorld->dynamicBodyPositions().size()
+                  << " resident movable bodies\n";
+    if (landscapeEditor)
+        std::cout << "Terrain: " << landscapeEditor->residentCells() << " resident cells, "
+                  << landscapeEditor->pendingWork() << " pending\n";
     if (worldStreamer)
         std::cout << "Streamer final: " << worldStreamer->streamedObjects()
                   << " loaded, " << worldStreamer->pendingObjects() << " pending\n";
@@ -744,10 +1058,16 @@ try
               << " MiB resident / virtual\n";
     renderer.reset();
     SDL_DestroyWindow(window);
-    return 0;
+    return compatibility && !compatibility->passed ? 1 : 0;
 }
 catch (const std::exception& error)
 {
+    if (compatibilityOutput)
+    {
+        std::ofstream report(*compatibilityOutput / "runtime.json", std::ios::binary);
+        report << "{\"schema\":1,\"status\":\"Fail\",\"reason\":"
+            << openf4::assets::compatibilityJsonString(error.what()) << "}\n";
+    }
     if (!headless)
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenF4", error.what(), nullptr);
     std::cerr << error.what() << '\n';

@@ -119,7 +119,7 @@ namespace
         appendString(bytes, "");
         appendZeros(bytes, 1);
         append(bytes, std::uint8_t{}); // Emit disabled.
-        appendZeros(bytes, 4 + 2 + 1 + 5 + 1 + 2 + 1 + 12 + 3 + 1 + 32);
+        appendZeros(bytes, 4 + 2 + 1 + 5 + 1 + 2 + 1 + 12 + 3 + 1 + 20);
         append(bytes, 0.75f);
 
         const auto material = openf4::assets::loadMaterial(bytes);

@@ -13,6 +13,7 @@
 #include <stb_image.h>
 
 #include <algorithm>
+#include <functional>
 #include <atomic>
 #include <chrono>
 #include <cctype>
@@ -201,6 +202,191 @@ namespace openf4::assets
                 value.a4, value.b4, value.c4, value.d4};
         }
 
+        // Convert Assimp's aiVector3D to glm::vec3
+        glm::vec3 convert(const aiVector3t<float>& value)
+        {
+            return {value.x, value.y, value.z};
+        }
+
+        // Convert Assimp's aiQuaternion to glm::quat
+        glm::quat convert(const aiQuaterniont<float>& value)
+        {
+            return {value.w, value.x, value.y, value.z};
+        }
+
+        // Extract animation data from an Assimp scene
+        void extractAnimations(const aiScene& scene, ModelGeometry& result)
+        {
+            if (!scene.HasAnimations())
+                return;
+
+            // Build a mapping from node names to their global transforms
+            std::unordered_map<std::string, glm::mat4> nodeGlobalTransforms;
+
+            // First pass: compute global transforms for all nodes
+            std::function<void(const aiNode*, const glm::mat4&)> computeGlobalTransforms =
+                [&](const aiNode* node, const glm::mat4& parentTransform) {
+                    glm::mat4 global = parentTransform * matrix(node->mTransformation);
+                    if (node->mName.C_Str())
+                        nodeGlobalTransforms[node->mName.C_Str()] = global;
+                    for (unsigned i = 0; i < node->mNumChildren; ++i)
+                        computeGlobalTransforms(node->mChildren[i], global);
+                };
+            computeGlobalTransforms(scene.mRootNode, glm::mat4(1.0f));
+
+            // Process each animation
+            for (unsigned animIdx = 0; animIdx < scene.mNumAnimations; ++animIdx)
+            {
+                const aiAnimation* aiAnim = scene.mAnimations[animIdx];
+                ModelAnimationClip clip;
+                clip.name = aiAnim->mName.C_Str();
+                
+                // Determine duration and ticks per second
+                clip.duration = static_cast<float>(aiAnim->mDuration);
+                clip.ticksPerSecond = aiAnim->mTicksPerSecond > 0 ? static_cast<float>(aiAnim->mTicksPerSecond) : 24.0f;
+
+                // Process each animation channel (one per bone/node)
+                for (unsigned chanIdx = 0; chanIdx < aiAnim->mNumChannels; ++chanIdx)
+                {
+                    const aiNodeAnim* aiChannel = aiAnim->mChannels[chanIdx];
+                    ModelAnimationChannel channel;
+                    channel.boneName = aiChannel->mNodeName.C_Str();
+
+                    // Collect all unique keyframe times
+                    std::vector<float> allTimes;
+                    for (unsigned i = 0; i < aiChannel->mNumPositionKeys; ++i)
+                        allTimes.push_back(static_cast<float>(static_cast<double>(aiChannel->mPositionKeys[i].mTime)));
+                    for (unsigned i = 0; i < aiChannel->mNumRotationKeys; ++i)
+                        allTimes.push_back(static_cast<float>(static_cast<double>(aiChannel->mRotationKeys[i].mTime)));
+                    for (unsigned i = 0; i < aiChannel->mNumScalingKeys; ++i)
+                        allTimes.push_back(static_cast<float>(static_cast<double>(aiChannel->mScalingKeys[i].mTime)));
+                    
+                    std::sort(allTimes.begin(), allTimes.end());
+                    allTimes.erase(std::unique(allTimes.begin(), allTimes.end()), allTimes.end());
+
+                    channel.times = allTimes;
+                    channel.positions.resize(allTimes.size());
+                    channel.rotations.resize(allTimes.size());
+                    channel.scales.resize(allTimes.size());
+
+                    // For each time, interpolate the position, rotation, and scale
+                    for (std::size_t i = 0; i < allTimes.size(); ++i)
+                    {
+                        float time = allTimes[i];
+                        
+                        // Interpolate position
+                        if (aiChannel->mNumPositionKeys > 0)
+                        {
+                            unsigned idx = 0;
+                            for (unsigned j = 0; j < aiChannel->mNumPositionKeys - 1; ++j)
+                            {
+                                if (aiChannel->mPositionKeys[j].mTime <= time && 
+                                    aiChannel->mPositionKeys[j + 1].mTime >= time)
+                                {
+                                    idx = j;
+                                    break;
+                                }
+                            }
+                            if (aiChannel->mNumPositionKeys > 0)
+                            {
+                                float t = 0.0f;
+                                if (aiChannel->mNumPositionKeys > 1 && idx + 1 < aiChannel->mNumPositionKeys)
+                                {
+                                    float t1 = static_cast<float>(aiChannel->mPositionKeys[idx].mTime);
+                                    float t2 = static_cast<float>(aiChannel->mPositionKeys[idx + 1].mTime);
+                                    if (t2 > t1)
+                                        t = (time - t1) / (t2 - t1);
+                                }
+                                aiVector3t<float> pos = aiChannel->mPositionKeys[idx].mValue;
+                                if (aiChannel->mNumPositionKeys > 1 && idx + 1 < aiChannel->mNumPositionKeys)
+                                {
+                                    aiVector3t<float> pos2 = aiChannel->mPositionKeys[idx + 1].mValue;
+                                    pos = pos + (pos2 - pos) * t;
+                                }
+                                channel.positions[i] = convert(pos);
+                            }
+                        }
+
+                        // Interpolate rotation (use SLERP for quaternions)
+                        if (aiChannel->mNumRotationKeys > 0)
+                        {
+                            unsigned idx = 0;
+                            for (unsigned j = 0; j < aiChannel->mNumRotationKeys - 1; ++j)
+                            {
+                                if (aiChannel->mRotationKeys[j].mTime <= time && 
+                                    aiChannel->mRotationKeys[j + 1].mTime >= time)
+                                {
+                                    idx = j;
+                                    break;
+                                }
+                            }
+                            if (aiChannel->mNumRotationKeys > 0)
+                            {
+                                float t = 0.0f;
+                                if (aiChannel->mNumRotationKeys > 1 && idx + 1 < aiChannel->mNumRotationKeys)
+                                {
+                                    float t1 = static_cast<float>(aiChannel->mRotationKeys[idx].mTime);
+                                    float t2 = static_cast<float>(aiChannel->mRotationKeys[idx + 1].mTime);
+                                    if (t2 > t1)
+                                        t = (time - t1) / (t2 - t1);
+                                }
+                                aiQuaterniont<float> rot = aiChannel->mRotationKeys[idx].mValue;
+                                if (aiChannel->mNumRotationKeys > 1 && idx + 1 < aiChannel->mNumRotationKeys)
+                                {
+                                    aiQuaterniont<float> rot2 = aiChannel->mRotationKeys[idx + 1].mValue;
+                                    aiQuaterniont<float>::Interpolate(rot, rot, rot2, t);
+                                }
+                                channel.rotations[i] = convert(rot);
+                            }
+                        }
+
+                        // Interpolate scale
+                        if (aiChannel->mNumScalingKeys > 0)
+                        {
+                            unsigned idx = 0;
+                            for (unsigned j = 0; j < aiChannel->mNumScalingKeys - 1; ++j)
+                            {
+                                if (aiChannel->mScalingKeys[j].mTime <= time && 
+                                    aiChannel->mScalingKeys[j + 1].mTime >= time)
+                                {
+                                    idx = j;
+                                    break;
+                                }
+                            }
+                            if (aiChannel->mNumScalingKeys > 0)
+                            {
+                                float t = 0.0f;
+                                if (aiChannel->mNumScalingKeys > 1 && idx + 1 < aiChannel->mNumScalingKeys)
+                                {
+                                    float t1 = static_cast<float>(aiChannel->mScalingKeys[idx].mTime);
+                                    float t2 = static_cast<float>(aiChannel->mScalingKeys[idx + 1].mTime);
+                                    if (t2 > t1)
+                                        t = (time - t1) / (t2 - t1);
+                                }
+                                aiVector3t<float> scale = aiChannel->mScalingKeys[idx].mValue;
+                                if (aiChannel->mNumScalingKeys > 1 && idx + 1 < aiChannel->mNumScalingKeys)
+                                {
+                                    aiVector3t<float> scale2 = aiChannel->mScalingKeys[idx + 1].mValue;
+                                    scale = scale + (scale2 - scale) * t;
+                                }
+                                channel.scales[i] = convert(scale);
+                            }
+                        }
+                    }
+
+                    // Store channel index for this bone
+                    clip.boneIndex[channel.boneName] = clip.channels.size();
+                    clip.channels.push_back(std::move(channel));
+                }
+
+                if (!clip.channels.empty())
+                {
+                    clip.name = clip.name.empty() ? "Animation_" + std::to_string(result.animations.size()) : clip.name;
+                    result.animations.push_back(std::move(clip));
+                }
+            }
+        }
+
         bool finite(const glm::vec3& value)
         {
             return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
@@ -232,8 +418,7 @@ namespace openf4::assets
             const aiScene* scene = importer.ReadFile(pathText(source), flags);
             if (!scene || !scene->mRootNode || (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE))
                 throw std::runtime_error("Model import failed: " + std::string(importer.GetErrorString()));
-            if (scene->HasAnimations())
-                result.warnings.emplace_back("Animations are retained in the source asset; preview uses the static pose.");
+            extractAnimations(*scene, result.geometry);
 
             std::vector<ModelSurface> materials(scene->mNumMaterials);
             for (unsigned index = 0; index < scene->mNumMaterials; ++index)
@@ -293,6 +478,7 @@ namespace openf4::assets
                             throw std::runtime_error("Network model resources are unsupported");
                         const auto resource = std::filesystem::weakly_canonical(source.parent_path()
                             / std::filesystem::u8path(decodeUri(path.C_Str())));
+                        result.sourceFiles.push_back(resource);
                         if (std::filesystem::is_regular_file(resource))
                             dependencies.insert(resource);
                     }
@@ -377,10 +563,18 @@ namespace openf4::assets
         }
     }
 
+    ModelImage decodeModelImage(std::span<const std::byte> bytes, bool srgb)
+    {
+        return decodeImage(bytes, srgb);
+    }
+
     ModelImportResult importModel(const std::filesystem::path& source, ModelImportOptions options)
     {
         std::set<std::filesystem::path> dependencies;
-        return import(source, options, dependencies);
+        auto result = import(source, options, dependencies);
+        dependencies.insert(result.sourceFiles.begin(), result.sourceFiles.end());
+        result.sourceFiles.assign(dependencies.begin(), dependencies.end());
+        return result;
     }
 
     std::future<ModelImportResult> importModelAsync(std::filesystem::path source, ModelImportOptions options)
@@ -452,6 +646,10 @@ namespace openf4::assets
             const auto relativeSource = stagedSource.lexically_relative(staging);
             std::filesystem::rename(staging, destination);
             imported.sourcePath = destination / relativeSource;
+            stagedDependencies.insert(imported.sourceFiles.begin(), imported.sourceFiles.end());
+            imported.sourceFiles.clear();
+            for (const auto& dependency : stagedDependencies)
+                imported.sourceFiles.push_back(destination / dependency.lexically_relative(staging));
             ImportedModelAsset result;
             result.assetRoot = root;
             result.sourcePath = imported.sourcePath;

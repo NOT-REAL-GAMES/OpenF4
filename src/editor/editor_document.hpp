@@ -21,6 +21,10 @@ namespace openf4::editor
         glm::vec4 bounds{};
         bool visible = true;
         bool locked = false;
+        assets::ESMRecordSource recordSource;
+        std::uint32_t ownerCellFormId = 0;
+        std::uint32_t childGroupType = 9;
+        assets::PapyrusBindings scripts;
         bool operator==(const EditorReference&) const = default;
     };
 
@@ -42,6 +46,7 @@ namespace openf4::editor
         [[nodiscard]] std::uint32_t worldFormId() const noexcept;
         [[nodiscard]] const std::vector<EditorReference>& references() const noexcept;
         [[nodiscard]] const std::map<std::uint32_t, std::string>& models() const noexcept;
+        [[nodiscard]] const assets::ESMModel* model(std::uint32_t id) const noexcept;
         [[nodiscard]] std::optional<std::string> sourcePath(std::uint32_t model) const;
         [[nodiscard]] std::optional<std::string> sourceEsm(std::uint32_t model) const;
         [[nodiscard]] glm::mat4 engineTransform(std::uint32_t reference) const;
@@ -60,7 +65,15 @@ namespace openf4::editor
         // any CELL/FormID allocations, without creating an undo entry.
         void cancelTransaction();
         [[nodiscard]] std::uint32_t addModel(std::string projectRelativePath,
-            std::string sourcePath = {});
+            std::string sourcePath = {}, assets::ESMModelKind kind = assets::ESMModelKind::staticObject);
+        // Publication precedes these commands; they never write or remove asset files.
+        [[nodiscard]] std::uint32_t assignNativeModel(std::uint32_t model,
+            std::string projectRelativePath, assets::ESMModelKind kind);
+        [[nodiscard]] std::uint32_t makeUnique(std::uint32_t reference,
+            std::string projectRelativePath, assets::ESMModelKind kind);
+        void retarget(std::uint32_t reference, std::uint32_t model);
+        void setModelScripts(std::uint32_t model, assets::PapyrusBindings scripts);
+        void setReferenceScripts(std::uint32_t reference, assets::PapyrusBindings scripts);
         [[nodiscard]] std::uint32_t place(std::uint32_t model, const glm::mat4& transform,
             std::string name = {});
         void setTransform(std::uint32_t reference, const glm::mat4& transform);

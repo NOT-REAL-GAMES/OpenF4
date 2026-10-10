@@ -1,4 +1,5 @@
 #include "world/world_scene.hpp"
+#include "script/object_scripts.hpp"
 
 #include "assets/ba2_archive.hpp"
 #include "assets/asset_resolver.hpp"
@@ -7,6 +8,7 @@
 #include "assets/dx10_archive.hpp"
 #include "assets/havok_packfile.hpp"
 #include "assets/lod_terrain.hpp"
+#include "assets/lod_bake.hpp"
 #include "assets/material_file.hpp"
 #include "assets/lod_statics.hpp"
 #include "assets/nif_model.hpp"
@@ -142,10 +144,98 @@ namespace openf4::world
                 text.data() + text.size(), result.origin.y);
             if (parsedY.ec != std::errc{} || parsedY.ptr != text.data() + text.size()
                 || (result.level != 4 && result.level != 8
-                    && result.level != 16 && result.level != 32))
+                    && result.level != 16 && result.level != 32)
+                || result.origin.x % result.level != 0 || result.origin.y % result.level != 0)
                 return std::nullopt;
             return result;
         }
+    }
+
+    std::set<assets::CellCoord> detail::demTerrainCoverage(
+        const render::PackedMesh& mesh, assets::LodTerrainTile tile)
+    {
+        std::set<assets::CellCoord> result;
+        for (const auto& meshlet : mesh.meshlets)
+            for (std::uint32_t triangle = 0; triangle < meshlet.triangleCount; ++triangle)
+            {
+                glm::vec3 center(0.0f);
+                for (int vertex = 0; vertex < 3; ++vertex)
+                    center += glm::vec3(mesh.vertices.at(meshlet.vertexOffset
+                        + mesh.indices.at(meshlet.indexOffset + triangle * 3 + vertex)).position);
+                const auto x = static_cast<std::int64_t>(std::floor(center.x / (3.0f * 4096.0f)));
+                const auto y = static_cast<std::int64_t>(std::floor(center.z / (3.0f * 4096.0f)));
+                if (x < 0 || x >= tile.level || y < 0 || y >= tile.level
+                    || x + tile.origin.x > std::numeric_limits<std::int32_t>::max()
+                    || y + tile.origin.y > std::numeric_limits<std::int32_t>::max())
+                    throw std::runtime_error("BTR triangle exceeds its tile bounds");
+                result.insert({static_cast<std::int32_t>(x + tile.origin.x),
+                    static_cast<std::int32_t>(y + tile.origin.y)});
+            }
+        return result;
+    }
+
+    detail::DemLodSelection detail::selectDemTerrainLod(
+        const std::map<assets::LodTerrainTile, bool>& desired,
+        const DemLodSelection& previous, bool landReady)
+    {
+        const auto root = [](assets::LodTerrainTile key) {
+            const auto floor32 = [](std::int32_t coordinate) {
+                return coordinate / 32 * 32 - (coordinate % 32 < 0 ? 32 : 0);
+            };
+            return assets::CellCoord{floor32(key.origin.x), floor32(key.origin.y)};
+        };
+        std::map<assets::CellCoord, std::map<int, std::vector<assets::LodTerrainTile>>> groups;
+        for (const auto& [key, loaded] : desired)
+            groups[root(key)][key.level].push_back(key);
+        DemLodSelection result;
+        bool replacementReady = true;
+        for (const auto& [origin, levels] : groups)
+        {
+            std::vector<int> ready;
+            for (const auto& [level, keys] : levels)
+                if (std::ranges::all_of(keys, [&](auto key) { return desired.at(key); }))
+                    ready.push_back(level);
+            replacementReady = replacementReady && !ready.empty()
+                && ready.back() == levels.rbegin()->first;
+            if (ready.empty())
+            {
+                for (const auto& [key, range] : previous)
+                    if (root(key) == origin)
+                        result.emplace(key, range);
+                continue;
+            }
+            // A resident ancestor bridges a loading level with the same complementary
+            // thresholds; each 32-cell region can advance without waiting for the world.
+            glm::vec2 fadeIn = landReady ? glm::vec2(3.0f, 4.0f) * 4096.0f : glm::vec2(0.0f);
+            for (const int level : ready)
+            {
+                glm::vec4 range = demBtrLodRange(level);
+                range.x = fadeIn.x;
+                range.y = fadeIn.y;
+                if (level == ready.back())
+                {
+                    range.z = demHorizonFadeStart;
+                    range.w = demHorizonFadeEnd;
+                }
+                for (const auto key : levels.at(level))
+                    result.emplace(key, range);
+                fadeIn = {range.z, range.w};
+            }
+        }
+        if (!replacementReady)
+            for (const auto& [key, range] : previous)
+                if (!groups.contains(root(key)))
+                    result.emplace(key, range);
+        std::map<assets::CellCoord, int> nearest;
+        for (const auto& [key, range] : result)
+            nearest.try_emplace(root(key), key.level);
+        for (auto& [key, range] : result)
+            if (nearest.at(root(key)) == key.level)
+            {
+                range.x = landReady ? 3.0f * 4096.0f : 0.0f;
+                range.y = landReady ? 4.0f * 4096.0f : 0.0f;
+            }
+        return result;
     }
 
     bool detail::repairLegacyDemBtrGrid(std::span<render::SourceVertex> vertices,
@@ -470,6 +560,7 @@ namespace openf4::world
             assets::MaterialInfo source;
             std::array<PreparedTexture, 3> textures;
             std::vector<std::string> warnings;
+            bool normalMapped = false;
         };
 
         class Materials
@@ -497,8 +588,7 @@ namespace openf4::world
                     prepared.source.alphaCutoff = 0.5f;
                     prepared.warnings.push_back("Imported alpha blend uses a 0.5 cutout fallback; sorted transparency is not yet supported");
                 }
-                if (surface.doubleSided)
-                    prepared.warnings.push_back("Imported double-sided material uses back-face culling in the current renderer");
+                prepared.source.twoSided = prepared.source.twoSided || surface.doubleSided;
                 const auto copyImage = [&](const std::optional<assets::ModelImage>& image,
                                            std::size_t slot) {
                     if (!image)
@@ -574,6 +664,7 @@ namespace openf4::world
                 material.alphaCutoff = source.alphaCutoff;
                 material.terrainLod = terrainLod;
                 material.decal = source.decal;
+                material.doubleSided = source.twoSided;
                 if (material.alphaCutoff > 0.0f && material.diffuseTexture == 0)
                     warn("Alpha texture", key,
                         std::runtime_error("alpha-masked material has no diffuse texture"));
@@ -788,6 +879,8 @@ namespace openf4::world
                 material.alphaCutoff = prepared.source.alphaCutoff;
                 material.terrainLod = terrainLod;
                 material.decal = prepared.source.decal;
+                material.doubleSided = prepared.source.twoSided;
+                material.normalMapped = prepared.normalMapped;
                 if (material.alphaCutoff > 0.0f && material.diffuseTexture == 0)
                     warn("Alpha texture fallback: " + prepared.key
                         + ": alpha-masked material has no diffuse texture");
@@ -817,6 +910,8 @@ namespace openf4::world
                 material.alphaCutoff = prepared.source.alphaCutoff;
                 material.terrainLod = terrainLod;
                 material.decal = prepared.source.decal;
+                material.doubleSided = prepared.source.twoSided;
+                material.normalMapped = prepared.normalMapped;
                 if (material.alphaCutoff > 0.0f && material.diffuseTexture == 0)
                     warn("Alpha texture fallback: " + prepared.key
                         + ": alpha-masked material has no diffuse texture");
@@ -3948,6 +4043,10 @@ namespace openf4::world
             std::vector<Surface> surfaces;
             std::vector<std::string> warnings;
             std::shared_ptr<const detail::PickingGeometry> picking;
+            std::vector<assets::ModelSkinBone> skinBones;
+            std::vector<assets::ModelAnimationClip> animations;
+            std::vector<assets::HavokRigidBody> collision;
+            std::string collisionError;
         };
         struct Model
         {
@@ -3955,7 +4054,13 @@ namespace openf4::world
             std::future<Prepared> job;
             std::optional<render::MeshRange> range;
             std::shared_ptr<const detail::PickingGeometry> picking;
+            std::vector<assets::ModelSkinBone> skinBones;
+            std::vector<assets::ModelAnimationClip> animations;
+            std::optional<std::uint32_t> skinPaletteOffset;
+            float animationTime = 0.0f;
             bool failed = false;
+            std::vector<assets::HavokRigidBody> collision;
+            std::string collisionError;
         };
         struct Instance
         {
@@ -3965,6 +4070,16 @@ namespace openf4::world
             glm::vec4 bounds{};
             bool active = false;
             std::optional<GeometryBounds> geometryBounds;
+            std::uint32_t skinOffset = 0;
+            std::uint32_t skinCount = 0;
+            glm::mat4 authoredTransform{1.0f};
+            assets::CellCoord cell{};
+            bool movable = false;
+            bool collisionFailed = false;
+            bool collisionReady = false;
+            std::vector<physics::BodyHandle> bodies;
+            std::vector<physics::BodyState> savedBodies;
+            std::optional<std::uint32_t> scriptMotion;
         };
         struct StaticPart
         {
@@ -3983,6 +4098,7 @@ namespace openf4::world
             std::map<std::uint32_t, std::uint32_t> installed;
             std::map<std::uint32_t, std::uint32_t> replacement;
             std::size_t cursor = 0;
+            std::uint64_t generation = 0;
             bool failed = false;
             bool reloadPending = false;
             bool removePending = false;
@@ -3996,6 +4112,158 @@ namespace openf4::world
         std::vector<std::string> messages;
         std::size_t pending = 0;
         std::size_t active = 0;
+        physics::JoltWorld* physicsWorld = nullptr;
+        LandscapeEditor* terrain = nullptr;
+        WorldStreamer* streamedTerrain = nullptr;
+        std::set<std::uint32_t> movableModels;
+        std::set<assets::CellCoord> incompleteStaticCells;
+        assets::CellCoord physicsCenter{};
+        std::unique_ptr<script::ObjectScripts> scripts;
+
+        ~Impl()
+        {
+            if (physicsWorld)
+                for (auto& [form, instance] : instances)
+                    for (auto body : instance.bodies) physicsWorld->removeBody(body);
+        }
+
+        void suspendPhysics(Instance& instance, bool remember = true)
+        {
+            if (!physicsWorld) return;
+            if (!instance.bodies.empty())
+            {
+                instance.savedBodies.clear();
+                for (auto body : instance.bodies)
+                {
+                    if (remember && instance.movable)
+                        instance.savedBodies.push_back(physicsWorld->bodyState(body));
+                    physicsWorld->removeBody(body);
+                }
+            }
+            instance.bodies.clear();
+            instance.collisionReady = false;
+            if (!remember) instance.savedBodies.clear();
+        }
+
+        bool installPhysics(Instance& instance)
+        {
+            if (!physicsWorld || instance.collisionReady || instance.collisionFailed)
+                return instance.collisionReady;
+            const auto& model = models.at(instance.model);
+            std::vector<physics::BodyHandle> created;
+            try
+            {
+                if (!model.collisionError.empty())
+                    throw std::runtime_error(model.collisionError);
+                if (instance.movable && model.collision.size() != 1)
+                    throw std::runtime_error("Movable project models require one native rigid body");
+                const float scale = glm::length(glm::vec3(instance.authoredTransform[0]));
+                if (!std::isfinite(scale) || scale <= 0)
+                    throw std::runtime_error("Project collision reference scale must be positive");
+                for (std::size_t index = 0; index < model.collision.size(); ++index)
+                {
+                    auto source = model.collision[index];
+                    source.dynamic = instance.movable;
+                    if (source.dynamic && source.mass <= 0)
+                        throw std::runtime_error("Movable project model has no authored dynamic mass");
+                    const auto placed = instance.authoredTransform * physics::havokBodyLocalTransform(source);
+                    glm::mat3 basis(placed);
+                    for (int axis = 0; axis < 3; ++axis) basis[axis] /= scale;
+                    const auto gram = glm::transpose(basis) * basis;
+                    for (int column = 0; column < 3; ++column)
+                        for (int row = 0; row < 3; ++row)
+                            if (!std::isfinite(gram[column][row])
+                                || std::abs(gram[column][row] - (column == row ? 1.0f : 0.0f)) > 1e-4f)
+                                throw std::runtime_error("Project collision requires uniform reference scale");
+                    if (glm::determinant(basis) <= 0)
+                        throw std::runtime_error("Project collision does not support reflected references");
+                    created.push_back(physicsWorld->addCollisionBody(source, glm::vec3(placed[3]),
+                        glm::normalize(glm::quat_cast(basis)), scale));
+                    if (instance.scriptMotion && !physicsWorld->setMotionType(created.back(), *instance.scriptMotion, true))
+                        throw std::runtime_error("Cannot restore scripted motion type");
+                    if (index < instance.savedBodies.size())
+                        physicsWorld->restoreBodyState(created.back(), instance.savedBodies[index]);
+                }
+                instance.bodies = std::move(created);
+                instance.collisionReady = true;
+                return true;
+            }
+            catch (const std::exception& error)
+            {
+                for (auto body : created) physicsWorld->removeBody(body);
+                instance.collisionFailed = true;
+                warn(instance.model + " collision: " + error.what());
+                return false;
+            }
+        }
+
+        bool surroundingsReady(const Instance& instance) const
+        {
+            const auto& p = instance.transform[3];
+            const assets::CellCoord cell{static_cast<std::int32_t>(std::floor(p.x / cellSize)),
+                static_cast<std::int32_t>(std::floor(p.z / cellSize))};
+            if (std::abs(static_cast<std::int64_t>(cell.x) - physicsCenter.x) > 3
+                || std::abs(static_cast<std::int64_t>(cell.y) - physicsCenter.y) > 3)
+                return false;
+            for (int y = cell.y - 1; y <= cell.y + 1; ++y)
+                for (int x = cell.x - 1; x <= cell.x + 1; ++x)
+                    if (incompleteStaticCells.contains({x, y})
+                        || (terrain && !terrain->collisionReady({x, y}))
+                        || (streamedTerrain && !streamedTerrain->collisionReady({x, y})))
+                        return false;
+            return true;
+        }
+
+        void syncPhysics()
+        {
+            if (!physicsWorld) return;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+            for (auto& [form, instance] : instances)
+            {
+                if (!instance.active) suspendPhysics(instance);
+                else if (!instance.movable)
+                {
+                    if (!instance.collisionReady && std::chrono::steady_clock::now() < deadline)
+                        (void)installPhysics(instance);
+                    if (!instance.collisionReady)
+                    {
+                        incompleteStaticCells.insert(instance.cell);
+                        if (!instance.collisionFailed) ++pending;
+                    }
+                }
+            }
+            for (auto& [form, instance] : instances)
+                if (instance.active && instance.movable)
+                {
+                    if (surroundingsReady(instance))
+                    {
+                        if (std::chrono::steady_clock::now() < deadline) (void)installPhysics(instance);
+                        if (!instance.collisionReady && !instance.collisionFailed) ++pending;
+                    }
+                    else suspendPhysics(instance);
+                }
+        }
+
+        void stepPhysics(render::VulkanRenderer& renderer, float seconds)
+        {
+            if (!physicsWorld) return;
+            if (scripts) scripts->update(seconds);
+            physicsWorld->step(seconds);
+            for (auto& [form, instance] : instances)
+            {
+                if (!instance.active || !instance.movable || instance.bodies.empty()) continue;
+                const auto& model = models.at(instance.model);
+                const float scale = glm::length(glm::vec3(instance.authoredTransform[0]));
+                const auto transform = physicsWorld->bodyTransform(instance.bodies.front())
+                    * glm::scale(glm::mat4(1.0f), glm::vec3(scale))
+                    * glm::inverse(physics::havokBodyLocalTransform(model.collision.front()));
+                const auto projected = makeInstance(*model.range, transform);
+                renderer.updateInstanceTransform(instance.id, transform, projected.bounds);
+                instance.transform = transform;
+                instance.bounds = projected.bounds;
+                instance.geometryBounds.reset();
+            }
+        }
 
         Impl(std::filesystem::path dataPath, std::filesystem::path masterPath)
             : data(std::move(dataPath)), master(std::move(masterPath))
@@ -4051,6 +4319,7 @@ namespace openf4::world
                 if (!origin) continue;
                 auto& tile = staticTiles[*origin];
                 tile.path = path;
+                ++tile.generation;
                 tile.failed = false;
                 tile.removePending = !std::filesystem::is_regular_file(path);
                 tile.reloadPending = !tile.removePending;
@@ -4108,8 +4377,11 @@ namespace openf4::world
                         }
                         catch (const std::exception& error)
                         {
-                            tile.failed = true;
-                            warn("Static LOD " + tile.path.string() + ": " + error.what());
+                            if (!tile.reloadPending && !tile.removePending)
+                            {
+                                tile.failed = true;
+                                warn("Static LOD " + tile.path.string() + ": " + error.what());
+                            }
                         }
                     }
                     else ++running;
@@ -4124,6 +4396,7 @@ namespace openf4::world
                     it = staticTiles.erase(it);
                     continue;
                 }
+                if (tile.ready) ++running; // Keep decoded-but-not-uploaded tiles inside the worker budget.
                 ++it;
             }
             // One reference part per frame bounds upload and material preparation cost.
@@ -4141,6 +4414,7 @@ namespace openf4::world
                         render::PackedMesh combined;
                         for (auto& surface : part.surfaces)
                         {
+                            surface.material.normalMapped = true;
                             const auto material = pack->materials.addPreparedDynamic(
                                 renderer, std::move(surface.material));
                             for (auto& meshlet : surface.mesh.meshlets)
@@ -4153,7 +4427,10 @@ namespace openf4::world
                                 key.origin.y * cellSize));
                         auto coarse = makeInstance(range, transform);
                         coarse.lodRange = {0.0f, 0.0f, 80.0f * cellSize, 92.0f * cellSize};
-                        tile.replacement.emplace(part.form, renderer.addInstance(coarse));
+                        const auto instance = renderer.addInstance(coarse);
+                        const std::array ids{instance};
+                        renderer.setInstancesActive(ids, false);
+                        tile.replacement.emplace(part.form, instance);
                     }
                     catch (const std::exception& error)
                     {
@@ -4163,12 +4440,14 @@ namespace openf4::world
                 }
                 if (tile.cursor == tile.ready->parts.size())
                 {
-                    for (const auto& [form, instance] : tile.installed)
+                    // Keep the resident tile if any replacement part failed to install.
+                    for (const auto& [form, instance] : tile.failed ? tile.replacement : tile.installed)
                     {
                         const std::array ids{instance};
                         renderer.setInstancesActive(ids, false);
                     }
-                    tile.installed = std::move(tile.replacement);
+                    if (!tile.failed) tile.installed = std::move(tile.replacement);
+                    tile.replacement.clear();
                     tile.ready.reset();
                     tile.cursor = 0;
                 }
@@ -4186,9 +4465,10 @@ namespace openf4::world
                     ++running;
                     tile.reloadPending = false;
                     const auto path = tile.path;
+                    const auto generation = tile.generation;
                     auto& pack = resources[master];
                     if (!pack) pack = std::make_shared<Resources>(data, master);
-                    tile.job = std::async(std::launch::async, [path, pack] {
+                    tile.job = std::async(std::launch::async, [path, pack, generation] {
                         StaticPrepared result;
                         for (auto& part : assets::loadLodStaticParts(path))
                         {
@@ -4197,7 +4477,7 @@ namespace openf4::world
                             for (std::size_t i = 0; i < part.geometry.surfaces.size(); ++i)
                             {
                                 const auto& source = part.geometry.surfaces[i];
-                                const auto materialKey = path.string() + "/"
+                                const auto materialKey = path.string() + "/" + std::to_string(generation) + "/"
                                     + std::to_string(prepared.form) + "/" + std::to_string(i);
                                 prepared.surfaces.push_back({render::buildMeshlets(
                                     source.vertices, source.indices),
@@ -4217,7 +4497,7 @@ namespace openf4::world
                     const std::array ids{instance};
                     renderer.setInstancesActive(ids, show);
                 }
-                if (desired && (tile.installed.empty() || tile.job.valid() || tile.ready
+                if (desired && !tile.failed && (tile.installed.empty() || tile.job.valid() || tile.ready
                     || tile.reloadPending))
                     ++pending;
             }
@@ -4247,6 +4527,12 @@ namespace openf4::world
                     render::PackedMesh combined;
                     for (auto& surface : prepared.surfaces)
                     {
+                        surface.material.normalMapped = true;
+                        for (const auto& warning : surface.material.warnings)
+                            warn(warning);
+                        for (const auto& texture : surface.material.textures)
+                            if (!texture.error.empty())
+                                warn("Texture fallback: " + texture.path + ": " + texture.error);
                         const auto material = model.resources->materials.addPreparedDynamic(
                             renderer, std::move(surface.material));
                         for (auto& meshlet : surface.mesh.meshlets)
@@ -4255,6 +4541,19 @@ namespace openf4::world
                     }
                     model.range = renderer.addMesh(std::move(combined));
                     model.picking = std::move(prepared.picking);
+                    model.skinBones = std::move(prepared.skinBones);
+                    model.animations = std::move(prepared.animations);
+                    model.collision = std::move(prepared.collision);
+                    model.collisionError = std::move(prepared.collisionError);
+                    // Create a skin palette for animated models
+                    if (!model.skinBones.empty())
+                    {
+                        std::vector<glm::mat4> palette;
+                        palette.reserve(model.skinBones.size());
+                        for (const auto& bone : model.skinBones)
+                            palette.push_back(glm::inverse(bone.skinToBone));
+                        model.skinPaletteOffset = renderer.addSkinPalette(palette);
+                    }
                     for (const auto& warning : prepared.warnings)
                         warn(warning);
                 }
@@ -4270,13 +4569,25 @@ namespace openf4::world
             const std::set<std::uint32_t> hiddenSet(hidden.begin(), hidden.end());
             std::set<std::uint32_t> visible;
             pending = active = 0;
+            incompleteStaticCells.clear();
+            physicsCenter = center;
+            if (physicsWorld && terrain)
+                physicsWorld->setOrigin({center.x * cellSize, 0.0f, center.y * cellSize});
             const std::size_t workerLimit = std::clamp<std::size_t>(
                 std::max(1u, std::thread::hardware_concurrency()) / 2u, 2u, 16u);
             for (const auto& reference : references)
             {
+                auto found = instances.find(reference.formId);
+                auto residentCell = reference.cell;
+                if (physicsWorld && found != instances.end() && found->second.movable)
+                {
+                    const auto& position = found->second.transform[3];
+                    residentCell = {static_cast<std::int32_t>(std::floor(position.x / cellSize)),
+                        static_cast<std::int32_t>(std::floor(position.z / cellSize))};
+                }
                 if (hiddenSet.contains(reference.formId)
-                    || std::abs(static_cast<std::int64_t>(reference.cell.x) - center.x) > 4
-                    || std::abs(static_cast<std::int64_t>(reference.cell.y) - center.y) > 4)
+                    || std::abs(static_cast<std::int64_t>(residentCell.x) - center.x) > 4
+                    || std::abs(static_cast<std::int64_t>(residentCell.y) - center.y) > 4)
                     continue;
                 const auto path = paths.find(reference.baseObject);
                 if (path == paths.end())
@@ -4284,6 +4595,24 @@ namespace openf4::world
                 const auto source = sources.find(reference.baseObject);
                 const auto& sourcePath = source == sources.end() ? master : source->second;
                 const auto key = sourcePath.generic_string() + ":" + path->second;
+                const auto keepPrevious = [&] {
+                    if (found == instances.end()) return;
+                    auto& previous = found->second;
+                    const auto placed = referenceTransform(reference);
+                    if (previous.authoredTransform != placed)
+                    {
+                        suspendPhysics(previous, false);
+                        const auto oldProjection = makeInstance(*models.at(previous.model).range, placed);
+                        renderer.updateInstanceTransform(previous.id, placed, oldProjection.bounds);
+                        previous.authoredTransform = previous.transform = placed;
+                        previous.bounds = oldProjection.bounds;
+                        previous.cell = reference.cell;
+                        previous.geometryBounds.reset();
+                        previous.collisionFailed = false;
+                    }
+                    visible.insert(reference.formId);
+                    ++active;
+                };
                 auto& model = models[key];
                 if (!model.resources)
                 {
@@ -4293,15 +4622,24 @@ namespace openf4::world
                     model.resources = pack;
                 }
                 if (model.failed)
+                {
+                    keepPrevious();
+                    if (!movableModels.contains(reference.baseObject))
+                        incompleteStaticCells.insert(reference.cell);
                     continue;
+                }
                 if (!model.range)
                 {
                     ++pending;
+                    keepPrevious();
+                    if (!movableModels.contains(reference.baseObject))
+                        incompleteStaticCells.insert(reference.cell);
                     if (!model.job.valid() && running < workerLimit)
                     {
                         ++running;
                         model.job = std::async(std::launch::async,
-                            [pack = model.resources, relative = path->second, key] {
+                            [pack = model.resources, relative = path->second, key,
+                                withPhysics = physicsWorld != nullptr] {
                                 Prepared result;
                                 assets::ModelGeometry geometry;
                                 std::string extension = std::filesystem::path(relative).extension().string();
@@ -4312,7 +4650,21 @@ namespace openf4::world
                                 {
                                     const auto nifPath = pack->archives.contains(relative) ? relative
                                         : assetPath(relative, "meshes\\", ".nif");
-                                    geometry = assets::loadNifModel(pack->archives.extract(nifPath));
+                                    const auto bytes = pack->archives.extract(nifPath);
+                                    geometry = assets::loadNifModel(bytes);
+                                    if (withPhysics)
+                                    {
+                                        try
+                                        {
+                                            for (auto& system : assets::loadNifPhysicsSystems(bytes))
+                                                for (auto& body : system.bodies)
+                                                    result.collision.push_back(std::move(body));
+                                        }
+                                        catch (const std::exception& error)
+                                        {
+                                            result.collisionError = error.what();
+                                        }
+                                    }
                                 }
                                 else
                                 {
@@ -4324,6 +4676,8 @@ namespace openf4::world
                                     result.warnings = std::move(imported.warnings);
                                 }
                                 result.picking = std::make_shared<const detail::PickingGeometry>(geometry);
+                                result.skinBones = std::move(geometry.skinBones);
+                                result.animations = std::move(geometry.animations);
                                 for (std::size_t i = 0; i < geometry.surfaces.size(); ++i)
                                 {
                                     const auto& surface = geometry.surfaces[i];
@@ -4341,23 +4695,59 @@ namespace openf4::world
                     continue;
                 }
                 const auto transform = referenceTransform(reference);
-                const auto projected = makeInstance(*model.range, transform);
-                auto found = instances.find(reference.formId);
-                if (found != instances.end() && found->second.model != key)
+                auto projected = makeInstance(*model.range, transform);
+                if (found == instances.end() || found->second.model != key)
                 {
-                    const std::array ids{found->second.id};
-                    renderer.setInstancesActive(ids, false);
-                    instances.erase(found);
-                    found = instances.end();
-                }
-                if (found == instances.end())
-                {
-                    found = instances.emplace(reference.formId, Instance{
-                        renderer.addInstance(projected), key, transform, projected.bounds, true}).first;
+                    auto& modelEntry = models[key];
+                    // Set skin data on the projected SceneInstance if the model has skin bones
+                    if (modelEntry.skinPaletteOffset && !modelEntry.skinBones.empty())
+                    {
+                        projected.skinOffset = *modelEntry.skinPaletteOffset;
+                        projected.skinCount = static_cast<std::uint32_t>(modelEntry.skinBones.size());
+                    }
+                    Instance instance;
+                    instance.model = key;
+                    instance.transform = transform;
+                    instance.authoredTransform = transform;
+                    instance.cell = reference.cell;
+                    instance.movable = movableModels.contains(reference.baseObject);
+                    instance.bounds = projected.bounds;
+                    instance.active = true;
+                    instance.skinOffset = projected.skinOffset;
+                    instance.skinCount = projected.skinCount;
+                    if (found != instances.end() && physicsWorld)
+                    {
+                        if (instance.movable && !surroundingsReady(instance))
+                        {
+                            keepPrevious();
+                            ++pending;
+                            continue;
+                        }
+                        if (!installPhysics(instance))
+                        {
+                            model.failed = true;
+                            keepPrevious();
+                            continue;
+                        }
+                    }
+                    instance.id = renderer.addInstance(projected);
+                    if (found == instances.end())
+                        found = instances.emplace(reference.formId, std::move(instance)).first;
+                    else
+                    {
+                        const std::array ids{found->second.id};
+                        renderer.setInstancesActive(ids, false);
+                        suspendPhysics(found->second, false);
+                        found->second = std::move(instance);
+                    }
                 }
                 auto& instance = found->second;
-                if (instance.transform != transform)
+                if (instance.authoredTransform != transform)
                 {
+                    suspendPhysics(instance, false);
+                    instance.collisionFailed = false;
+                    instance.authoredTransform = transform;
+                    instance.cell = reference.cell;
                     renderer.updateInstanceTransform(instance.id, transform, projected.bounds);
                     instance.transform = transform;
                     instance.bounds = projected.bounds;
@@ -4365,6 +4755,21 @@ namespace openf4::world
                 }
                 visible.insert(reference.formId);
                 ++active;
+            }
+            // Update skin palettes for animated models
+            for (auto& [key, modelEntry] : models)
+            {
+                if (!modelEntry.skinPaletteOffset || modelEntry.animations.empty()
+                    || modelEntry.skinBones.empty())
+                    continue;
+                // Advance animation time
+                modelEntry.animationTime += 0.016f; // Assuming ~60 FPS
+                // Sample the first animation clip
+                assets::ModelGeometry geomRef;
+                geomRef.skinBones = modelEntry.skinBones;
+                auto palette = assets::sampleAnimation(
+                    geomRef, modelEntry.animations.front(), modelEntry.animationTime);
+                renderer.updateSkinPalette(*modelEntry.skinPaletteOffset, palette);
             }
             for (auto& [formId, instance] : instances)
             {
@@ -4376,16 +4781,98 @@ namespace openf4::world
                     instance.active = wanted;
                 }
             }
+            syncPhysics();
             std::set<std::uint32_t> available;
-            for (const auto& ref : references) available.insert(ref.formId);
+            for (const auto& ref : references)
+                if (!movableModels.contains(ref.baseObject)) available.insert(ref.formId);
             updateStaticTiles(renderer, center, available, hiddenSet);
         }
     };
+
+    render::SceneTexture modelSceneTexture(const assets::ModelImage& image)
+    {
+        return sceneTexture(image);
+    }
 
     ObjectScene::ObjectScene(const std::filesystem::path& dataDirectory,
         const std::filesystem::path& masterPath)
         : mImpl(std::make_unique<Impl>(dataDirectory, masterPath)) {}
     ObjectScene::~ObjectScene() = default;
+    void ObjectScene::enablePhysics(physics::JoltWorld& world,
+        std::span<const assets::ESMModel> models, LandscapeEditor* terrain,
+        WorldStreamer* streamedTerrain)
+    {
+        if (mImpl->physicsWorld || !mImpl->models.empty())
+            throw std::runtime_error("Project physics must be enabled before object loading");
+        mImpl->physicsWorld = &world;
+        mImpl->terrain = terrain;
+        mImpl->streamedTerrain = streamedTerrain;
+        for (const auto& model : models)
+            if (model.kind == assets::ESMModelKind::movableStatic)
+                mImpl->movableModels.insert(model.formId);
+    }
+    void ObjectScene::stepPhysics(render::VulkanRenderer& renderer, float seconds)
+    {
+        mImpl->stepPhysics(renderer, seconds);
+    }
+    void ObjectScene::enableScripts(const assets::ESMMasterStack& records)
+    {
+        if (!mImpl->physicsWorld || mImpl->scripts)
+            throw std::runtime_error("Project scripts require physics and can only be enabled once");
+        script::ObjectScriptHost host;
+        host.loaded = [this](std::uint32_t form) {
+            const auto found = mImpl->instances.find(form);
+            return found != mImpl->instances.end() && found->second.active && found->second.collisionReady;
+        };
+        host.position = [this](std::uint32_t form) {
+            const auto found = mImpl->instances.find(form);
+            if (found == mImpl->instances.end()) throw std::runtime_error("Reference has no resident transform");
+            return glm::vec3(found->second.transform[3]);
+        };
+        host.motion = [this](std::uint32_t form, std::uint32_t type, bool activate) {
+            const auto found = mImpl->instances.find(form);
+            if (found == mImpl->instances.end() || !found->second.active || !found->second.movable
+                || found->second.bodies.size() != 1)
+                throw std::runtime_error("SetMotionType requires a loaded MSTT with one authored body");
+            auto& instance = found->second;
+            if (!mImpl->physicsWorld->setMotionType(instance.bodies.front(), type, activate))
+                throw std::runtime_error("SetMotionType rejected unsupported collision or motion type");
+            instance.scriptMotion = type;
+        };
+        host.impulse = [this](std::uint32_t form, glm::vec3 direction, float magnitude) {
+            const auto found = mImpl->instances.find(form);
+            if (found == mImpl->instances.end() || !found->second.active || found->second.bodies.size() != 1
+                || !mImpl->physicsWorld->applyHavokImpulse(found->second.bodies.front(), direction, magnitude))
+                throw std::runtime_error("ApplyHavokImpulse requires a loaded dynamic body and finite impulse");
+        };
+        host.diagnostic = [this](std::string_view text) { mImpl->warn(std::string(text)); };
+        mImpl->scripts = std::make_unique<script::ObjectScripts>(records, mImpl->master, mImpl->data, std::move(host));
+    }
+    ObjectCompatibilityState ObjectScene::compatibilityState(std::uint32_t formId) const
+    {
+        ObjectCompatibilityState result;
+        result.formId = formId;
+        const auto found = mImpl->instances.find(formId);
+        if (found == mImpl->instances.end()) return result;
+        const auto& instance = found->second;
+        result.installed = instance.active;
+        result.movable = instance.movable;
+        result.collisionReady = instance.collisionReady;
+        result.surroundingsReady = mImpl->surroundingsReady(instance);
+        result.collisionFailed = instance.collisionFailed;
+        result.authoredTransform = instance.authoredTransform;
+        result.transform = instance.transform;
+        const auto& model = mImpl->models.at(instance.model);
+        result.expectedBodies = model.collision.size();
+        if (mImpl->physicsWorld)
+            for (const auto body : instance.bodies)
+                result.bodies.push_back(mImpl->physicsWorld->bodyState(body));
+        if (model.picking) result.geometry = model.picking->bounds(instance.transform);
+        if (mImpl->terrain)
+            if (const auto surface = mImpl->terrain->surfaceAt({instance.transform[3].x, instance.transform[3].z}))
+                result.landHeight = surface->height;
+        return result;
+    }
     void ObjectScene::update(render::VulkanRenderer& renderer,
         std::span<const assets::PlacedReference> references,
         const std::map<std::uint32_t, std::string>& models,
@@ -4505,7 +4992,9 @@ namespace openf4::world
             std::filesystem::path path;
             std::optional<render::MeshRange> range;
             std::optional<std::uint32_t> instance;
-            std::optional<std::uint32_t> fallbackInstance;
+            std::vector<std::uint32_t> topology;
+            std::set<assets::CellCoord> coveredCells;
+            bool available = true;
             bool queued = false;
             bool failed = false;
         };
@@ -4599,10 +5088,14 @@ namespace openf4::world
         std::map<assets::CellCoord, TerrainSurface> surfaces;
         std::map<assets::CellCoord, render::MeshRange> terrainRanges;
         std::map<assets::CellCoord, std::uint32_t> terrainInstances;
+        physics::JoltWorld* physicsWorld = nullptr;
+        std::map<assets::CellCoord, physics::BodyHandle> terrainBodies;
+        std::set<assets::CellCoord> failedTerrainBodies;
         std::set<assets::CellCoord> activeCells;
         std::map<assets::LodTerrainTile, DemBtrTile> demBtrTiles;
-        std::set<assets::LodTerrainTile> activeDemBtrs;
-        std::set<assets::LodTerrainTile> activeFallbackBtrs;
+        detail::DemLodSelection activeDemBtrs;
+        std::set<assets::CellCoord> hiddenDemCells;
+        std::set<assets::CellCoord> fadingDemCells;
         std::deque<assets::CellCoord> demCellQueue;
         std::set<assets::CellCoord> queuedDemCells;
         std::set<assets::CellCoord> unavailableDemCells;
@@ -4634,6 +5127,47 @@ namespace openf4::world
         glm::vec2 brushCenter{std::numeric_limits<float>::max()};
         float displayedRadius = 0.0f;
 
+        void syncTerrainPhysics(const glm::dvec3& camera)
+        {
+            if (!physicsWorld) return;
+            const assets::CellCoord center{static_cast<std::int32_t>(std::floor(-camera.x / cellSize)),
+                static_cast<std::int32_t>(std::floor(camera.z / cellSize))};
+            const auto wanted = [&](assets::CellCoord cell) {
+                return std::abs(static_cast<std::int64_t>(cell.x) - center.x) <= demCellRadius
+                    && std::abs(static_cast<std::int64_t>(cell.y) - center.y) <= demCellRadius;
+            };
+            for (auto it = terrainBodies.begin(); it != terrainBodies.end();)
+                if (!wanted(it->first))
+                {
+                    physicsWorld->removeBody(it->second);
+                    it = terrainBodies.erase(it);
+                }
+                else ++it;
+            // Bound main-thread shape construction and fill nearest support cells first.
+            unsigned budget = 2;
+            for (int radius = 0; radius <= demCellRadius; ++radius)
+                for (int y = center.y - radius; y <= center.y + radius; ++y)
+                    for (int x = center.x - radius; x <= center.x + radius; ++x)
+                    {
+                        const assets::CellCoord cell{x, y};
+                        if (!budget || terrainBodies.contains(cell) || failedTerrainBodies.contains(cell)
+                            || !document.containsCell(cell)) continue;
+                        --budget;
+                        try
+                        {
+                            terrainBodies.emplace(cell, physicsWorld->addStaticHeightField(
+                                document.cell(cell).heights, assets::LandscapeCell::side,
+                                vertexSpacing, {x * cellSize, 0.0f, y * cellSize}));
+                        }
+                        catch (const std::exception& error)
+                        {
+                            failedTerrainBodies.insert(cell);
+                            std::cerr << "Project LAND collision " << x << ", " << y
+                                << ": " << error.what() << '\n';
+                        }
+                    }
+        }
+
         [[nodiscard]] static std::int32_t demBtrTileOrigin(
             std::int32_t coordinate, std::int32_t level)
         {
@@ -4643,8 +5177,20 @@ namespace openf4::world
             return tile * level;
         }
 
+        void includeIndexedDemBtrs()
+        {
+            for (const auto key : assets::LodBuildIndex(path).expectedTerrainTiles())
+            {
+                const auto output = assets::LodBuildIndex::terrainTilePath(path, key);
+                const auto [tile, inserted] = demBtrTiles.try_emplace(key, DemBtrTile{output});
+                if (inserted)
+                    tile->second.available = false;
+            }
+        }
+
         void discoverDemBtrs()
         {
+            includeIndexedDemBtrs();
             const std::filesystem::path directory = path.parent_path()
                 / (path.stem().string() + ".btr");
             if (!std::filesystem::is_directory(directory))
@@ -4658,9 +5204,11 @@ namespace openf4::world
                 {
                     const auto [tile, inserted] = demBtrTiles.try_emplace(*key,
                         DemBtrTile{entry.path()});
-                    if (!inserted && entry.path().filename().string().starts_with("openf4world.")
-                        && !tile->second.path.filename().string().starts_with("openf4world."))
+                    if (!inserted && (!tile->second.available
+                        || (entry.path().filename().string().starts_with("openf4world.")
+                            && !tile->second.path.filename().string().starts_with("openf4world."))))
                         tile->second.path = entry.path();
+                    tile->second.available = true;
                 }
             }
         }
@@ -4759,6 +5307,18 @@ namespace openf4::world
                 glm::vec3(origin.x * cellSize, -32.0f, origin.y * cellSize));
         }
 
+        [[nodiscard]] static std::vector<std::uint32_t> demBtrTopology(
+            const render::PackedMesh& mesh)
+        {
+            auto result = mesh.indices;
+            for (const auto& meshlet : mesh.meshlets)
+            {
+                result.push_back(meshlet.vertexCount);
+                result.push_back(meshlet.triangleCount);
+            }
+            return result;
+        }
+
         [[nodiscard]] static glm::mat4 demWaterTransform(assets::CellCoord center)
         {
             return glm::translate(glm::mat4(1.0f), glm::vec3(
@@ -4770,7 +5330,7 @@ namespace openf4::world
             const render::MeshRange& range, const glm::mat4& transform, bool coarse) const
         {
             auto instance = makeInstance(range, transform);
-            if (demProject || !demBtrTiles.empty())
+            if (coarse || demProject)
                 instance.lodRange = detail::demTerrainLodRange(coarse);
             return instance;
         }
@@ -4785,21 +5345,19 @@ namespace openf4::world
                 if (key.level != 32)
                     continue;
                 auto& tile = demBtrTiles.at(key);
+                if (!tile.available)
+                    continue;
                 try
                 {
-                    const auto range = render::appendMesh(initial.mesh,
-                        loadDemBtrMesh(tile.path, material));
+                    auto mesh = loadDemBtrMesh(tile.path, material);
+                    tile.topology = demBtrTopology(mesh);
+                    tile.coveredCells = detail::demTerrainCoverage(mesh, key);
+                    const auto range = render::appendMesh(initial.mesh, std::move(mesh));
                     tile.range = range;
                     tile.instance = static_cast<std::uint32_t>(initial.instances.size());
-                    auto normal = makeDemTerrainInstance(
-                        range, demBtrTransform(key.origin), false);
-                    normal.lodRange = detail::demBtrLodRange(32);
-                    normal.active = false;
-                    initial.instances.push_back(normal);
-                    tile.fallbackInstance = static_cast<std::uint32_t>(initial.instances.size());
                     initial.instances.push_back(makeDemTerrainInstance(
                         range, demBtrTransform(key.origin), true));
-                    activeFallbackBtrs.insert(key);
+                    activeDemBtrs.emplace(key, detail::demTerrainLodRange(true));
                 }
                 catch (const std::exception& error)
                 {
@@ -4807,12 +5365,19 @@ namespace openf4::world
                     std::cerr << "DEM BTR skipped: " << error.what() << '\n';
                 }
             }
-            std::cout << "DEM BTR viewer: " << activeFallbackBtrs.size() << " / "
-                      << demBtrTiles.size() << " level-32 tiles resident\n";
+            std::cout << "DEM BTR viewer: " << activeDemBtrs.size() << " resident / "
+                      << demBtrTiles.size() << " hierarchy tiles discovered\n";
         }
 
         void queueDemCells(assets::CellCoord center)
         {
+            std::erase_if(demCellQueue, [&](assets::CellCoord coord) {
+                if (std::abs(static_cast<std::int64_t>(coord.x) - center.x) <= demCellRadius
+                    && std::abs(static_cast<std::int64_t>(coord.y) - center.y) <= demCellRadius)
+                    return false;
+                queuedDemCells.erase(coord);
+                return true;
+            });
             for (std::int32_t y = center.y - demCellRadius;
                 y <= center.y + demCellRadius; ++y)
             {
@@ -4925,6 +5490,8 @@ namespace openf4::world
             tile.queued = false;
             if (prepared.mesh)
             {
+                tile.topology = demBtrTopology(*prepared.mesh);
+                tile.coveredCells = detail::demTerrainCoverage(*prepared.mesh, prepared.key);
                 const auto range = renderer.addMesh(std::move(*prepared.mesh));
                 tile.range = range;
                 auto instance = makeDemTerrainInstance(
@@ -4932,13 +5499,6 @@ namespace openf4::world
                 instance.lodRange = detail::demBtrLodRange(prepared.key.level);
                 instance.active = false;
                 tile.instance = renderer.addInstance(instance);
-                if (prepared.key.level == 32)
-                {
-                    auto fallback = makeDemTerrainInstance(
-                        range, demBtrTransform(prepared.key.origin), true);
-                    fallback.active = false;
-                    tile.fallbackInstance = renderer.addInstance(fallback);
-                }
             }
             else
             {
@@ -4966,7 +5526,7 @@ namespace openf4::world
                     if (key.level != level)
                         continue;
                     auto& tile = demBtrTiles.at(key);
-                    if (!tile.instance && !tile.failed && !tile.queued)
+                    if (tile.available && !tile.instance && !tile.failed && !tile.queued)
                     {
                         tile.queued = true;
                         demBtrQueue.push_back(key);
@@ -4974,67 +5534,52 @@ namespace openf4::world
                 }
             startDemBtrJob();
 
-            bool hierarchyReady = true;
-            bool fallbackReady = true;
-            for (const int level : {4, 8, 16, 32})
+            std::map<assets::LodTerrainTile, bool> residency;
+            for (const auto key : desired)
+                residency.emplace(key, demBtrTiles.at(key).instance.has_value());
+            const bool landReady = !demProject || demWindowResolved(center);
+            auto selected = detail::selectDemTerrainLod(residency, activeDemBtrs, landReady);
+            for (const auto coord : activeCells)
             {
-                const auto tileX = demBtrTileOrigin(center.x, level);
-                const auto tileY = demBtrTileOrigin(center.y, level);
-                for (int y = -demBtrRadius; y <= demBtrRadius; ++y)
-                    for (int x = -demBtrRadius; x <= demBtrRadius; ++x)
-                    {
-                        const assets::LodTerrainTile key{level,
-                            {tileX + x * level, tileY + y * level}};
-                        const auto found = demBtrTiles.find(key);
-                        const bool loaded = found != demBtrTiles.end()
-                            && found->second.instance.has_value();
-                        hierarchyReady = hierarchyReady && loaded;
-                        if (level == 32 && found != demBtrTiles.end())
-                            fallbackReady = fallbackReady && loaded;
-                    }
-            }
-            if (hierarchyReady)
-            {
-                for (const auto key : activeFallbackBtrs)
-                    deactivate.push_back(*demBtrTiles.at(key).fallbackInstance);
-                activeFallbackBtrs.clear();
-                std::set<assets::LodTerrainTile> selected;
-                for (const auto key : desired)
+                const bool covered = (!landReady || !demProject) && std::ranges::any_of(selected,
+                    [&](const auto& entry) { return demBtrTiles.at(entry.first).coveredCells.contains(coord); });
+                const bool fade = demProject || covered;
+                if (fade != fadingDemCells.contains(coord))
                 {
-                    selected.insert(key);
-                    if (!activeDemBtrs.contains(key))
-                        activate.push_back(*demBtrTiles.at(key).instance);
+                    renderer.updateInstanceLodRange(terrainInstances.at(coord), fade
+                        ? detail::demTerrainLodRange(false) : render::SceneInstance{}.lodRange);
+                    if (fade)
+                        fadingDemCells.insert(coord);
+                    else
+                        fadingDemCells.erase(coord);
                 }
-                for (const auto key : activeDemBtrs)
-                    if (!selected.contains(key))
-                        deactivate.push_back(*demBtrTiles.at(key).instance);
-                activeDemBtrs = std::move(selected);
+                const bool hide = !landReady && covered;
+                if (hide != hiddenDemCells.contains(coord))
+                    (hide ? deactivate : activate).push_back(terrainInstances.at(coord));
+                if (hide)
+                    hiddenDemCells.insert(coord);
+                else
+                    hiddenDemCells.erase(coord);
             }
-            else if (fallbackReady)
+            for (const auto& [key, range] : selected)
             {
-                for (const auto key : activeDemBtrs)
+                const auto previous = activeDemBtrs.find(key);
+                if (previous == activeDemBtrs.end())
+                    activate.push_back(*demBtrTiles.at(key).instance);
+                if (previous == activeDemBtrs.end() || previous->second != range)
+                    renderer.updateInstanceLodRange(*demBtrTiles.at(key).instance, range);
+            }
+            for (const auto& [key, range] : activeDemBtrs)
+                if (!selected.contains(key))
                     deactivate.push_back(*demBtrTiles.at(key).instance);
-                activeDemBtrs.clear();
-                std::set<assets::LodTerrainTile> selected;
-                for (const auto key : desired)
-                {
-                    if (key.level != 32 || !demBtrTiles.at(key).fallbackInstance)
-                        continue;
-                    selected.insert(key);
-                    if (!activeFallbackBtrs.contains(key))
-                        activate.push_back(*demBtrTiles.at(key).fallbackInstance);
-                }
-                for (const auto key : activeFallbackBtrs)
-                    if (!selected.contains(key))
-                        deactivate.push_back(*demBtrTiles.at(key).fallbackInstance);
-                activeFallbackBtrs = std::move(selected);
-            }
+            activeDemBtrs = std::move(selected);
         }
 
         void refreshDerivedLod(render::VulkanRenderer& renderer,
             std::span<const std::filesystem::path> publishedPaths)
         {
-            if (publishedPaths.empty())
+            if (std::ranges::none_of(publishedPaths,
+                    [](const auto& output) { return demLodBtrTile(output).has_value(); }))
                 return;
             if (demBtrJob.valid())
             {
@@ -5043,62 +5588,71 @@ namespace openf4::world
             }
             if (surfaces.empty())
                 return;
+            includeIndexedDemBtrs();
             const auto material = surfaces.begin()->second.material;
             for (const auto& path : publishedPaths)
             {
                 const auto key = demLodBtrTile(path);
                 if (!key)
                     continue;
+                if (!std::filesystem::is_regular_file(path))
+                {
+                    const auto retired = demBtrTiles.find(*key);
+                    if (retired != demBtrTiles.end())
+                    {
+                        if (retired->second.instance)
+                        {
+                            const std::array old{*retired->second.instance};
+                            renderer.setInstancesActive(old, false);
+                        }
+                        std::erase(demBtrQueue, *key);
+                        activeDemBtrs.erase(*key);
+                        demBtrTiles.erase(retired);
+                    }
+                    continue;
+                }
                 auto [it, inserted] = demBtrTiles.try_emplace(*key,
                     DemBtrTile{path});
                 auto& tile = it->second;
                 tile.path = path;
                 tile.failed = false;
+                tile.available = true;
                 if (inserted || !tile.instance)
                     continue;
 
                 auto mesh = loadDemBtrMesh(path, material);
-                // ponytail: the renderer has append-only mesh storage; each explicit
-                // rebake replaces the resident instance. Recycle topology-compatible
-                // ranges if repeated live bakes make this cache measurable.
-                std::vector<std::uint32_t> old;
-                if (tile.instance)
-                    old.push_back(*tile.instance);
-                if (tile.fallbackInstance)
-                    old.push_back(*tile.fallbackInstance);
-                const bool wasNormal = activeDemBtrs.contains(*key);
-                const bool wasFallback = activeFallbackBtrs.contains(*key);
-                renderer.setInstancesActive(old, false);
-                activeDemBtrs.erase(*key);
-                activeFallbackBtrs.erase(*key);
-
+                auto topology = demBtrTopology(mesh);
+                if (tile.range && tile.topology == topology
+                    && tile.range->vertexCount == mesh.vertices.size()
+                    && tile.range->indexCount == mesh.indices.size()
+                    && tile.range->meshletCount == mesh.meshlets.size())
+                {
+                    const auto bounds = mesh.bounds;
+                    renderer.updateMesh(*tile.range, std::move(mesh));
+                    tile.range->bounds = bounds;
+                    const auto updated = makeDemTerrainInstance(
+                        *tile.range, demBtrTransform(key->origin), false);
+                    renderer.updateInstanceTransform(*tile.instance,
+                        updated.transform, updated.bounds);
+                    continue;
+                }
+                // Changed cell coverage changes topology; install it before hiding
+                // the old range so a failed allocation leaves the previous tile visible.
+                auto coveredCells = detail::demTerrainCoverage(mesh, *key);
                 const auto range = renderer.addMesh(std::move(mesh));
-                tile.range = range;
-                auto normal = makeDemTerrainInstance(
+                auto replacement = makeDemTerrainInstance(
                     range, demBtrTransform(key->origin), false);
-                normal.lodRange = detail::demBtrLodRange(key->level);
-                normal.active = false;
-                tile.instance = renderer.addInstance(normal);
-                tile.fallbackInstance.reset();
-                if (key->level == 32)
-                {
-                    auto fallback = makeDemTerrainInstance(
-                        range, demBtrTransform(key->origin), true);
-                    fallback.active = false;
-                    tile.fallbackInstance = renderer.addInstance(fallback);
-                }
-                if (wasNormal)
-                {
-                    const std::array ids{*tile.instance};
-                    renderer.setInstancesActive(ids, true);
-                    activeDemBtrs.insert(*key);
-                }
-                if (wasFallback && tile.fallbackInstance)
-                {
-                    const std::array ids{*tile.fallbackInstance};
-                    renderer.setInstancesActive(ids, true);
-                    activeFallbackBtrs.insert(*key);
-                }
+                const auto active = activeDemBtrs.find(*key);
+                replacement.active = active != activeDemBtrs.end();
+                replacement.lodRange = replacement.active ? active->second
+                    : detail::demBtrLodRange(key->level);
+                const auto instance = renderer.addInstance(replacement);
+                const std::array old{*tile.instance};
+                renderer.setInstancesActive(old, false);
+                tile.instance = instance;
+                tile.range = range;
+                tile.topology = std::move(topology);
+                tile.coveredCells = std::move(coveredCells);
             }
             std::vector<std::uint32_t> activate, deactivate;
             updateDemBtrs(renderer, activeCenter.value_or(assets::CellCoord{}),
@@ -5152,10 +5706,21 @@ namespace openf4::world
                 initial.instances.push_back(
                     makeDemTerrainInstance(range, glm::mat4(1.0f), false));
                 activeCells.insert(coord);
+                if (demProject)
+                    fadingDemCells.insert(coord);
             }
 
             if (!demBtrTiles.empty())
                 appendInitialDemBtrs({0, 0});
+            if (!demProject)
+                for (const auto& [coord, instance] : terrainInstances)
+                    if (std::ranges::any_of(activeDemBtrs, [&](const auto& entry) {
+                            return demBtrTiles.at(entry.first).coveredCells.contains(coord);
+                        }))
+                    {
+                        initial.instances[instance].lodRange = detail::demTerrainLodRange(false);
+                        fadingDemCells.insert(coord);
+                    }
             if (!readOnly)
             {
                 render::SceneMaterial brushSceneMaterial;
@@ -5183,6 +5748,8 @@ namespace openf4::world
 
         ~Impl()
         {
+            if (physicsWorld)
+                for (const auto& [cell, body] : terrainBodies) physicsWorld->removeBody(body);
             if (readOnly || externalSave || !isDirty())
                 return;
             try
@@ -5538,7 +6105,9 @@ namespace openf4::world
             surfaces.emplace(coord, surface);
             const auto range = renderer.addMesh(terrainCell(landscape, surface, 1, &document));
             terrainRanges.emplace(coord, range);
-            terrainInstances.emplace(coord, renderer.addInstance(makeInstance(range, glm::mat4(1.0f))));
+            terrainInstances.emplace(coord,
+                renderer.addInstance(makeDemTerrainInstance(range, glm::mat4(1.0f), false)));
+            activeCells.insert(coord);
             brushCenter = glm::vec2(std::numeric_limits<float>::max());
             std::cout << "Editor created CELL " << coord.x << ", " << coord.y << '\n';
         }
@@ -5732,6 +6301,15 @@ namespace openf4::world
         return mImpl->loadedObjects;
     }
 
+    bool WorldStreamer::collisionReady(assets::CellCoord cell) const
+    {
+        const auto landscape = mImpl->world.landscapes.find(cell);
+        if (landscape == mImpl->world.landscapes.end() || !landscape->second.hasHeights)
+            return true;
+        const auto found = mImpl->cells.find(cell);
+        return found != mImpl->cells.end() && found->second.terrainBody.has_value();
+    }
+
     std::size_t WorldStreamer::pendingObjects() const noexcept
     {
             return mImpl->terrainRequests.size() + mImpl->referenceRequests.size()
@@ -5784,6 +6362,7 @@ namespace openf4::world
         if (!mImpl->initialTaken)
             throw std::runtime_error("Initial editor scene must be installed before editing");
         mImpl->update(renderer, cameraPosition, cameraForward, deltaSeconds, sculpting);
+        mImpl->syncTerrainPhysics(cameraPosition);
     }
 
     bool LandscapeEditor::undo(render::VulkanRenderer& renderer)
@@ -5835,6 +6414,20 @@ namespace openf4::world
     std::size_t LandscapeEditor::residentCells() const noexcept
     {
         return mImpl->document.cellForms.size();
+    }
+
+    void LandscapeEditor::enablePhysics(physics::JoltWorld& world)
+    {
+        if (!mImpl->readOnly || mImpl->physicsWorld)
+            throw std::runtime_error("Terrain physics is only available in the read-only runtime");
+        mImpl->physicsWorld = &world;
+    }
+
+    bool LandscapeEditor::collisionReady(assets::CellCoord cell) const
+    {
+        if (mImpl->terrainBodies.contains(cell)) return true;
+        if (mImpl->document.containsCell(cell)) return false;
+        return !mImpl->demProject || !mImpl->demProject->contains(cell);
     }
 
     std::size_t LandscapeEditor::pendingWork() const noexcept

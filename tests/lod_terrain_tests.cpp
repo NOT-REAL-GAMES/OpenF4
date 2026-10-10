@@ -12,6 +12,7 @@
 #include <ranges>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -45,8 +46,39 @@ namespace
     }
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    if (argc == 4 && std::string_view(argv[1]) == "--dem")
+    {
+        try
+        {
+            const auto output = std::filesystem::absolute(argv[3]);
+            const auto world = std::filesystem::absolute(argv[2]);
+            const auto sidecar = world.parent_path() / (world.stem().string() + ".btr");
+            require(!std::filesystem::exists(output), "DEM test output must be a new directory");
+            require(output.lexically_normal() != sidecar.lexically_normal(),
+                "DEM test may not overwrite world products");
+            TerrainLodSource source(world);
+            const auto tiles = source.tiles();
+            std::cout << "DEM terrain preflight: " << tiles.size() << " tiles\n";
+            for (const int level : {4, 8, 16, 32})
+            {
+                const LodTerrainTile key{level, {0, 0}};
+                require(std::ranges::find(tiles, key) != tiles.end(),
+                    "DEM fixture lacks origin terrain");
+                const auto tile = output / ("openf4world." + std::to_string(level) + ".0.0.btr");
+                source.bake(key, tile);
+                require(!readSurface(tile).indices.empty(), "DEM BTR could not be reimported");
+                std::cout << "Baked level " << level << " origin tile\n";
+            }
+            return 0;
+        }
+        catch (const std::exception& error)
+        {
+            std::cerr << error.what() << '\n';
+            return 1;
+        }
+    }
     const auto root = std::filesystem::temp_directory_path()
         / ("openf4-lod-terrain-" + std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -89,7 +121,7 @@ int main()
         source.bake({4, {4, 0}}, rightPath);
         const auto left = readSurface(leftPath);
         const auto right = readSurface(rightPath);
-        require(left.indices.size() == 4u * 8u * 8u * 6u,
+        require(left.indices.size() == 6u * 8u * 8u * 6u,
             "Level-4 BTR did not clip absent LAND cells");
         require(right.indices.size() == 8u * 8u * 6u,
             "Sparse level-4 BTR contains missing cells");
@@ -99,10 +131,26 @@ int main()
             const auto& b = right.vertices[static_cast<std::size_t>(y) * 33];
             require(close(a.position.y, b.position.y),
                 "Adjacent BTR tiles disagree at a shared LAND edge");
+            require(glm::length(a.normal - b.normal) < 0.01f,
+                "Adjacent BTR tiles disagree on shared-edge normals");
         }
-        source.bake({32, {0, 0}}, root / "large.btr");
-        require(!readSurface(root / "large.btr").indices.empty(),
-            "Level-32 BTR was not readable");
+        for (const int level : {8, 16, 32})
+        {
+            const auto tile = root / (std::to_string(level) + ".btr");
+            source.bake({level, {0, 0}}, tile);
+            const auto mesh = readSurface(tile);
+            require(mesh.indices.size() == 7u * (32u / level) * (32u / level) * 6u,
+                "Coarser BTR did not clip missing cells");
+            for (std::size_t index = 0; index < mesh.indices.size(); index += 3)
+            {
+                const auto center = (mesh.vertices[mesh.indices[index]].position
+                    + mesh.vertices[mesh.indices[index + 1]].position
+                    + mesh.vertices[mesh.indices[index + 2]].position) / 3.0f;
+                require(landscape.containsCell({static_cast<int>(std::floor(center.x / 4096.0f)),
+                    static_cast<int>(std::floor(center.z / 4096.0f))}),
+                    "BTR triangle covers an absent LAND cell");
+            }
+        }
 
         const auto seam = EditableLandscape::SampleCoord{4 * 32, 0};
         landscape.setSample(seam, landscape.sample(seam) + 80.0f);

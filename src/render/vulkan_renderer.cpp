@@ -5,10 +5,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -28,6 +31,17 @@ namespace openf4::render
     namespace
     {
         constexpr std::uint32_t frameCount = 2;
+
+        VKAPI_ATTR VkBool32 VKAPI_CALL validationMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+            VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT* message, void*)
+        {
+            std::fprintf(stderr, "Vulkan Validation %s [%s]: %s\n",
+                severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "Error" : "Warning",
+                message && message->pMessageIdName ? message->pMessageIdName : "unknown",
+                message && message->pMessage ? message->pMessage : "No validation message text");
+            std::fflush(stderr);
+            return VK_FALSE;
+        }
 
         const char* computeShader = R"(
 #version 460
@@ -60,6 +74,8 @@ void main()
         return;
 
     uvec2 source = sources[sourceIndex];
+    if (camera.cameraPosition.w >= 0.0 && source.x < uint(camera.cameraPosition.w))
+        return;
     Instance instance = instances[source.x];
     if (instance.meshletRange.z == 0)
         return;
@@ -244,6 +260,8 @@ void main()
 {
     Instance instance = instances[fragmentInstance];
     Material material = materials[fragmentMaterial];
+    if (!gl_FrontFacing && (material.parameters.z > 0.5 || material.extraTextureIndices.x == 0u))
+        discard;
     if (instance.meshletRange.w != 0) {
         outputColor = material.baseColor;
         return;
@@ -262,6 +280,22 @@ void main()
         discard;
 
     vec3 normal = normalize(fragmentNormal);
+    if (!gl_FrontFacing) normal = -normal;
+    if ((camera.cameraPosition.w >= 0.0 || material.extraTextureIndices.y != 0u)
+        && material.parameters.z < 0.5 && material.textureIndices.y != 0u) {
+        vec3 dp1 = dFdx(fragmentWorldPosition), dp2 = dFdy(fragmentWorldPosition);
+        vec2 uv1 = dFdx(fragmentTexCoord), uv2 = dFdy(fragmentTexCoord);
+        float determinant = uv1.x * uv2.y - uv1.y * uv2.x;
+        if (abs(determinant) > 0.0000001) {
+            vec3 tangent = (dp1 * uv2.y - dp2 * uv1.y) / determinant;
+            vec3 bitangent = (dp2 * uv1.x - dp1 * uv2.x) / determinant;
+            if (dot(tangent,tangent) > 0.0000001 && dot(bitangent,bitangent) > 0.0000001) {
+                vec2 xy = texture(diffuseTextures[nonuniformEXT(material.textureIndices.y)], fragmentTexCoord).rg * 2.0 - 1.0;
+                normal = normalize(normalize(tangent) * xy.x + normalize(bitangent) * xy.y
+                    + normal * sqrt(max(0.0, 1.0 - dot(xy,xy))));
+            }
+        }
+    }
     vec3 lightDirection = normalize(vec3(0.35, 0.8, 0.25));
     vec4 lightClip = camera.lightViewProjection * vec4(fragmentWorldPosition, 1.0);
     vec3 lightUv = lightClip.xyz / lightClip.w;
@@ -540,7 +574,8 @@ void main()
                     material.grayscaleTexture, material.grayscaleToPalette ? 1u : 0u),
                 glm::vec4(material.grayscaleToPaletteScale, material.alphaCutoff,
                     material.water ? 3.0f : (material.terrainLod ? 2.0f : 0.0f),
-                    material.decal ? 1.0f : 0.0f), {}};
+                    material.decal ? 1.0f : 0.0f), glm::uvec4(material.doubleSided ? 1u : 0u,
+                        material.normalMapped ? 1u : 0u, 0u, 0u)};
         }
 
         std::vector<std::uint32_t> compileShader(
@@ -598,6 +633,8 @@ void main()
 
         SDL_Window* window = nullptr;
         VkInstance instance = VK_NULL_HANDLE;
+        VkDebugUtilsMessengerEXT validationMessenger = VK_NULL_HANDLE;
+        PFN_vkDestroyDebugUtilsMessengerEXT destroyValidationMessenger = nullptr;
         VkSurfaceKHR surface = VK_NULL_HANDLE;
         VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
         VkDevice device = VK_NULL_HANDLE;
@@ -668,6 +705,7 @@ void main()
         std::vector<std::uint32_t> pendingInstanceUpdates;
         std::vector<glm::uvec2> pendingSources;
         std::vector<GpuMaterial> pendingMaterials;
+        std::map<std::uint32_t, GpuMaterial> pendingMaterialUpdates;
         std::vector<SceneTexture> pendingTextures;
         struct MeshPatch
         {
@@ -681,6 +719,16 @@ void main()
         float timestampPeriod = 1.0f;
         std::string gpuName;
         RendererStats rendererStats;
+        struct PreviewCheckpoint
+        {
+            std::uint32_t vertices, indices, meshlets, instances, candidates, materials, textures;
+            glm::vec3 center;
+            float radius;
+            RendererStats stats;
+            std::vector<std::uint32_t> selection;
+            std::optional<std::uint32_t> active;
+        };
+        std::optional<PreviewCheckpoint> preview;
 
         Impl(SDL_Window* targetWindow, const PackedMesh& mesh,
             std::span<const SceneInstance> sceneInstances,
@@ -688,30 +736,40 @@ void main()
             std::span<const SceneTexture> sceneTextures)
             : window(targetWindow)
         {
-            createInstance();
-            check(SDL_Vulkan_CreateSurface(window, instance, nullptr, &surface)
-                    ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR,
-                "SDL_Vulkan_CreateSurface");
-            selectPhysicalDevice();
-            createDevice();
-            createAllocator();
-            createSwapchain();
-            createCommandResources();
-            createDescriptorResources(static_cast<std::uint32_t>(sceneTextures.size()));
-            uploadScene(mesh, sceneInstances, sceneMaterials);
-            createFrameResources();
-            createShadowResources();
-            uploadTextures(sceneTextures);
-            createPipelines();
-            updateDescriptorSets();
+            try
+            {
+                createInstance();
+                check(SDL_Vulkan_CreateSurface(window, instance, nullptr, &surface)
+                        ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR,
+                    "SDL_Vulkan_CreateSurface");
+                selectPhysicalDevice();
+                createDevice();
+                createAllocator();
+                createSwapchain();
+                createCommandResources();
+                createDescriptorResources(static_cast<std::uint32_t>(sceneTextures.size()));
+                uploadScene(mesh, sceneInstances, sceneMaterials);
+                createFrameResources();
+                createShadowResources();
+                uploadTextures(sceneTextures);
+                createPipelines();
+                updateDescriptorSets();
 
-            VkQueryPoolCreateInfo queryInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-            queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            queryInfo.queryCount = frameCount * 2;
-            check(vkCreateQueryPool(device, &queryInfo, nullptr, &queryPool), "vkCreateQueryPool");
+                VkQueryPoolCreateInfo queryInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                queryInfo.queryCount = frameCount * 2;
+                check(vkCreateQueryPool(device, &queryInfo, nullptr, &queryPool), "vkCreateQueryPool");
+            }
+            catch (...)
+            {
+                destroy();
+                throw;
+            }
         }
 
-        ~Impl()
+        ~Impl() { destroy(); }
+
+        void destroy()
         {
             if (device)
                 vkDeviceWaitIdle(device);
@@ -793,6 +851,8 @@ void main()
                 vkDestroyDevice(device, nullptr);
             if (surface)
                 vkDestroySurfaceKHR(instance, surface, nullptr);
+            if (validationMessenger)
+                destroyValidationMessenger(instance, validationMessenger, nullptr);
             if (instance)
                 vkDestroyInstance(instance, nullptr);
         }
@@ -803,6 +863,36 @@ void main()
             const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&extensionCount);
             if (!extensions)
                 throw std::runtime_error(SDL_GetError());
+            std::vector<const char*> enabledExtensions(extensions, extensions + extensionCount);
+            constexpr const char* validationLayer = "VK_LAYER_KHRONOS_validation";
+            const char* requestedValidation = std::getenv("OPENF4_VULKAN_VALIDATION");
+            const bool validation = requestedValidation && std::string_view(requestedValidation) == "1";
+            VkDebugUtilsMessengerCreateInfoEXT debugInfo{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+            if (validation)
+            {
+                std::uint32_t layerCount = 0;
+                check(vkEnumerateInstanceLayerProperties(&layerCount, nullptr), "vkEnumerateInstanceLayerProperties");
+                std::vector<VkLayerProperties> layers(layerCount);
+                check(vkEnumerateInstanceLayerProperties(&layerCount, layers.data()), "vkEnumerateInstanceLayerProperties");
+                if (std::ranges::none_of(layers, [validationLayer](const auto& layer) {
+                    return std::string_view(layer.layerName) == validationLayer;
+                })) throw std::runtime_error("Requested Vulkan validation layer is unavailable: VK_LAYER_KHRONOS_validation");
+                std::uint32_t debugExtensionCount = 0;
+                check(vkEnumerateInstanceExtensionProperties(nullptr, &debugExtensionCount, nullptr), "vkEnumerateInstanceExtensionProperties");
+                std::vector<VkExtensionProperties> debugExtensions(debugExtensionCount);
+                check(vkEnumerateInstanceExtensionProperties(nullptr, &debugExtensionCount, debugExtensions.data()), "vkEnumerateInstanceExtensionProperties");
+                if (std::ranges::none_of(debugExtensions, [](const auto& extension) {
+                    return std::string_view(extension.extensionName) == VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+                })) throw std::runtime_error("Requested Vulkan validation requires VK_EXT_debug_utils");
+                if (std::ranges::none_of(enabledExtensions, [](const char* extension) {
+                    return std::string_view(extension) == VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+                })) enabledExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+                debugInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT
+                    | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+                debugInfo.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT
+                    | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+                debugInfo.pfnUserCallback = validationMessage;
+            }
             VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
             application.pApplicationName = "OpenF4";
             application.applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
@@ -811,9 +901,27 @@ void main()
             application.apiVersion = VK_API_VERSION_1_3;
             VkInstanceCreateInfo createInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
             createInfo.pApplicationInfo = &application;
-            createInfo.enabledExtensionCount = extensionCount;
-            createInfo.ppEnabledExtensionNames = extensions;
+            createInfo.enabledExtensionCount = static_cast<std::uint32_t>(enabledExtensions.size());
+            createInfo.ppEnabledExtensionNames = enabledExtensions.data();
+            if (validation)
+            {
+                createInfo.enabledLayerCount = 1;
+                createInfo.ppEnabledLayerNames = &validationLayer;
+                createInfo.pNext = &debugInfo;
+            }
             check(vkCreateInstance(&createInfo, nullptr, &instance), "vkCreateInstance");
+            if (validation)
+            {
+                const auto createMessenger = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+                    vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
+                destroyValidationMessenger = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+                    vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
+                if (!createMessenger || !destroyValidationMessenger)
+                    throw std::runtime_error("Vulkan validation debug messenger entry points are unavailable");
+                check(createMessenger(instance, &debugInfo, nullptr, &validationMessenger), "vkCreateDebugUtilsMessengerEXT");
+                std::fputs("Vulkan validation enabled: VK_LAYER_KHRONOS_validation\n", stderr);
+                std::fflush(stderr);
+            }
         }
 
         void selectPhysicalDevice()
@@ -1959,6 +2067,102 @@ void main()
             return index;
         }
 
+        void updateMaterial(std::uint32_t index, const SceneMaterial& material)
+        {
+            if (index >= materialCount) throw std::runtime_error("Material index is out of bounds");
+            const auto gpu = makeGpuMaterial(material);
+            const auto pendingBase = materialCount - pendingMaterials.size();
+            if (index >= pendingBase) pendingMaterials[index - pendingBase] = gpu;
+            else pendingMaterialUpdates[index] = gpu;
+        }
+
+        void endPreview()
+        {
+            if (!preview) return;
+            // Preview buffers reuse their tail only after all prior readers have completed.
+            waitForFrames();
+            const auto saved = *preview;
+            const auto trim = [](auto& pending, std::size_t total, std::size_t keep) {
+                const auto uploaded = total - pending.size();
+                pending.resize(keep > uploaded ? keep - uploaded : 0);
+            };
+            trim(pendingVertices, vertexCount, saved.vertices);
+            trim(pendingIndices, indexCount, saved.indices);
+            trim(pendingMeshlets, meshletCount, saved.meshlets);
+            trim(pendingInstances, instanceCount, saved.instances);
+            trim(pendingSources, candidateCount, saved.candidates);
+            trim(pendingMaterials, materialCount, saved.materials);
+            trim(pendingTextures, textureTargets.size(), saved.textures);
+            std::erase_if(pendingInstanceUpdates, [&](auto id) { return id >= saved.instances; });
+            std::erase_if(pendingMaterialUpdates, [&](const auto& entry) { return entry.first >= saved.materials; });
+            std::erase_if(pendingMeshPatches, [&](const auto& patch) { return patch.range.vertexOffset >= saved.vertices; });
+            for (std::size_t i = saved.textures; i < textureTargets.size(); ++i)
+            {
+                auto& texture = textureTargets[i];
+                vkDestroyImageView(device, texture.view, nullptr);
+                if (texture.sparse)
+                {
+                    vkDestroyImage(device, texture.image, nullptr);
+                    vkFreeMemory(device, texture.sparseMemory, nullptr);
+                }
+                else vmaDestroyImage(allocator, texture.image, texture.allocation);
+            }
+            textureTargets.resize(saved.textures);
+            vertexCount = saved.vertices; indexCount = saved.indices; meshletCount = saved.meshlets;
+            instanceCount = saved.instances; candidateCount = saved.candidates; materialCount = saved.materials;
+            instanceData.resize(instanceCount); meshletData.resize(meshletCount);
+            sceneCenter = saved.center; sceneRadius = saved.radius;
+            rendererStats = saved.stats;
+            selectedInstances.clear(); activeSelection.reset();
+            preview.reset();
+            setSelection(saved.selection, saved.active);
+            ++descriptorGeneration;
+            updateDescriptorSets();
+        }
+
+        std::uint32_t replacePreview(PackedMesh mesh, std::span<const SceneInstance> objects,
+            std::span<const SceneMaterial> surfaceMaterials, std::span<const SceneTexture> textures)
+        {
+            if (mesh.meshlets.empty() || objects.empty() || surfaceMaterials.empty())
+                throw std::runtime_error("Preview scene is empty");
+            for (const auto& meshlet : mesh.meshlets)
+                if (meshlet.materialIndex >= surfaceMaterials.size())
+                    throw std::runtime_error("Preview material index is invalid");
+            for (const auto& material : surfaceMaterials)
+                if (material.diffuseTexture > textures.size() || material.normalTexture > textures.size())
+                    throw std::runtime_error("Preview texture index is invalid");
+            endPreview();
+            preview = PreviewCheckpoint{vertexCount, indexCount, meshletCount, instanceCount,
+                candidateCount, materialCount, static_cast<std::uint32_t>(textureTargets.size()),
+                sceneCenter, sceneRadius, rendererStats, selectedInstances, activeSelection};
+            try
+            {
+                setSelection({}, std::nullopt);
+                const auto materialBase = materialCount;
+                const auto textureBase = static_cast<std::uint32_t>(textureTargets.size());
+                for (const auto& texture : textures) (void)appendTexture(texture);
+                for (auto material : surfaceMaterials)
+                {
+                    if (material.diffuseTexture) material.diffuseTexture += textureBase - 1;
+                    if (material.normalTexture) material.normalTexture += textureBase - 1;
+                    (void)appendMaterial(material);
+                }
+                for (auto& meshlet : mesh.meshlets) meshlet.materialIndex += materialBase;
+                const auto range = appendPackedMesh(std::move(mesh));
+                const auto first = instanceCount;
+                sceneCenter = glm::vec3(range.bounds); sceneCenter.x = -sceneCenter.x;
+                sceneRadius = std::max(range.bounds.w, 1.0f);
+                for (auto object : objects)
+                {
+                    object.meshletOffset += range.meshletOffset;
+                    if (!object.meshletCount) object.meshletCount = range.meshletCount;
+                    (void)appendInstance(object);
+                }
+                return first;
+            }
+            catch (...) { endPreview(); throw; }
+        }
+
         MeshRange appendPackedMesh(PackedMesh mesh)
         {
             if (mesh.vertices.empty() || mesh.indices.empty() || mesh.meshlets.empty())
@@ -2070,14 +2274,10 @@ void main()
             candidateCount += source.meshletCount;
             rendererStats.sourceCandidates = candidateCount;
 
-            const glm::vec3 oldMinimum = sceneCenter - sceneRadius;
-            const glm::vec3 oldMaximum = sceneCenter + sceneRadius;
-            const glm::vec3 newMinimum = glm::vec3(source.bounds) - source.bounds.w;
-            const glm::vec3 newMaximum = glm::vec3(source.bounds) + source.bounds.w;
-            const glm::vec3 minimum = glm::min(oldMinimum, newMinimum);
-            const glm::vec3 maximum = glm::max(oldMaximum, newMaximum);
-            sceneCenter = (minimum + maximum) * 0.5f;
-            sceneRadius = std::max(glm::distance(sceneCenter, maximum), 1.0f);
+            const auto combinedBounds = unionBoundingSpheres(
+                glm::vec4(sceneCenter, sceneRadius), source.bounds);
+            sceneCenter = glm::vec3(combinedBounds);
+            sceneRadius = std::max(combinedBounds.w, 1.0f);
             return index;
         }
 
@@ -2172,11 +2372,28 @@ void main()
                 glm::distance(sceneCenter, glm::vec3(bounds)) + bounds.w);
         }
 
+        void updateLodRange(std::uint32_t index, glm::vec4 range)
+        {
+            if (index >= instanceData.size())
+                throw std::runtime_error("Streamed instance index is out of bounds");
+            if (!std::isfinite(range.x) || !std::isfinite(range.y)
+                || !std::isfinite(range.z) || !std::isfinite(range.w)
+                || range.x < 0.0f || range.y < range.x || range.z < range.y || range.w < range.z)
+                throw std::runtime_error("Invalid instance LOD range");
+            if (instanceData[index].lodRange == range) return;
+            instanceData[index].lodRange = range;
+            const std::size_t pendingBase = instanceData.size() - pendingInstances.size();
+            if (index >= pendingBase)
+                pendingInstances[index - pendingBase].lodRange = range;
+            else
+                pendingInstanceUpdates.push_back(index);
+        }
+
         bool recordStreamingUploads(Frame& frame, VkCommandBuffer command)
         {
             const bool hasUploads = !pendingVertices.empty() || !pendingIndices.empty()
                 || !pendingMeshlets.empty() || !pendingInstances.empty() || !pendingSources.empty()
-                || !pendingMaterials.empty() || !pendingTextures.empty()
+                || !pendingMaterials.empty() || !pendingMaterialUpdates.empty() || !pendingTextures.empty()
                 || !pendingInstanceUpdates.empty() || !pendingMeshPatches.empty() || skinDataDirty;
             if (!hasUploads)
             {
@@ -2290,6 +2507,8 @@ void main()
             addUpload(materials,
                 static_cast<VkDeviceSize>(materialCount - pendingMaterials.size()) * sizeof(GpuMaterial),
                 pendingMaterials.data(), pendingMaterials.size() * sizeof(GpuMaterial));
+            for (const auto& [index, material] : pendingMaterialUpdates)
+                addUpload(materials, static_cast<VkDeviceSize>(index) * sizeof(GpuMaterial), &material, sizeof(material));
             if (skinDataDirty)
                 addUpload(skinMatrices, 0, skinData.data(), skinData.size() * sizeof(glm::mat4));
 
@@ -2328,7 +2547,7 @@ void main()
 
             // Scene buffers are shared by both in-flight frames: wait for earlier
             // shader reads before overwriting existing geometry/instance/skin data.
-            if (!pendingMeshPatches.empty() || !pendingInstanceUpdates.empty() || skinDataDirty)
+            if (!pendingMeshPatches.empty() || !pendingInstanceUpdates.empty() || !pendingMaterialUpdates.empty() || skinDataDirty)
             {
                 VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
                 barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
@@ -2393,6 +2612,7 @@ void main()
             pendingInstanceUpdates.clear();
             pendingSources.clear();
             pendingMaterials.clear();
+            pendingMaterialUpdates.clear();
             pendingTextures.clear();
             pendingMeshPatches.clear();
             skinDataDirty = false;
@@ -2455,7 +2675,7 @@ void main()
             VkPipelineRasterizationStateCreateInfo rasterization{
                 VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
             rasterization.polygonMode = VK_POLYGON_MODE_FILL;
-            rasterization.cullMode = VK_CULL_MODE_BACK_BIT;
+            rasterization.cullMode = VK_CULL_MODE_NONE;
             rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
             rasterization.lineWidth = 1.0f;
             VkPipelineMultisampleStateCreateInfo multisample{
@@ -2528,6 +2748,7 @@ void main()
             shadowStage.module = shadowModule;
             shadowStage.pName = "main";
             VkPipelineRasterizationStateCreateInfo shadowRasterization = rasterization;
+            shadowRasterization.cullMode = VK_CULL_MODE_BACK_BIT;
             shadowRasterization.depthBiasEnable = VK_TRUE;
             shadowRasterization.depthBiasConstantFactor = 1.25f;
             shadowRasterization.depthBiasSlopeFactor = 1.75f;
@@ -2582,7 +2803,7 @@ void main()
             viewport.viewportCount = viewport.scissorCount = 1;
             VkPipelineRasterizationStateCreateInfo rasterization{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
             rasterization.polygonMode = VK_POLYGON_MODE_FILL;
-            rasterization.cullMode = VK_CULL_MODE_BACK_BIT;
+            rasterization.cullMode = VK_CULL_MODE_NONE;
             rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
             rasterization.lineWidth = 1.0f;
             VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -2845,7 +3066,7 @@ void main()
             lightProjection[1][1] *= -1.0f;
             camera.lightViewProjection = lightProjection * lightView;
             camera.planes = extractFrustum(camera.viewProjection);
-            camera.cameraPosition = glm::vec4(cameraPosition, 1.0f);
+            camera.cameraPosition = glm::vec4(cameraPosition, preview ? static_cast<float>(preview->instances) : -1.0f);
             camera.worldOrigin = glm::vec4(worldOrigin, 0.0f);
             int logicalWidth = 0;
             int logicalHeight = 0;
@@ -3123,6 +3344,24 @@ void main()
         return mImpl->appendMaterial(material);
     }
 
+    void VulkanRenderer::updateMaterial(std::uint32_t index, const SceneMaterial& material)
+    {
+        mImpl->updateMaterial(index, material);
+    }
+
+    std::uint32_t VulkanRenderer::replacePreviewScene(PackedMesh mesh,
+        std::span<const SceneInstance> instances, std::span<const SceneMaterial> materials,
+        std::span<const SceneTexture> textures)
+    {
+        return mImpl->replacePreview(std::move(mesh), instances, materials, textures);
+    }
+
+    void VulkanRenderer::endPreview() { mImpl->endPreview(); }
+    std::uint32_t VulkanRenderer::previewMaterialOffset() const noexcept
+    { return mImpl->preview ? mImpl->preview->materials : 0; }
+    std::uint32_t VulkanRenderer::previewTextureOffset() const noexcept
+    { return mImpl->preview ? mImpl->preview->textures : 0; }
+
     MeshRange VulkanRenderer::addMesh(PackedMesh mesh)
     {
         return mImpl->appendPackedMesh(std::move(mesh));
@@ -3159,6 +3398,11 @@ void main()
         std::span<const std::uint32_t> instances, bool active)
     {
         mImpl->setActive(instances, active);
+    }
+
+    void VulkanRenderer::updateInstanceLodRange(std::uint32_t instance, glm::vec4 lodRange)
+    {
+        mImpl->updateLodRange(instance, lodRange);
     }
 
     void VulkanRenderer::setSelection(std::span<const std::uint32_t> instances,

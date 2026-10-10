@@ -19,7 +19,9 @@ int main(int argc, char** argv)
         bool unattended = false;
         for (int i = 1; i < argc; ++i)
             unattended |= std::string_view(argv[i]) == "--frames"
-                || std::string_view(argv[i]) == "--smoke-test";
+                || std::string_view(argv[i]) == "--smoke-test"
+                || std::string_view(argv[i]) == "--smoke-bake"
+                || std::string_view(argv[i]) == "--bake-lod";
         if (!unattended)
             SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenF4 editor", error.what(), nullptr);
         return 1;

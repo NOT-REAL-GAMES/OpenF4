@@ -4,6 +4,7 @@
   "version-string": "0.1.0",
   "dependencies": [
     "assimp",
+    { "name": "directxtex", "default-features": false },
     "glm",
     {
       "name": "imgui",
@@ -19,6 +20,7 @@
       "features": ["vulkan"]
     },
     "shaderc",
+    "spdlog",
     "sqlite3",
     "stb",
     "vulkan-memory-allocator",
