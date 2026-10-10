@@ -2,7 +2,9 @@
 
 OpenF4 is a clean-room reimplementation of Fallout 4,
 meant to expand its capabilities beyond some of its more
-dated design decisions from 2015.
+dated design decisions from 2015. This project does not
+and will never rely on decompilation efforts or any of
+Bethesda's preexisting source code.
 
 ## Current Core
 
