@@ -13,6 +13,9 @@ namespace openf4::editor
     public:
         AssetWorkspace(EditorDocument& world, std::uint32_t model,
             const std::filesystem::path& dataDirectory);
+        // PROTOTYPE: blank asset with no world base yet; the first Save Native NIF publishes
+        // the package and adds a new STAT/MSTT base (modelId() is 0 until then).
+        AssetWorkspace(EditorDocument& world, const std::filesystem::path& dataDirectory);
         ~AssetWorkspace();
         AssetWorkspace(const AssetWorkspace&) = delete;
         AssetWorkspace& operator=(const AssetWorkspace&) = delete;

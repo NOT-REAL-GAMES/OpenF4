@@ -28,10 +28,17 @@ namespace openf4::assets
             }
         };
 
-        nifly::MatTransform globalTransform(nifly::NifFile& file, nifly::NiShape* shape)
+        // Model-space transform of a block. The root node's own transform is deliberately
+        // excluded: the game replaces it with the reference placement, so it must not be
+        // applied again on top of the REFR transform. Verified against vanilla SCOL CM*.nif
+        // bakes, which match the parts only when the part NIF's root transform is ignored.
+        nifly::MatTransform modelTransform(nifly::NifFile& file, nifly::NiAVObject* object)
         {
-            nifly::MatTransform result = shape->GetTransformToParent();
-            for (nifly::NiNode* parent = file.GetParentNode(shape); parent;
+            const nifly::NiNode* root = file.GetRootNode();
+            if (object == root)
+                return {};
+            nifly::MatTransform result = object->GetTransformToParent();
+            for (nifly::NiNode* parent = file.GetParentNode(object); parent && parent != root;
                  parent = file.GetParentNode(parent))
                 result = parent->GetTransformToParent().ComposeTransforms(result);
             return result;
@@ -81,11 +88,10 @@ namespace openf4::assets
                 for (const auto& point : parents->connectPoints)
                 {
                     glm::mat4 root(1.0f);
-                    nifly::MatTransform rootTransform;
                     const std::string rootName = point.root.get();
-                    if (!rootName.empty()
-                        && file.GetNodeTransformToGlobal(rootName, rootTransform))
-                        root = rootTransform.ToGLMMatrix<glm::mat4>();
+                    if (!rootName.empty())
+                        if (auto* node = file.FindBlockByName<nifly::NiNode>(rootName))
+                            root = modelTransform(file, node).ToGLMMatrix<glm::mat4>();
                     glm::quat rotation(point.rotation.w, point.rotation.x,
                         point.rotation.y, point.rotation.z);
                     if (glm::length(rotation) <= 0.0f)
@@ -120,7 +126,7 @@ namespace openf4::assets
             const auto* colors = file.GetColorsForShape(shape);
             const bool skinned = shape->IsSkinned();
             const nifly::MatTransform transform = skinned
-                ? nifly::MatTransform{} : globalTransform(file, shape);
+                ? nifly::MatTransform{} : modelTransform(file, shape);
             std::vector<std::uint32_t> boneMap;
             std::vector<glm::uvec4> vertexBones(positions->size());
             std::vector<glm::vec4> vertexWeights(positions->size());

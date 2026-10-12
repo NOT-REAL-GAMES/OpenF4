@@ -5,6 +5,8 @@
 #include "editor/scripts_panel.hpp"
 #include "assets/fo4_install.hpp"
 #include "assets/fo4_export.hpp"
+#include "assets/fo4_world_writer.hpp"
+#include "assets/load_order.hpp"
 #include "assets/lod_bake.hpp"
 #include "assets/lod_statics.hpp"
 #include "assets/lod_terrain.hpp"
@@ -22,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <deque>
 #include <filesystem>
@@ -35,6 +38,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -168,7 +172,7 @@ namespace openf4::editor
             bool mPlatformAttached = false;
         };
 
-        enum class FileAction { open, create, saveAs, import, exportFolder };
+        enum class FileAction { open, create, saveAs, import, exportFolder, addPlugin, newPlugin };
         struct DialogResult
         {
             FileAction action;
@@ -263,6 +267,7 @@ namespace openf4::editor
                 if (!mWindow)
                     throw std::runtime_error(SDL_GetError());
                 mUi = std::make_unique<EditorUi>(mWindow.get());
+                mLoadOrder = assets::LoadOrder(mData);
                 openWorld(path);
             }
 
@@ -280,12 +285,43 @@ namespace openf4::editor
                     << "W/E/R: move/rotate/scale; Delete: delete; Ctrl+D: duplicate; "
                        "End: drop to LAND; Escape: cancel drag; Ctrl+Z/Y: undo/redo; Ctrl+S: save\n";
                 auto previous = std::chrono::steady_clock::now();
+                if (const char* profile = SDL_getenv("OPENF4_EDITOR_PROFILE"); profile && *profile && *profile != '0')
+                {
+                    mProfile.enabled = true;
+                    std::cout << "Editor profiling on: section averages every " << FrameProfile::window << " frames\n";
+                }
+                // Reproducible perf runs: OPENF4_EDITOR_BENCH="x,y,z,yaw,pitch" activates the file the
+                // load order adopted (so masters + worldspace load like Make Active File), parks the
+                // camera, and never writes anything on exit.
+                if (const char* bench = SDL_getenv("OPENF4_EDITOR_BENCH"); bench && *bench)
+                {
+                    // Optional sixth value: fly speed in units/s along the horizontal heading, to
+                    // reproduce cell crossings (streaming, LOD fades) while moving.
+                    // Optional seventh value: frames to hold still first (initial load drains), so the
+                    // frame-time summary only measures the flight itself.
+                    std::array<double, 7> values{};
+                    if (std::sscanf(bench, "%lf,%lf,%lf,%lf,%lf,%lf,%lf", &values[0], &values[1], &values[2],
+                            &values[3], &values[4], &values[5], &values[6]) < 5)
+                        throw std::runtime_error("OPENF4_EDITOR_BENCH expects x,y,z,yaw,pitch[,speed[,warmupFrames]]");
+                    mBenchSpeed = values[5];
+                    mBenchWarmup = static_cast<int>(std::max(0.0, values[6]));
+                    mProfile.summaryFrom = mBenchWarmup;
+                    mDiscardOnExit = true;
+                    if (mLoadOrder.active()) makeActiveFile(*mLoadOrder.active());
+                    mPosition = {values[0], values[1], values[2]};
+                    mYaw = static_cast<float>(values[3]);
+                    mPitch = static_cast<float>(values[4]);
+                    std::cout << "Editor bench: " << mDocument->references().size() << " references\n";
+                }
                 while (mRunning)
                 {
                     const auto now = std::chrono::steady_clock::now();
+                    mProfile.last = now;
                     const float delta = std::clamp(std::chrono::duration<float>(now - previous).count(),
                         0.0001f, 0.1f);
                     previous = now;
+                    if (mBenchSpeed != 0.0 && mFrames >= mBenchWarmup)
+                        mPosition += glm::dvec3(std::sin(mYaw), 0.0, std::cos(mYaw)) * (mBenchSpeed * delta);
                     if (mNextFrameAction) { auto action = std::move(mNextFrameAction); mNextFrameAction = {}; attempt(action); }
                     events();
                     handleDialogs();
@@ -337,15 +373,18 @@ namespace openf4::editor
                         SDL_Delay(16);
                         continue;
                     }
+                    mark(FrameProfile::pre);
                     mUi->attach(mRenderer->uiContext());
                     ImGui_ImplVulkan_NewFrame();
                     ImGui_ImplSDL3_NewFrame();
                     ImGui::NewFrame();
                     ImGuizmo::BeginFrame();
                     mScripts.poll();
+                    if (mDocument && mDocument->writable()) mScripts.ensureWakeScript(*mDocument, mData);
                     if (!mAssetMode) pollBake();
                     pollExport();
                     shell();
+                    mark(FrameProfile::menu);
                     ImGui::BeginDisabled(mExportDialog);
                     if (mAssetMode && mAsset)
                     {
@@ -357,15 +396,25 @@ namespace openf4::editor
                         if (!mExportDialog) navigate(delta);
                         reconcileSelection();
                         viewport(delta);
+                        mark(FrameProfile::viewport);
                         inspector();
+                        mark(FrameProfile::inspector);
                         outliner();
+                        mark(FrameProfile::outliner);
                     }
+                    mark(FrameProfile::viewport);
                     assetsPanel();
+                    mark(FrameProfile::assets);
+                    loadOrderPanel();
                     diagnostics();
                     ImGui::EndDisabled();
-                    if (!mAssetMode) { shortcuts(); projectObjects(); }
+                    writeModeBanner();
+                    mark(FrameProfile::panels);
+                    if (!mAssetMode) { hardDeleteModal(); shortcuts(); projectObjects(); }
                     smokeStep();
+                    mark(FrameProfile::objects);
                     ImGui::Render();
+                    mark(FrameProfile::imgui);
                     const glm::dvec3 origin = mAssetMode ? glm::dvec3(0) : renderOrigin(mPosition);
                     const glm::vec3 local = mAssetMode ? mAsset->cameraPosition() : glm::vec3(mPosition - origin);
                     const glm::mat4 view = mAssetMode ? mAsset->view() : glm::lookAtRH(local, local + forward(), {0.0f, 1.0f, 0.0f});
@@ -384,6 +433,8 @@ namespace openf4::editor
                         [](VkCommandBuffer commands) {
                             ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commands);
                         });
+                    mark(FrameProfile::render);
+                    reportProfile(now);
                     ++mFrames;
                     if (mFrameLimit > 0 && mFrames >= mFrameLimit)
                         mRunning = false;
@@ -407,8 +458,14 @@ namespace openf4::editor
                 mBakeJob = {};
                 mBakeAwaitingConfirmation = false;
                 mBakeProgress.reset();
-                if (mDocument->dirty())
-                    save();
+                if (mDocument->dirty() && !mDiscardOnExit)
+                {
+                    if (mLoadOrder.masterEditingEnabled())
+                        std::cerr << "Editor: unsaved MASTER edits were not auto-saved; masters are only written by an explicit Save\n";
+                    else if (mDocument->writable())
+                        save();
+                }
+                reportFrameSummary();
                 std::cout << "Editor finished: " << mFrames << " frames, "
                     << mDocument->references().size() << " references, "
                     << mObjects->loaded() << " loaded, " << mObjects->pending() << " pending, "
@@ -429,6 +486,95 @@ namespace openf4::editor
             }
 
         private:
+            // OPENF4_EDITOR_PROFILE=1: per-section CPU averages, printed every `window` frames.
+            struct FrameProfile
+            {
+                enum Slot { pre, menu, viewport, inspector, outliner, assets, panels, objects, imgui, render, count };
+                static constexpr int window = 120;
+                static constexpr const char* names[count]{"events", "menu", "viewport+stream", "inspector",
+                    "outliner", "assets", "panels", "objects", "imgui", "render"};
+                bool enabled = false;
+                std::chrono::steady_clock::time_point last{};
+                std::array<double, count> sums{};
+                std::array<double, 5> gpu{}; // frame, cull, shadow, world, overlay
+                double visible = 0.0, shadowVisible = 0.0;
+                double total = 0.0, worst = 0.0;
+                int frames = 0;
+                // Per-frame breakdown for hitch reports (frames over hitchMs) and the exit summary.
+                std::array<double, count> current{};
+                double terrainMs = 0.0, objectsMs = 0.0, coverageMs = 0.0;
+                double hitchMs = 12.0;
+                int summaryFrom = 0;
+                std::vector<float> samples;
+            };
+
+            void mark(FrameProfile::Slot slot)
+            {
+                if (!mProfile.enabled) return;
+                const auto now = std::chrono::steady_clock::now();
+                const double elapsed = std::chrono::duration<double, std::milli>(now - mProfile.last).count();
+                mProfile.sums[slot] += elapsed;
+                mProfile.current[slot] += elapsed;
+                mProfile.last = now;
+            }
+
+            void reportFrameSummary()
+            {
+                if (!mProfile.enabled || mProfile.samples.empty()) return;
+                auto sorted = mProfile.samples;
+                std::sort(sorted.begin(), sorted.end());
+                const auto at = [&](double q) { return sorted[std::min(sorted.size() - 1, static_cast<std::size_t>(q * double(sorted.size())))]; };
+                double sum = 0.0;
+                std::size_t over8 = 0, over16 = 0, over33 = 0;
+                for (const float value : sorted)
+                {
+                    sum += value;
+                    over8 += value > 8.33f; over16 += value > 16.67f; over33 += value > 33.3f;
+                }
+                std::printf("Frame summary (%zu frames after warmup): avg %.2f p50 %.2f p95 %.2f p99 %.2f p99.9 %.2f max %.2f ms | "
+                    ">8.3ms %zu, >16.7ms %zu, >33ms %zu\n", sorted.size(), sum / double(sorted.size()), at(0.5), at(0.95),
+                    at(0.99), at(0.999), sorted.back(), over8, over16, over33);
+                std::fflush(stdout);
+            }
+
+            void reportProfile(std::chrono::steady_clock::time_point frameStart)
+            {
+                if (!mProfile.enabled) return;
+                const double frame = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frameStart).count();
+                mProfile.total += frame; mProfile.worst = std::max(mProfile.worst, frame);
+                if (mFrames >= mProfile.summaryFrom) mProfile.samples.push_back(static_cast<float>(frame));
+                if (frame >= mProfile.hitchMs && mFrames >= mProfile.summaryFrom)
+                {
+                    std::printf("  hitch frame %d: %.2f ms |", mFrames, frame);
+                    for (int i = 0; i < FrameProfile::count; ++i)
+                        if (mProfile.current[i] >= 0.5) std::printf(" %s %.2f", FrameProfile::names[i], mProfile.current[i]);
+                    std::printf(" | terrain %.2f objects %.2f coverage %.2f\n", mProfile.terrainMs, mProfile.objectsMs, mProfile.coverageMs);
+                }
+                mProfile.current = {};
+                mProfile.terrainMs = mProfile.objectsMs = mProfile.coverageMs = 0.0;
+                if (mRenderer)
+                {
+                    const auto& stats = mRenderer->stats();
+                    mProfile.gpu[0] += stats.gpuFrameMs; mProfile.gpu[1] += stats.gpuCullMs;
+                    mProfile.gpu[2] += stats.gpuShadowMs; mProfile.gpu[3] += stats.gpuWorldMs;
+                    mProfile.gpu[4] += stats.gpuOverlayMs; mProfile.visible += stats.visibleMeshlets;
+                    mProfile.shadowVisible += stats.shadowMeshlets;
+                }
+                if (++mProfile.frames < FrameProfile::window) return;
+                const double n = mProfile.frames;
+                std::printf("Editor profile: %.2f ms/frame avg (%.1f fps), worst %.2f |", mProfile.total / n,
+                    1000.0 * n / std::max(mProfile.total, 0.001), mProfile.worst);
+                for (int i = 0; i < FrameProfile::count; ++i) std::printf(" %s %.2f", FrameProfile::names[i], mProfile.sums[i] / n);
+                std::printf(" | %zu refs, %zu loaded\n", mDocument ? mDocument->references().size() : 0,
+                    mObjects ? mObjects->loaded() : 0);
+                std::printf("  GPU %.2f ms (cull %.2f shadow %.2f world %.2f overlay %.2f) | %.0f visible + %.0f shadow meshlets\n",
+                    mProfile.gpu[0] / n, mProfile.gpu[1] / n, mProfile.gpu[2] / n, mProfile.gpu[3] / n,
+                    mProfile.gpu[4] / n, mProfile.visible / n, mProfile.shadowVisible / n);
+                std::fflush(stdout);
+                mProfile.sums = {}; mProfile.gpu = {}; mProfile.visible = mProfile.shadowVisible = 0.0;
+                mProfile.total = mProfile.worst = 0.0; mProfile.frames = 0;
+            }
+
             void recordError(const std::exception& error)
             {
                 mMessages.push_back(error.what());
@@ -607,6 +753,7 @@ namespace openf4::editor
             {
                 if (mExportDialog) throw std::runtime_error("Close the export dialog before baking");
                 if (bakeBusy()) return;
+                if (!mDocument->writable()) throw std::runtime_error(mDocument->readOnlyReason());
                 save();
                 mBakeWorld = mDocument->path();
                 mBakeOptions = {};
@@ -701,7 +848,15 @@ namespace openf4::editor
                 }
             }
 
+            // Legacy File > Open: one OpenF4 world (non-OpenF4 files get an automatic overlay).
             void openWorld(const std::filesystem::path& path)
+            {
+                prepareDocumentSwitch();
+                installDocument(std::make_unique<EditorDocument>(path, mData));
+                adoptLegacyLoadOrder();
+            }
+
+            void prepareDocumentSwitch()
             {
                 if (mExportDialog) throw std::runtime_error("Close the export dialog before opening a world");
                 if (mScripts.busy()) throw std::runtime_error("Wait for script compilation before opening a world");
@@ -709,7 +864,12 @@ namespace openf4::editor
                     throw std::runtime_error("Wait for or cancel the current LOD bake before opening a world");
                 if (mDocument) finishManipulation(true);
                 if (mDocument && mDocument->dirty())
+                {
+                    // A master is only ever written by an explicit Save.
+                    if (mLoadOrder.masterEditingEnabled())
+                        throw std::runtime_error("Unsaved MASTER edits: press Save (Ctrl+S) or Undo them before switching files");
                     save();
+                }
                 if (mImport)
                     throw std::runtime_error("Wait for the current model import before opening a world");
                 if (mAsset)
@@ -717,13 +877,21 @@ namespace openf4::editor
                     if (mAsset->dirty()) throw std::runtime_error("Save or discard the asset before opening a world");
                     mAsset->suspend(*mRenderer); mAsset.reset(); mAssetMode = false;
                 }
-                auto next = std::make_unique<EditorDocument>(path, mData);
+            }
+
+            void installDocument(std::unique_ptr<EditorDocument> next)
+            {
+                // MSTTs start awake by default; worlds authored before that get a one-time,
+                // undoable upgrade of this ESM's own MSTT bases (never master records,
+                // never third-party plugins, never read-only targets).
+                next->setStartAwakeByDefault(true);
+                const auto awakened = next->migrateStartAwake();
                 std::unique_ptr<world::LandscapeEditor> terrain;
                 std::unique_ptr<world::WorldStreamer> streamer;
                 world::WorldScene scene;
                 if (next->hasEditableTerrain())
                 {
-                    terrain = std::make_unique<world::LandscapeEditor>(mData, next->path());
+                    terrain = std::make_unique<world::LandscapeEditor>(mData, next->path(), !next->writable());
                     terrain->setExternalSave(true);
                     terrain->setBrushEnabled(false);
                     scene = terrain->takeInitialScene();
@@ -731,7 +899,7 @@ namespace openf4::editor
                 else
                 {
                     streamer = std::make_unique<world::WorldStreamer>(mData, std::nullopt, 2,
-                        false, 0, next->basePath());
+                        false, 0, next->basePath(), next->baseWorldFormId());
                     scene = streamer->takeInitialScene();
                 }
                 mUi->detach();
@@ -745,6 +913,8 @@ namespace openf4::editor
                 mRenderer = std::make_unique<render::VulkanRenderer>(mWindow.get(), scene.mesh,
                     scene.instances, scene.materials, scene.textures);
                 mUi->attach(mRenderer->uiContext());
+                // Full-detail references come from mObjects; vanilla object LOD hands off to them.
+                if (mStreamer) mStreamer->fadeObjectLodIntoExternalObjects(*mRenderer);
                 mSelection.clear();
                 mSelectionOrder.clear();
                 mActiveReference.reset();
@@ -760,6 +930,502 @@ namespace openf4::editor
                     mResidentTerrainCells = mTerrain->residentCells();
                 }
                 mMessages.push_back("Opened " + mDocument->path().string());
+                if (awakened)
+                    mMessages.push_back("Start Awake: attached " + std::string(assets::wakeOnLoadScriptName) + " to "
+                        + std::to_string(awakened) + " existing MSTT base(s) in this ESM (unsaved; Undo reverts).");
+            }
+
+            static bool isPluginFile(const std::filesystem::path& path)
+            {
+                const auto extension = assets::foldedName(path.extension().string());
+                return extension == ".esm" || extension == ".esp" || extension == ".esl";
+            }
+
+            void requestQuit()
+            {
+                if (mDocument && mDocument->dirty() && mLoadOrder.masterEditingEnabled()) mQuitConfirm = true;
+                else mRunning = false;
+            }
+
+            // Re-applies the load-order gate to the open document and the window title.
+            void syncWritePolicy()
+            {
+                if (!mDocument) return;
+                std::string reason;
+                const bool allowed = mLoadOrder.canWrite(mDocument->path(), &reason);
+                if (allowed != mDocument->writable() || (!allowed && reason != mDocument->readOnlyReason()))
+                    mDocument->setWritePolicy(allowed, reason);
+                std::string title = "OpenF4 Editor - " + mDocument->path().filename().string();
+                if (mLoadOrder.masterEditingEnabled()) title += "  [MASTER EDITING ENABLED]";
+                else if (!allowed) title += "  [READ-ONLY]";
+                if (title != mWindowTitle) { mWindowTitle = title; SDL_SetWindowTitle(mWindow.get(), title.c_str()); }
+            }
+
+            void adoptLegacyLoadOrder()
+            {
+                assets::LoadOrder order(mData);
+                const auto& files = mDocument->loadedFiles();
+                for (std::size_t i = 0; i + 1 < files.size(); ++i)
+                {
+                    const auto name = std::filesystem::u8path(files[i]);
+                    for (const auto& candidate : {mDocument->path().parent_path() / name, mData / name})
+                        if (std::filesystem::is_regular_file(candidate))
+                        {
+                            try { (void)order.add(candidate); } catch (const std::exception&) {}
+                            break;
+                        }
+                }
+                (void)order.add(mDocument->path());
+                order.adoptActive(mDocument->path());
+                mLoadOrder = std::move(order);
+                mLoadOrderDirect = false; mWorldspaces.clear(); mActiveWorld.reset(); mLoadOrderSelected = mLoadOrder.active();
+                syncWritePolicy();
+            }
+
+            void addPluginFile(const std::filesystem::path& path)
+            {
+                auto order = mLoadOrder;
+                auto result = order.add(path);
+                if (mDocument && mDocument->dirty() && mDocument->writable() && !order.canWrite(mDocument->path()))
+                    throw std::runtime_error("Save the active file before adding " + path.filename().string()
+                        + ": it lists the active file as a master, which would make it read-only");
+                mLoadOrder = std::move(order);
+                mLoadOrderSelected = result.index;
+                syncWritePolicy();
+                mMessages.push_back("Load order: added " + path.filename().string());
+                if (!result.missingMasters.empty())
+                {
+                    mMissingOfferPlugin = mLoadOrder.entries()[result.index].header.name;
+                    mMissingOffer = std::move(result);
+                }
+            }
+
+            void createPlugin(std::filesystem::path path)
+            {
+                if (path.extension().empty()) path += ".esp";
+                if (!mLoadOrderSelected || *mLoadOrderSelected >= mLoadOrder.size())
+                    throw std::runtime_error("Select the file the new plugin should override (its masters are copied in order)");
+                const auto& base = mLoadOrder.entries()[*mLoadOrderSelected].header;
+                auto masters = base.masters; masters.push_back(base.name);
+                assets::createFo4OverridePlugin(path, masters, "Created by OpenF4");
+                addPluginFile(path);
+                mMessages.push_back("New plugin " + path.filename().string() + " (masters: " + std::to_string(masters.size())
+                    + "). Select it and press Make Active File to edit.");
+            }
+
+            void makeActiveFile(std::size_t index, std::optional<std::uint32_t> requestedWorld = std::nullopt)
+            {
+                auto order = mLoadOrder;
+                order.makeActive(index);
+                const auto worlds = order.activeWorldspaces();
+                if (worlds.empty())
+                    throw std::runtime_error(order.activeEntry()->header.name + " and its masters define no worldspace");
+                std::uint32_t world = worlds.front().formId;
+                const auto pick = [&](auto predicate) {
+                    for (const auto& w : worlds) if (predicate(w)) { world = w.formId; return true; }
+                    return false;
+                };
+                if (!(requestedWorld && pick([&](const auto& w) { return w.formId == *requestedWorld; })))
+                    if (!(!mActiveWorldEditorId.empty()
+                        && pick([&](const auto& w) { return assets::foldedName(w.editorId) == assets::foldedName(mActiveWorldEditorId); })))
+                        pick([](const auto& w) { return assets::foldedName(w.editorId) == "commonwealth"; });
+                prepareDocumentSwitch();
+                EditorOpenOptions options;
+                options.dataDirectory = mData; options.directEdit = true; options.worldFormId = world;
+                for (const auto& entry : order.entries()) options.resolvedFiles.push_back(entry.header.path);
+                options.writable = order.canWrite(order.activeEntry()->header.path, &options.readOnlyReason);
+                const auto path = order.activeEntry()->header.path;
+                installDocument(std::make_unique<EditorDocument>(path, std::move(options)));
+                mLoadOrder = std::move(order);
+                mLoadOrderDirect = true; mWorldspaces = worlds; mActiveWorld = world;
+                for (const auto& w : worlds) if (w.formId == world) mActiveWorldEditorId = w.editorId;
+                syncWritePolicy();
+                mMessages.push_back("Active file: " + path.filename().string() + " / " + mActiveWorldEditorId
+                    + (mDocument->writable() ? " (edits are saved to this file)" : " (READ-ONLY master browse)"));
+            }
+
+            void reopenActive()
+            {
+                if (mLoadOrderDirect && mLoadOrder.active()) makeActiveFile(*mLoadOrder.active(), mActiveWorld);
+                else openWorld(mDocument->path());
+            }
+
+            static std::string worldLabel(const assets::WorldspaceInfo& w)
+            {
+                char id[16]; SDL_snprintf(id, sizeof(id), "%08X", w.formId);
+                return (w.editorId.empty() ? std::string("(no EDID)") : w.editorId) + "  [" + id + "]  " + w.definingFile;
+            }
+
+            void loadOrderPanel()
+            {
+                ImGui::SetNextWindowSize({420, 360}, ImGuiCond_FirstUseEver);
+                ImGui::Begin("Load Order");
+                ImGui::BeginDisabled(mAssetMode);
+                ImGui::TextWrapped("Drop .esm/.esp/.esl files on the window, or Add. Masters always load first and before their dependents.");
+                if (ImGui::Button("Add file...")) showDialog(FileAction::addPlugin);
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!mLoadOrderSelected);
+                if (ImGui::Button("New plugin...")) showDialog(FileAction::newPlugin);
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Creates an empty .esp whose masters are the selected file's masters plus the selected file.");
+                ImGui::SameLine();
+                if (ImGui::Button("Up") && *mLoadOrderSelected > 0)
+                    attempt([&] { mLoadOrder.move(*mLoadOrderSelected, *mLoadOrderSelected - 1); --*mLoadOrderSelected; syncWritePolicy(); });
+                ImGui::SameLine();
+                if (ImGui::Button("Down") && *mLoadOrderSelected + 1 < mLoadOrder.size())
+                    attempt([&] { mLoadOrder.move(*mLoadOrderSelected, *mLoadOrderSelected + 1); ++*mLoadOrderSelected; syncWritePolicy(); });
+                ImGui::SameLine();
+                if (ImGui::Button("Remove"))
+                    attempt([&] { mLoadOrder.remove(*mLoadOrderSelected); mLoadOrderSelected.reset(); syncWritePolicy(); });
+                ImGui::EndDisabled();
+                ImGui::Separator();
+                if (ImGui::BeginTable("LoadOrderTable", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp))
+                {
+                    ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 26.0f);
+                    ImGui::TableSetupColumn("File");
+                    ImGui::TableSetupColumn("Status");
+                    ImGui::TableHeadersRow();
+                    std::optional<std::pair<std::size_t, std::size_t>> requestedMove;
+                    for (std::size_t i = 0; i < mLoadOrder.size(); ++i)
+                    {
+                        const auto& entry = mLoadOrder.entries()[i];
+                        const bool active = mLoadOrder.active() == i;
+                        ImGui::PushID(static_cast<int>(i));
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%02zX", i);
+                        ImGui::TableNextColumn();
+                        std::string label = (active ? "> " : "  ") + entry.header.name
+                            + (entry.header.isMasterFile() ? "  [M]" : "  [P]") + (entry.header.light ? " [ESL]" : "");
+                        if (ImGui::Selectable(label.c_str(), mLoadOrderSelected == i, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick))
+                            mLoadOrderSelected = i;
+                        if (ImGui::BeginDragDropSource())
+                        {
+                            ImGui::SetDragDropPayload("OPENF4_LOAD_ORDER", &i, sizeof(i));
+                            ImGui::Text("Move %s", entry.header.name.c_str());
+                            ImGui::EndDragDropSource();
+                        }
+                        if (ImGui::BeginDragDropTarget())
+                        {
+                            if (const auto* payload = ImGui::AcceptDragDropPayload("OPENF4_LOAD_ORDER"))
+                                requestedMove = std::pair(*static_cast<const std::size_t*>(payload->Data), i);
+                            ImGui::EndDragDropTarget();
+                        }
+                        if (ImGui::IsItemHovered())
+                        {
+                            std::string tip = entry.header.path.string();
+                            for (const auto& m : entry.header.masters) tip += "\nmaster: " + m;
+                            ImGui::SetTooltip("%s", tip.c_str());
+                        }
+                        ImGui::TableNextColumn();
+                        if (!entry.missingMasters.empty())
+                            ImGui::TextColored({1.0f, 0.35f, 0.3f, 1.0f}, "missing %s", entry.missingMasters.front().c_str());
+                        else if (active && mLoadOrder.masterEditingEnabled())
+                            ImGui::TextColored({1.0f, 0.25f, 0.2f, 1.0f}, "ACTIVE - MASTER EDITING");
+                        else if (active)
+                            ImGui::TextColored(mDocument->writable() ? ImVec4{0.4f, 1.0f, 0.5f, 1.0f} : ImVec4{1.0f, 0.75f, 0.2f, 1.0f},
+                                mDocument->writable() ? "ACTIVE (editable)" : "ACTIVE (read-only)");
+                        else if (mLoadOrder.isProtected(i)) ImGui::TextDisabled("protected");
+                        else ImGui::TextDisabled("plugin");
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTable();
+                    if (requestedMove)
+                        attempt([&] {
+                            mLoadOrder.move(requestedMove->first, requestedMove->second);
+                            mLoadOrderSelected = requestedMove->second; syncWritePolicy();
+                        });
+                }
+                for (const auto& problem : mLoadOrder.validate())
+                    ImGui::TextColored({1.0f, 0.35f, 0.3f, 1.0f}, "%s", problem.c_str());
+                ImGui::Separator();
+                ImGui::BeginDisabled(!mLoadOrderSelected);
+                if (ImGui::Button("Make Active File"))
+                {
+                    const auto index = *mLoadOrderSelected;
+                    mNextFrameAction = [this, index] { guardAsset([this, index] { makeActiveFile(index); }); };
+                }
+                ImGui::EndDisabled();
+                if (mLoadOrderSelected && *mLoadOrderSelected < mLoadOrder.size() && mLoadOrder.isProtected(*mLoadOrderSelected))
+                {
+                    ImGui::SameLine();
+                    ImGui::TextColored({1.0f, 0.75f, 0.2f, 1.0f}, "opens READ-ONLY (protected master)");
+                }
+                if (const auto* active = mLoadOrder.activeEntry())
+                {
+                    const auto index = *mLoadOrder.active();
+                    if (mLoadOrder.isProtected(index) && !active->header.light)
+                    {
+                        if (!mLoadOrder.masterEditingEnabled())
+                        {
+                            ImGui::PushStyleColor(ImGuiCol_Button, {0.55f, 0.12f, 0.1f, 1.0f});
+                            if (ImGui::Button("Enable Master Editing...")) { mMasterConfirm = {}; mMasterConfirmOpen = true; }
+                            ImGui::PopStyleColor();
+                        }
+                        else if (ImGui::Button("Disable Master Editing"))
+                            attempt([&] {
+                                if (mDocument->dirty()) throw std::runtime_error("Save or Undo the unsaved master edits before disabling master editing");
+                                mLoadOrder.disableMasterEditing(); syncWritePolicy();
+                                mMessages.push_back("Master editing disabled; " + active->header.name + " is read-only again");
+                            });
+                    }
+                    if (mLoadOrderDirect && !mWorldspaces.empty())
+                    {
+                        std::size_t current = 0;
+                        for (std::size_t i = 0; i < mWorldspaces.size(); ++i) if (mActiveWorld == mWorldspaces[i].formId) current = i;
+                        if (ImGui::BeginCombo("Worldspace", worldLabel(mWorldspaces[current]).c_str()))
+                        {
+                            for (std::size_t i = 0; i < mWorldspaces.size(); ++i)
+                                if (ImGui::Selectable(worldLabel(mWorldspaces[i]).c_str(), i == current) && i != current)
+                                {
+                                    const auto world = mWorldspaces[i].formId;
+                                    mNextFrameAction = [this, index, world] { guardAsset([this, index, world] { makeActiveFile(index, world); }); };
+                                }
+                            ImGui::EndCombo();
+                        }
+                    }
+                    else if (!mLoadOrderDirect)
+                        ImGui::TextDisabled("Opened via File > Open. Use Make Active File to choose a worldspace.");
+                }
+                ImGui::EndDisabled();
+                ImGui::End();
+
+                if (mMissingOffer) ImGui::OpenPopup("Missing masters");
+                if (ImGui::BeginPopupModal("Missing masters", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+                {
+                    ImGui::Text("%s needs masters that are not loaded:", mMissingOfferPlugin.c_str());
+                    for (const auto& name : mMissingOffer->missingMasters) ImGui::BulletText("%s", name.c_str());
+                    if (!mMissingOffer->resolvable.empty())
+                    {
+                        ImGui::Text("Found on disk (added in this order):");
+                        for (const auto& path : mMissingOffer->resolvable) ImGui::BulletText("%s", path.string().c_str());
+                    }
+                    for (const auto& name : mMissingOffer->unresolvable)
+                        ImGui::TextColored({1.0f, 0.35f, 0.3f, 1.0f}, "Not found: %s", name.c_str());
+                    ImGui::BeginDisabled(mMissingOffer->resolvable.empty());
+                    if (ImGui::Button("Add found masters"))
+                        attempt([&] {
+                            if (const auto at = mLoadOrder.find(mMissingOfferPlugin))
+                            {
+                                const auto added = mLoadOrder.addMissingMasters(*at);
+                                mMessages.push_back("Load order: added " + std::to_string(added) + " master(s) for " + mMissingOfferPlugin);
+                            }
+                            syncWritePolicy();
+                            mMissingOffer.reset(); ImGui::CloseCurrentPopup();
+                        });
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Not now")) { mMissingOffer.reset(); ImGui::CloseCurrentPopup(); }
+                    ImGui::EndPopup();
+                }
+
+                if (mMasterConfirmOpen) { ImGui::OpenPopup("Enable Master Editing"); mMasterConfirmOpen = false; }
+                if (ImGui::BeginPopupModal("Enable Master Editing", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+                {
+                    const auto* active = mLoadOrder.activeEntry();
+                    const std::string name = active ? active->header.name : std::string();
+                    ImGui::TextColored({1.0f, 0.3f, 0.25f, 1.0f}, "You are about to allow edits to the MASTER file %s.", name.c_str());
+                    ImGui::TextWrapped("Every plugin that depends on it can break. Deleting or re-identifying records in a master is "
+                        "usually unrecoverable for mods built on it. Prefer Make Active File on an .esp and save overrides there.");
+                    ImGui::TextWrapped("A timestamped byte-for-byte backup is written beside the file first. The permission lasts only "
+                        "until you disable it, switch the active file, or close the editor.");
+                    ImGui::Text("Type the exact filename to confirm:  %s", name.c_str());
+                    ImGui::InputText("##masterConfirm", mMasterConfirm.data(), mMasterConfirm.size());
+                    const bool matches = active && name == mMasterConfirm.data();
+                    ImGui::BeginDisabled(!matches);
+                    ImGui::PushStyleColor(ImGuiCol_Button, {0.6f, 0.1f, 0.08f, 1.0f});
+                    if (ImGui::Button("Back up and enable master editing"))
+                        attempt([&] {
+                            const auto backup = mLoadOrder.enableMasterEditing(mMasterConfirm.data());
+                            syncWritePolicy();
+                            mMessages.push_back("MASTER EDITING ENABLED for " + name + ". Backup: " + backup.string());
+                            mMasterConfirm = {};
+                            ImGui::CloseCurrentPopup();
+                            if (mTerrain) mNextFrameAction = [this] { reopenActive(); };
+                        });
+                    ImGui::PopStyleColor();
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel")) { mMasterConfirm = {}; ImGui::CloseCurrentPopup(); }
+                    ImGui::EndPopup();
+                }
+
+                if (mQuitConfirm) { ImGui::OpenPopup("Unsaved master edits"); mQuitConfirm = false; }
+                if (ImGui::BeginPopupModal("Unsaved master edits", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+                {
+                    ImGui::TextColored({1.0f, 0.3f, 0.25f, 1.0f}, "%s has unsaved MASTER edits.", mDocument->path().filename().string().c_str());
+                    ImGui::TextUnformatted("Masters are never saved automatically.");
+                    if (ImGui::Button("Save to master and exit")) attempt([&] { save(); mRunning = false; ImGui::CloseCurrentPopup(); });
+                    ImGui::SameLine();
+                    if (ImGui::Button("Discard and exit")) { mDiscardOnExit = true; mRunning = false; ImGui::CloseCurrentPopup(); }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+                    ImGui::EndPopup();
+                }
+            }
+
+            // Unmistakable, always-on-top indication of the current write mode.
+            void writeModeBanner()
+            {
+                if (!mDocument) return;
+                const bool master = mLoadOrder.masterEditingEnabled();
+                if (!master && mDocument->writable()) return;
+                const auto* viewport = ImGui::GetMainViewport();
+                const float height = ImGui::GetFrameHeight() + 6.0f;
+                const ImVec2 start{viewport->WorkPos.x, viewport->WorkPos.y + ImGui::GetFrameHeight()};
+                const ImVec2 end{start.x + viewport->WorkSize.x, start.y + height};
+                auto* draw = ImGui::GetForegroundDrawList();
+                draw->AddRectFilled(start, end, master ? IM_COL32(170, 20, 16, 235) : IM_COL32(150, 105, 10, 220));
+                const std::string text = master
+                    ? "MASTER EDITING ENABLED: " + mDocument->path().filename().string() + " WILL BE MODIFIED ON SAVE.  Backup: "
+                        + mLoadOrder.masterBackup().filename().string() + "   (Load Order > Disable Master Editing)"
+                    : "READ-ONLY: " + mDocument->readOnlyReason();
+                draw->AddText({start.x + 10.0f, start.y + 3.0f}, IM_COL32(255, 255, 255, 255), text.c_str());
+            }
+
+            // PROTOTYPE actors: ACHR base fields. The NPC_ record itself is read-only.
+            void actorFields(const EditorReference& reference)
+            {
+                const auto id = reference.placement.formId;
+                const auto* npc = mDocument->actorBase(reference.placement.baseObject);
+                if (npc)
+                {
+                    ImGui::Text("Base EDID: %s", npc->editorId.empty() ? "(none)" : npc->editorId.c_str());
+                    if (!npc->name.empty()) ImGui::Text("Name: %s", npc->name.c_str());
+                    if (npc->race)
+                    {
+                        const auto& files = mDocument->loadedFiles();
+                        const auto slot = npc->race >> 24;
+                        ImGui::Text("Race: %08X (%s)", npc->race, slot < files.size() ? files[slot].c_str() : "?");
+                    }
+                }
+                else ImGui::TextColored({1.0f, 0.75f, 0.2f, 1.0f},
+                    "NPC_ base not indexed this session (its master was not scanned). Rendered as a placeholder.");
+                ImGui::TextDisabled("Prototype actor: placeholder capsule only (no skeleton, AI, inventory or outfit yet).");
+                const bool editable = mDocument->writable() && !reference.locked && !mGizmoDragging && !mInspectorEditing;
+                if (mActorBaseEditFor != id)
+                {
+                    mActorBaseEditFor = id;
+                    std::snprintf(mActorBaseText, sizeof(mActorBaseText), "%08X", reference.placement.baseObject);
+                }
+                ImGui::BeginDisabled(!editable);
+                ImGui::SetNextItemWidth(110.0f);
+                ImGui::InputText("##npcbase", mActorBaseText, sizeof(mActorBaseText), ImGuiInputTextFlags_CharsHexadecimal);
+                ImGui::SameLine();
+                if (ImGui::Button("Set NPC_ base"))
+                    attempt([&] {
+                        const auto value = static_cast<std::uint32_t>(std::stoul(mActorBaseText, nullptr, 16));
+                        mDocument->setActorBase(id, value);
+                    });
+                ImGui::EndDisabled();
+            }
+
+            void actorsSection()
+            {
+                if (!ImGui::CollapsingHeader("Actors (NPC_) - prototype")) return;
+                const auto& bases = mDocument->actorBases();
+                ImGui::TextDisabled("%zu NPC_ bases indexed. Double-click to place an ACHR at the look-at point.", bases.size());
+                static ImGuiTextFilter filter;
+                filter.Draw("Filter NPC_");
+                const bool writable = mDocument->writable() && !mAssetMode;
+                ImGui::BeginDisabled(!writable);
+                ImGui::SetNextItemWidth(110.0f);
+                ImGui::InputText("##placenpc", mPlaceActorText, sizeof(mPlaceActorText), ImGuiInputTextFlags_CharsHexadecimal);
+                ImGui::SameLine();
+                if (ImGui::Button("Place actor by FormID"))
+                    attempt([&] { placeActor(static_cast<std::uint32_t>(std::stoul(mPlaceActorText, nullptr, 16))); });
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("FormID in the active file's master order (e.g. a Fallout4.esm NPC_ when it was not scanned).");
+                ImGui::BeginChild("##npcs", {0.0f, 220.0f}, ImGuiChildFlags_Borders);
+                std::size_t shown = 0;
+                for (const auto& [id, npc] : bases)
+                {
+                    char label[320];
+                    std::snprintf(label, sizeof(label), "%08X  %s%s%s", id, npc.editorId.c_str(),
+                        npc.name.empty() ? "" : "  -  ", npc.name.c_str());
+                    if (!filter.PassFilter(label)) continue;
+                    if (++shown > 500) { ImGui::TextDisabled("... refine the filter"); break; }
+                    ImGui::PushID(static_cast<int>(id));
+                    if (ImGui::Selectable(label, false, ImGuiSelectableFlags_AllowDoubleClick)
+                        && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && writable)
+                        attempt([&] { placeActor(id); });
+                    ImGui::PopID();
+                }
+                ImGui::EndChild();
+            }
+
+            void placeActor(std::uint32_t base)
+            {
+                if (mGizmoDragging || mInspectorEditing) return;
+                finishStroke();
+                if (!mDocument->actorBase(base))
+                    mMessages.push_back("Placing actor with an unindexed NPC_ base; it renders as a placeholder only");
+                const auto reference = mDocument->placeActor(base, placementTransform());
+                select(reference);
+                restoreTerrain();
+            }
+
+            void provenancePanel(const EditorReference& reference)
+            {
+                if (!ImGui::CollapsingHeader("Record provenance", ImGuiTreeNodeFlags_DefaultOpen)) return;
+                try
+                {
+                    const auto p = mDocument->referenceProvenance(reference.placement.formId);
+                    ImGui::Text("FormID %08X (master slot %02X)", p.formId, p.formId >> 24);
+                    ImGui::Text("Original defining file: %s", p.definingFile.c_str());
+                    ImGui::Text("Current winning override: %s", p.winningFile.c_str());
+                    ImGui::Text("Active edit target: %s%s", p.activeFile.c_str(),
+                        mLoadOrder.masterEditingEnabled() ? "  [MASTER EDITING]" : mDocument->writable() ? "" : "  [READ-ONLY]");
+                    if (!p.writable)
+                        ImGui::TextColored({1.0f, 0.55f, 0.2f, 1.0f}, "Edit blocked: %s", p.blockedReason.c_str());
+                    else if (p.definedByActive)
+                        ImGui::TextWrapped("Edits change the record %s itself defines%s.", p.activeFile.c_str(),
+                            mLoadOrder.masterEditingEnabled() ? " (THIS IS A MASTER)" : "");
+                    else if (p.activeHasOverride)
+                        ImGui::TextWrapped("Edits update the existing override in %s (same FormID). %s is not modified.",
+                            p.activeFile.c_str(), p.definingFile.c_str());
+                    else
+                        ImGui::TextColored({0.45f, 0.85f, 1.0f, 1.0f}, "Next edit creates a NEW override in %s (same FormID); %s is not modified.",
+                            p.activeFile.c_str(), p.definingFile.c_str());
+                    ImGui::Text("Unsaved change: %s", p.pendingChange ? "yes" : "no");
+                    if (p.revertPending)
+                        ImGui::TextColored({0.45f, 0.85f, 1.0f, 1.0f}, "Reverted to load order: %s's version is removed on save; %s wins.",
+                            p.activeFile.c_str(), p.revertWinner.c_str());
+                    if (p.canRevertToLoadOrder)
+                    {
+                        ImGui::BeginDisabled(!p.writable);
+                        if (ImGui::Button("Revert to load order"))
+                        {
+                            const std::vector<std::uint32_t> ids{p.formId};
+                            mNextFrameAction = [this, ids] { revertToLoadOrder(ids); };
+                        }
+                        ImGui::EndDisabled();
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                            ImGui::SetTooltip("Remove %s's version of this record (override, disable or edits).\n"
+                                "%s's version wins again; %s is not modified. Undo with Ctrl+Z.",
+                                p.activeFile.c_str(), p.revertWinner.c_str(), p.definingFile.c_str());
+                    }
+                    if (!p.definedByActive)
+                        for (const auto& other : mLoadOrder.otherOverrides(p.definingFile, p.formId & 0xFFFFFFu))
+                            ImGui::TextColored({1.0f, 0.75f, 0.2f, 1.0f}, "Also overridden by %s", other.c_str());
+                    if (mDocument->model(reference.placement.baseObject))
+                    {
+                        const auto base = mDocument->modelProvenance(reference.placement.baseObject);
+                        ImGui::TextDisabled("Base %08X: defined in %s, winning %s", base.formId, base.definingFile.c_str(), base.winningFile.c_str());
+                    }
+                    else if (reference.placement.actor)
+                    {
+                        const auto& files = mDocument->loadedFiles();
+                        const auto slot = reference.placement.baseObject >> 24;
+                        const auto* npc = mDocument->actorBase(reference.placement.baseObject);
+                        ImGui::TextDisabled("Base NPC_ %08X: defined in %s, winning %s", reference.placement.baseObject,
+                            slot < files.size() ? files[slot].c_str() : "?",
+                            npc ? std::filesystem::path(npc->sourceEsm).filename().string().c_str() : "(not indexed this session)");
+                    }
+                }
+                catch (const std::exception& error) { ImGui::TextWrapped("Provenance unavailable: %s", error.what()); }
+                ImGui::Separator();
             }
 
             int smokeMenuPhase() const
@@ -795,7 +1461,7 @@ namespace openf4::editor
                         continue;
                     switch (event.type)
                     {
-                    case SDL_EVENT_QUIT: guardAsset([this] { mRunning = false; }); break;
+                    case SDL_EVENT_QUIT: guardAsset([this] { requestQuit(); }); break;
                     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: mRenderer->resize(); break;
                     case SDL_EVENT_WINDOW_FOCUS_LOST:
                         if (mAsset) mAsset->cancelGesture();
@@ -830,8 +1496,12 @@ namespace openf4::editor
                             mMoveSpeed = std::clamp(mMoveSpeed * std::pow(1.25f, event.wheel.y), 10.0f, 1.0e6f);
                         break;
                     case SDL_EVENT_DROP_FILE:
-                        if (event.drop.data && !mAssetMode)
-                            attempt([&] { startImport(std::filesystem::u8path(event.drop.data)); });
+                        if (event.drop.data)
+                        {
+                            const auto dropped = std::filesystem::u8path(event.drop.data);
+                            if (isPluginFile(dropped)) attempt([&] { addPluginFile(dropped); });
+                            else if (!mAssetMode) attempt([&] { startImport(dropped); });
+                        }
                         break;
                     default: break;
                     }
@@ -858,10 +1528,16 @@ namespace openf4::editor
                 mDialogMailbox->pending = true;
                 auto* request = new DialogRequest{mDialogMailbox, action};
                 static constexpr SDL_DialogFileFilter esmFilter[]{ {"Bethesda master", "esm"} };
+                static constexpr SDL_DialogFileFilter pluginFilter[]{ {"Bethesda plugin", "esm;esp;esl"} };
+                static constexpr SDL_DialogFileFilter espFilter[]{ {"Fallout 4 plugin", "esp"} };
                 static constexpr SDL_DialogFileFilter modelFilter[]{
                     {"3D model", "glb;gltf;obj;fbx;dae;ply;stl;blend;3ds"}, {"All files", "*"} };
                 if (action == FileAction::exportFolder)
                     SDL_ShowOpenFolderDialog(fileDialogResult, request, mWindow.get(), nullptr, false);
+                else if (action == FileAction::addPlugin)
+                    SDL_ShowOpenFileDialog(fileDialogResult, request, mWindow.get(), pluginFilter, 1, nullptr, false);
+                else if (action == FileAction::newPlugin)
+                    SDL_ShowSaveFileDialog(fileDialogResult, request, mWindow.get(), espFilter, 1, nullptr);
                 else if (action == FileAction::saveAs || action == FileAction::create)
                     SDL_ShowSaveFileDialog(fileDialogResult, request, mWindow.get(), esmFilter, 1,
                         nullptr);
@@ -889,6 +1565,8 @@ namespace openf4::editor
                             return;
                         }
                         if (mExportDialog) throw std::runtime_error("Close the export dialog before changing files");
+                        if (result.action == FileAction::addPlugin) { addPluginFile(result.path); return; }
+                        if (result.action == FileAction::newPlugin) { createPlugin(result.path); return; }
                         if (mScripts.busy() && result.action != FileAction::import)
                             throw std::runtime_error("Wait for script compilation before changing worlds");
                         if (bakeBusy() && result.action != FileAction::import)
@@ -897,6 +1575,8 @@ namespace openf4::editor
                             startImport(result.path);
                         else if (result.action == FileAction::saveAs)
                         {
+                            if (mLoadOrderDirect)
+                                throw std::runtime_error("Save As is not available for Load Order files; use New plugin to start another override file");
                             finishStroke();
                             synchronizeTerrain();
                             mDocument->saveAs(result.path);
@@ -950,8 +1630,9 @@ namespace openf4::editor
                         if (ImGui::MenuItem("Export to Fallout 4 (.esp)...")) attempt([&] { requestExport(); });
                         ImGui::Separator();
                         if (ImGui::MenuItem("Import model...")) showDialog(FileAction::import);
+                        if (ImGui::MenuItem("New empty asset")) mNextFrameAction = [this] { openNewAssetNow(); };
                         ImGui::Separator();
-                        if (ImGui::MenuItem("Exit")) guardAsset([this] { mRunning = false; });
+                        if (ImGui::MenuItem("Exit")) guardAsset([this] { requestQuit(); });
                         if (smokeMenuPhase() == 3) ImGui::CloseCurrentPopup();
                         ImGui::EndMenu();
                     }
@@ -961,12 +1642,41 @@ namespace openf4::editor
                         if (ImGui::MenuItem("Redo", "Ctrl+Y")) { if(mAssetMode) mAsset->history(true); else history(true); }
                         ImGui::Separator();
                         if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, !mAssetMode && !mSelection.empty())) duplicate();
-                        if (ImGui::MenuItem("Delete", "Delete", false, !mAssetMode && !mSelection.empty())) erase();
+                        if (ImGui::MenuItem("Delete (disable in plugins)", "Delete", false, !mAssetMode && !mSelection.empty())) erase();
+                        if (ImGui::MenuItem("Delete permanently...", "Ctrl+Shift+Delete", false, !mAssetMode && !mSelection.empty()))
+                            requestHardDelete();
+                        ImGui::Separator();
+                        if (ImGui::MenuItem("Revert to load order", nullptr, false,
+                                !mAssetMode && mDocument->writable() && anySelectionRevertible()))
+                        {
+                            const std::vector<std::uint32_t> ids(mSelection.begin(), mSelection.end());
+                            mNextFrameAction = [this, ids] { revertToLoadOrder(ids); };
+                        }
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                            ImGui::SetTooltip("Drop the active file's version of the selected records so the rest of the\n"
+                                "load order decides their state again. Masters are never modified.");
+                        if (ImGui::BeginMenu("Restore deleted references", !mAssetMode && mDocument->writable()))
+                        {
+                            const auto deletions = mDocument->revertibleDeletions();
+                            if (deletions.empty()) ImGui::TextDisabled("No Deleted-flag overrides in %s", mDocument->path().filename().string().c_str());
+                            std::size_t shown = 0;
+                            for (const auto& [id, name] : deletions)
+                            {
+                                if (++shown > 200) { ImGui::TextDisabled("... %zu more", deletions.size() - 200); break; }
+                                char hex[16]; SDL_snprintf(hex, sizeof(hex), "%08X", id);
+                                if (ImGui::MenuItem(((name.empty() ? std::string("Reference") : name) + " [" + hex + "]").c_str()))
+                                {
+                                    const std::vector<std::uint32_t> ids{id};
+                                    mNextFrameAction = [this, ids] { revertToLoadOrder(ids); };
+                                }
+                            }
+                            ImGui::EndMenu();
+                        }
                         ImGui::EndMenu();
                     }
                     if (ImGui::BeginMenu("Build"))
                     {
-                        ImGui::BeginDisabled(bakeBusy() || mAssetMode);
+                        ImGui::BeginDisabled(bakeBusy() || mAssetMode || !mDocument->writable());
                         if (ImGui::MenuItem("Bake Changed LOD"))
                             attempt([&] { requestBake(false); });
                         if (ImGui::MenuItem("Bake All LOD"))
@@ -992,10 +1702,20 @@ namespace openf4::editor
                     ImGui::BeginDisabled(mAssetMode);
                     if (ImGui::MenuItem("Objects", nullptr, !mTerrainMode))
                     { finishManipulation(true); finishStroke(); mTerrainMode = false; }
-                    if (ImGui::MenuItem("Landscape", nullptr, mTerrainMode, mTerrain != nullptr))
+                    if (ImGui::MenuItem("Landscape", nullptr, mTerrainMode, mTerrain != nullptr && mDocument->writable()))
                     { finishManipulation(true); mTerrainMode = true; }
                     ImGui::EndDisabled();
                     ImGui::Separator();
+                    if (mLoadOrder.masterEditingEnabled())
+                    {
+                        ImGui::TextColored({1.0f, 0.25f, 0.2f, 1.0f}, "[MASTER EDITING]");
+                        ImGui::SameLine();
+                    }
+                    else if (!mDocument->writable())
+                    {
+                        ImGui::TextColored({1.0f, 0.75f, 0.2f, 1.0f}, "[READ-ONLY]");
+                        ImGui::SameLine();
+                    }
                     ImGui::TextUnformatted(mDocument->path().filename().string().c_str());
                     if (mDocument->dirty()) { ImGui::SameLine(); ImGui::TextUnformatted("*"); }
                     if (mImport) { ImGui::SameLine(); ImGui::TextUnformatted("Importing..."); }
@@ -1055,6 +1775,7 @@ namespace openf4::editor
                     ImGuiID right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.24f, nullptr, &center);
                     ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.21f, nullptr, &center);
                     ImGui::DockBuilderDockWindow("Outliner", left);
+                    ImGui::DockBuilderDockWindow("Load Order", left);
                     ImGui::DockBuilderDockWindow("Inspector", right);
                     ImGui::DockBuilderDockWindow("Asset Browser", bottom);
                     ImGui::DockBuilderDockWindow("Diagnostics", bottom);
@@ -1236,7 +1957,7 @@ namespace openf4::editor
                     if (const auto* payload = ImGui::AcceptDragDropPayload("OPENF4_MODEL"))
                     {
                         const auto model = *static_cast<const std::uint32_t*>(payload->Data);
-                        attempt([&] { placeModel(model); });
+                        requestPlace(model);
                     }
                     ImGui::EndDragDropTarget();
                 }
@@ -1254,8 +1975,11 @@ namespace openf4::editor
                         mDocument->beginTransaction();
                         mStroke = true;
                     }
+                    const auto terrainStart = std::chrono::steady_clock::now();
                     mTerrain->update(*mRenderer, mPosition,
                         mTerrainMode && mViewportHovered ? cursorRay() : forward(), delta, sculpt);
+                    if (mProfile.enabled)
+                        mProfile.terrainMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - terrainStart).count();
                     mDocument->setNextFormId(std::max(mDocument->nextFormId(), mTerrain->nextFormId()));
                     if (!sculpt && mStroke)
                         finishStroke();
@@ -1304,17 +2028,14 @@ namespace openf4::editor
                         limit = glm::length(glm::dvec3(*terrainHit) - origin) + 0.01;
                 std::vector<std::uint32_t> excluded;
                 for (const auto& reference : mDocument->references())
-                    if (!reference.visible || reference.locked) excluded.push_back(reference.placement.formId);
+                    if (!reference.visible || reference.locked || reference.disabled) excluded.push_back(reference.placement.formId);
                 const auto hit = mObjects->pick(origin, glm::normalize(direction), excluded, limit);
                 select(hit ? std::optional(hit->formId) : std::nullopt, ImGui::GetIO().KeyShift);
             }
 
             const EditorReference* reference(std::uint32_t id) const
             {
-                const auto& references = mDocument->references();
-                const auto it = std::find_if(references.begin(), references.end(),
-                    [id](const EditorReference& ref) { return ref.placement.formId == id; });
-                return it == references.end() ? nullptr : &*it;
+                return mDocument->findReference(id);
             }
 
             const EditorReference* selectedReference() const
@@ -1354,6 +2075,17 @@ namespace openf4::editor
             std::vector<std::uint32_t> editableSelection() const
             {
                 std::vector<std::uint32_t> result;
+                if (!mDocument->writable()) return result;
+                for (auto id : mSelection)
+                    if (auto ref = reference(id); ref && ref->visible && !ref->locked && !ref->disabled) result.push_back(id);
+                return result;
+            }
+
+            // Like editableSelection, but disabled references stay deletable (Ctrl+Shift+Delete).
+            std::vector<std::uint32_t> deletableSelection() const
+            {
+                std::vector<std::uint32_t> result;
+                if (!mDocument->writable()) return result;
                 for (auto id : mSelection)
                     if (auto ref = reference(id); ref && ref->visible && !ref->locked) result.push_back(id);
                 return result;
@@ -1470,18 +2202,38 @@ namespace openf4::editor
                     const bool locked = reference->locked;
                     ImGui::Text("%s", reference->name.empty() ? "Placed object" : reference->name.c_str());
                     const auto* base = mDocument->model(reference->placement.baseObject);
-                    ImGui::Text("REFR %08X  /  %s %08X", id,
+                    const bool actor = reference->placement.actor;
+                    if (actor) ImGui::Text("ACHR %08X  /  NPC_ %08X", id, reference->placement.baseObject);
+                    else ImGui::Text("REFR %08X  /  %s %08X", id,
                         base && base->kind == assets::ESMModelKind::movableStatic ? "MSTT" : "STAT", reference->placement.baseObject);
                     ImGui::Text("Cell (%d, %d)", reference->placement.cell.x, reference->placement.cell.y);
+                    if (actor) actorFields(*reference);
+                    if (mAsset && mAsset->modelId() == baseObject && mAsset->dirty())
+                        ImGui::TextWrapped("This base has unsaved asset edits. Use Save Native NIF in the Asset workspace "
+                            "to apply them (Movable prop switches the base to MSTT).");
                     if (mSelection.size() > 1)
                         ImGui::Text("%zu selected; gizmo moves the selection", mSelection.size());
+                    const bool writable = mDocument->writable();
+                    provenancePanel(*reference);
                     bool visible = reference->visible;
                     bool lockedValue = locked;
-                    ImGui::BeginDisabled(mGizmoDragging || mInspectorEditing);
+                    ImGui::BeginDisabled(mGizmoDragging || mInspectorEditing || !writable);
                     if (ImGui::Checkbox("Visible", &visible)) mDocument->setVisible(id, visible);
                     ImGui::SameLine();
                     if (ImGui::Checkbox("Locked", &lockedValue)) mDocument->setLocked(id, lockedValue);
+                    ImGui::SameLine();
+                    bool disabledValue = reference->disabled;
+                    ImGui::BeginDisabled(locked);
+                    if (ImGui::Checkbox("Disabled", &disabledValue))
+                        attempt([&] { mDocument->setDisabled(id, disabledValue); });
                     ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("REFR \"Initially Disabled\" flag. This is what Delete does in a plugin:\n"
+                            "the record is kept (as a same-FormID override if another file defines it).");
+                    ImGui::EndDisabled();
+                    if (reference->disabled)
+                        ImGui::TextColored({1.0f, 0.75f, 0.2f, 1.0f},
+                            "Disabled: hidden here and in Fallout 4. Uncheck to restore; Ctrl+Shift+Delete deletes permanently.");
                     ImGui::Separator();
                     ImGui::BeginDisabled(mGizmoDragging || mInspectorEditing);
                     if (ImGui::RadioButton("Move", mOperation == ImGuizmo::TRANSLATE)) mOperation = ImGuizmo::TRANSLATE;
@@ -1493,7 +2245,7 @@ namespace openf4::editor
                     float translation[3], rotation[3], scale[3];
                     glm::mat4 transform = mDocument->engineTransform(id);
                     ImGuizmo::DecomposeMatrixToComponents(glm::value_ptr(transform), translation, rotation, scale);
-                    ImGui::BeginDisabled(locked || !visible || mGizmoDragging);
+                    ImGui::BeginDisabled(locked || !visible || mGizmoDragging || !writable);
                     bool changed = false;
                     const auto trackEdit = [&] {
                         const auto item = ImGui::GetItemID();
@@ -1530,11 +2282,19 @@ namespace openf4::editor
                     else if (mEndInspectorTransaction) finishManipulation(false);
                     ImGui::EndDisabled();
                     if (ImGui::Button("Frame selected")) frameSelection();
+                    ImGui::BeginDisabled(!writable);
                     ImGui::SameLine();
                     if (ImGui::Button("Duplicate")) duplicate();
-                    if (ImGui::Button("Edit Asset")) requestAsset(baseObject);
                     ImGui::SameLine();
-                    if (ImGui::Button("Make Unique")) mNextFrameAction = [this, id] { guardAsset([this, id] {
+                    if (ImGui::Button("Delete")) erase();
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete: disables the reference in plugins (record kept).");
+                    ImGui::SameLine();
+                    ImGui::PushStyleColor(ImGuiCol_Button, {0.45f, 0.08f, 0.06f, 1.0f});
+                    if (ImGui::Button("Delete permanently...")) requestHardDelete();
+                    ImGui::PopStyleColor();
+                    if (!actor && ImGui::Button("Edit Asset")) requestAsset(baseObject);
+                    if (!actor) ImGui::SameLine();
+                    if (!actor && ImGui::Button("Make Unique")) mNextFrameAction = [this, id] { guardAsset([this, id] {
                         const auto found = std::ranges::find_if(mDocument->references(), [id](const auto& ref) { return ref.placement.formId == id; });
                         if (found == mDocument->references().end()) throw std::runtime_error("Selected reference no longer exists");
                         auto next = std::make_unique<AssetWorkspace>(*mDocument, found->placement.baseObject, mData);
@@ -1542,9 +2302,11 @@ namespace openf4::editor
                         if (mAsset) mAsset->suspend(*mRenderer);
                         mAsset = std::move(next); mAssetMode = true;
                     }); };
+                    ImGui::EndDisabled();
                     if (auto source = mDocument->sourcePath(baseObject))
                         ImGui::TextWrapped("Source: %s", source->c_str());
-                    ImGui::BeginDisabled(mGizmoDragging || mInspectorEditing || locked);
+                    ImGui::BeginDisabled(mGizmoDragging || mInspectorEditing || locked || !writable);
+                    mScripts.drawStartAwake(*mDocument, id, mData);
                     mScripts.draw(*mDocument, id, mData);
                     ImGui::EndDisabled();
                 }
@@ -1556,42 +2318,100 @@ namespace openf4::editor
             void outliner()
             {
                 ImGui::Begin("Outliner");
-                ImGui::Text("%zu references", mDocument->references().size());
+                const auto& references = mDocument->references();
                 static ImGuiTextFilter filter;
                 filter.Draw("Filter");
-                for (const auto& reference : mDocument->references())
+                // A Commonwealth load has hundreds of thousands of references: filter only when the
+                // document or filter changes (not every frame or during a drag), and only build
+                // labels/widgets for the rows on screen.
+                const std::string filterText = filter.InputBuf;
+                const auto revision = mDocument->revision();
+                if (mOutliner.revision == 0 || mOutliner.filter != filterText
+                    || (mOutliner.revision != revision && !mGizmoDragging && !mInspectorEditing))
                 {
-                    const auto id = reference.placement.formId;
-                    const std::string label = (reference.name.empty() ? "Object " + std::to_string(id) : reference.name)
-                        + (mActiveReference == id ? " [active]" : "")
-                        + (reference.visible ? "" : " [hidden]") + (reference.locked ? " [locked]" : "");
-                    if (!filter.PassFilter(label.c_str())) continue;
-                    ImGui::PushID(static_cast<int>(id));
-                    if (ImGui::Selectable(label.c_str(), mSelection.contains(id), ImGuiSelectableFlags_AllowDoubleClick))
+                    mOutliner.rows.clear();
+                    if (filter.IsActive())
                     {
-                        select(id, ImGui::GetIO().KeyShift);
-                        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) frameSelection();
+                        for (std::size_t i = 0; i < references.size(); ++i)
+                            if (filter.PassFilter(outlinerLabel(references[i], false).c_str()))
+                                mOutliner.rows.push_back(static_cast<std::uint32_t>(i));
                     }
-                    ImGui::PopID();
+                    else
+                    {
+                        mOutliner.rows.resize(references.size());
+                        for (std::size_t i = 0; i < references.size(); ++i) mOutliner.rows[i] = static_cast<std::uint32_t>(i);
+                    }
+                    mOutliner.revision = revision; mOutliner.filter = filterText;
                 }
+                if (filter.IsActive()) ImGui::Text("%zu of %zu references", mOutliner.rows.size(), references.size());
+                else ImGui::Text("%zu references", references.size());
+                ImGui::BeginChild("##outliner-rows");
+                ImGuiListClipper clipper;
+                clipper.Begin(static_cast<int>(mOutliner.rows.size()));
+                while (clipper.Step())
+                    for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row)
+                    {
+                        const auto index = mOutliner.rows[static_cast<std::size_t>(row)];
+                        if (index >= references.size()) { ImGui::TextDisabled("..."); continue; }
+                        const auto& reference = references[index];
+                        const auto id = reference.placement.formId;
+                        const std::string label = outlinerLabel(reference, true);
+                        ImGui::PushID(static_cast<int>(id));
+                        if (ImGui::Selectable(label.c_str(), mSelection.contains(id), ImGuiSelectableFlags_AllowDoubleClick))
+                        {
+                            select(id, ImGui::GetIO().KeyShift);
+                            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) frameSelection();
+                        }
+                        ImGui::PopID();
+                    }
+                ImGui::EndChild();
                 ImGui::End();
+            }
+
+            std::string outlinerLabel(const EditorReference& reference, bool markActive) const
+            {
+                const auto id = reference.placement.formId;
+                return (reference.name.empty() ? "Object " + std::to_string(id) : reference.name)
+                    + (markActive && mActiveReference == id ? " [active]" : "")
+                    + (reference.visible ? "" : " [hidden]") + (reference.locked ? " [locked]" : "")
+                    + (reference.disabled ? " [disabled]" : "") + (reference.placement.actor ? " [ACHR]" : "");
             }
 
             void assetsPanel()
             {
                 ImGui::Begin("Asset Browser");
-                ImGui::BeginDisabled(mImport.has_value() || mAssetMode);
+                ImGui::BeginDisabled(mImport.has_value() || mAssetMode || !mDocument->writable());
                 if (ImGui::Button("Import model...")) showDialog(FileAction::import);
                 ImGui::EndDisabled();
                 ImGui::SameLine();
                 ImGui::TextDisabled("%s", mDocument->assetRoot().string().c_str());
                 ImGui::Separator();
-                for (const auto& [id, path] : mDocument->models())
+                // Fallout4.esm contributes tens of thousands of STAT/MSTT bases: clip to visible rows.
+                const auto& models = mDocument->models();
+                if (mModelRows.revision == 0 || (mModelRows.revision != mDocument->revision() && !mGizmoDragging && !mInspectorEditing))
                 {
+                    mModelRows.ids.clear(); mModelRows.ids.reserve(models.size());
+                    for (const auto& [id, path] : models) mModelRows.ids.push_back(id);
+                    mModelRows.revision = mDocument->revision();
+                }
+                ImGuiListClipper modelClipper;
+                modelClipper.Begin(static_cast<int>(mModelRows.ids.size()));
+                while (modelClipper.Step())
+                for (int row = modelClipper.DisplayStart; row < modelClipper.DisplayEnd; ++row)
+                {
+                    const auto id = mModelRows.ids[static_cast<std::size_t>(row)];
+                    const auto entry = models.find(id);
+                    if (entry == models.end()) { ImGui::TextDisabled("..."); continue; }
+                    const auto& path = entry->second;
                     ImGui::PushID(static_cast<int>(id));
-                    if (ImGui::Selectable(path.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick)
+                    const auto* base = mDocument->model(id);
+                    const bool pendingAsset = mAsset && mAsset->modelId() == id && mAsset->dirty();
+                    const std::string label = path
+                        + (base && base->kind == assets::ESMModelKind::movableStatic ? "  [MSTT]" : "  [STAT]")
+                        + (pendingAsset ? "  (unsaved asset edits)" : "") + "###model";
+                    if (ImGui::Selectable(label.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick)
                         && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                        if (!mAssetMode) attempt([&] { placeModel(id); });
+                        if (!mAssetMode) requestPlace(id);
                     if (ImGui::BeginPopupContextItem())
                     {
                         if (ImGui::MenuItem("Edit Asset")) requestAsset(id);
@@ -1605,6 +2425,8 @@ namespace openf4::editor
                     }
                     ImGui::PopID();
                 }
+                ImGui::Separator();
+                actorsSection();
                 ImGui::End();
             }
 
@@ -1628,7 +2450,8 @@ namespace openf4::editor
             void activateAssetWorkspace()
             {
                 if (mAsset) switchWorkspace(true);
-                else if (const auto* reference = selectedReference()) requestAsset(reference->placement.baseObject);
+                else if (const auto* reference = selectedReference(); reference && !reference->placement.actor)
+                    requestAsset(reference->placement.baseObject);
             }
 
             void requestAsset(std::uint32_t id)
@@ -1639,10 +2462,26 @@ namespace openf4::editor
             void openAssetNow(std::uint32_t id)
             {
                 if (mExportDialog) return;
+                if (!mDocument->writable()) { mMessages.push_back("Asset editing is disabled: " + mDocument->readOnlyReason()); return; }
                 if (mImport || bakeBusy()) { mMessages.push_back("Finish the import or LOD bake before editing an asset"); return; }
                 if (mAsset && mAsset->modelId() == id) { switchWorkspace(true); return; }
                 guardAsset([this,id] {
                     auto next = std::make_unique<AssetWorkspace>(*mDocument, id, mData);
+                    if (mAsset) mAsset->suspend(*mRenderer);
+                    finishManipulation(true); finishStroke();
+                    mNavigating = false; SDL_SetWindowRelativeMouseMode(mWindow.get(), false);
+                    mAsset = std::move(next); mAssetMode = true;
+                });
+            }
+
+            // PROTOTYPE: blank mesh asset; its world base is created on the first Save Native NIF.
+            void openNewAssetNow()
+            {
+                if (mExportDialog) return;
+                if (!mDocument->writable()) { mMessages.push_back("Asset editing is disabled: " + mDocument->readOnlyReason()); return; }
+                if (mImport || bakeBusy()) { mMessages.push_back("Finish the import or LOD bake before creating an asset"); return; }
+                guardAsset([this] {
+                    auto next = std::make_unique<AssetWorkspace>(*mDocument, mData);
                     if (mAsset) mAsset->suspend(*mRenderer);
                     finishManipulation(true); finishStroke();
                     mNavigating = false; SDL_SetWindowRelativeMouseMode(mWindow.get(), false);
@@ -1676,8 +2515,25 @@ namespace openf4::editor
                     ImGui::ProgressBar(total ? static_cast<float>(done) / static_cast<float>(total) : 0.0f);
                     if (ImGui::Button("Cancel bake")) mBakeProgress->cancel.store(true);
                 }
-                for (const auto& message : mMessages) ImGui::TextWrapped("%s", message.c_str());
-                for (const auto& message : mObjects->diagnostics()) ImGui::TextWrapped("%s", message.c_str());
+                // Streaming can log thousands of warnings; draw only the visible lines (hover for wrapped text).
+                const auto& objectMessages = mObjects->diagnostics();
+                const auto lines = mMessages.size() + objectMessages.size();
+                ImGui::BeginChild("##diagnostic-log", {0.0f, 0.0f}, ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
+                ImGuiListClipper logClipper;
+                logClipper.Begin(static_cast<int>(lines));
+                while (logClipper.Step())
+                    for (int line = logClipper.DisplayStart; line < logClipper.DisplayEnd; ++line)
+                    {
+                        const auto index = static_cast<std::size_t>(line);
+                        const auto& message = index < mMessages.size() ? mMessages[index] : objectMessages[index - mMessages.size()];
+                        ImGui::TextUnformatted(message.c_str());
+                        if (message.size() > 120 && ImGui::IsItemHovered())
+                        {
+                            ImGui::BeginTooltip(); ImGui::PushTextWrapPos(ImGui::GetFontSize() * 45.0f);
+                            ImGui::TextUnformatted(message.c_str()); ImGui::PopTextWrapPos(); ImGui::EndTooltip();
+                        }
+                    }
+                ImGui::EndChild();
                 ImGui::End();
             }
 
@@ -1688,8 +2544,14 @@ namespace openf4::editor
                 if (mGizmoDragging || mInspectorEditing) return;
                 if (ImGui::GetIO().WantTextInput || mNavigating) return;
                 const bool control = ImGui::GetIO().KeyCtrl;
+                // Object delete keys never fire while any modal (including the hard-delete
+                // confirmation) is up. Mesh/collision Delete lives in the asset workspace.
+                const bool deleteKeysBlocked = !mHardDeleteIds.empty()
+                    || ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
                 if (control)
                 {
+                    if (ImGui::GetIO().KeyShift && !deleteKeysBlocked && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+                        requestHardDelete();
                     if (ImGui::IsKeyPressed(ImGuiKey_S)) attempt([&] { save(); });
                     if (ImGui::IsKeyPressed(ImGuiKey_O)) showDialog(FileAction::open);
                     if (ImGui::IsKeyPressed(ImGuiKey_N)) showDialog(FileAction::create);
@@ -1700,7 +2562,7 @@ namespace openf4::editor
                 else
                 {
                     if (ImGui::IsKeyPressed(ImGuiKey_F)) frameSelection();
-                    if (ImGui::IsKeyPressed(ImGuiKey_Delete)) erase();
+                    if (!ImGui::GetIO().KeyShift && !deleteKeysBlocked && ImGui::IsKeyPressed(ImGuiKey_Delete, false)) erase();
                     if (ImGui::IsKeyPressed(ImGuiKey_End)) dropToGround();
                     if (ImGui::IsKeyPressed(ImGuiKey_W)) mOperation = ImGuizmo::TRANSLATE;
                     if (ImGui::IsKeyPressed(ImGuiKey_E)) mOperation = ImGuizmo::ROTATE;
@@ -1718,6 +2580,7 @@ namespace openf4::editor
             void startImport(const std::filesystem::path& source)
             {
                 if (mExportDialog) throw std::runtime_error("Close the export dialog before importing");
+                if (!mDocument->writable()) throw std::runtime_error(mDocument->readOnlyReason());
                 finishManipulation(true);
                 if (mImport) throw std::runtime_error("Another import is still running");
                 if (!std::filesystem::is_regular_file(source))
@@ -1751,6 +2614,19 @@ namespace openf4::editor
                 });
             }
 
+            // Asset-workspace edits (including Movable prop -> MSTT) reach the world base only on
+            // Save Native NIF, which may re-key the base to a new MSTT FormID. Placing the model
+            // while that asset is dirty would silently use the stale STAT base, so ask first.
+            void requestPlace(std::uint32_t model)
+            {
+                if (mAsset && mAsset->modelId() == model && mAsset->dirty())
+                {
+                    mAsset->cancelGesture();
+                    mAssetPending = [this, model] { placeModel(mAsset ? mAsset->modelId() : model); };
+                }
+                else attempt([&] { placeModel(model); });
+            }
+
             void placeModel(std::uint32_t model)
             {
                 if (mGizmoDragging || mInspectorEditing) return;
@@ -1762,18 +2638,57 @@ namespace openf4::editor
 
             void projectObjects()
             {
-                std::vector<assets::PlacedReference> references;
-                std::vector<std::uint32_t> hidden;
-                references.reserve(mDocument->references().size());
-                for (const auto& reference : mDocument->references())
+                // The scene input used to be rebuilt every frame (every placement copied, a path
+                // per model). Rebuild it only when the document changes; a gizmo drag only moves
+                // the dragged placements, so patch those in place and keep the scene's layout.
+                auto& cache = mProjection;
+                const auto revision = mDocument->revision();
+                const auto& document = mDocument->references();
+                if (cache.revision != revision)
                 {
-                    references.push_back(reference.placement);
-                    if (!reference.visible) hidden.push_back(reference.placement.formId);
+                    bool patched = false;
+                    if (cache.layout != 0 && (mGizmoDragging || mInspectorEditing) && cache.references.size() == document.size())
+                    {
+                        patched = true;
+                        for (const auto& [id, transform] : mDragTransforms)
+                        {
+                            const auto slot = cache.index.find(id);
+                            const auto* reference = mDocument->findReference(id);
+                            if (slot == cache.index.end() || !reference || reference->placement.baseObject != cache.references[slot->second].baseObject)
+                            { patched = false; break; }
+                            cache.references[slot->second] = reference->placement;
+                        }
+                        if (mInspectorEditing && mDragTransforms.empty()) patched = false;
+                    }
+                    if (!patched)
+                    {
+                        cache.references.clear(); cache.hidden.clear(); cache.index.clear(); cache.sources.clear();
+                        cache.references.reserve(document.size()); cache.index.reserve(document.size());
+                        for (const auto& reference : document)
+                        {
+                            cache.index.emplace(reference.placement.formId, cache.references.size());
+                            cache.references.push_back(reference.placement);
+                            if (!reference.visible || reference.disabled) cache.hidden.push_back(reference.placement.formId);
+                        }
+                        for (const auto& [id, path] : mDocument->models())
+                            if (auto source = mDocument->sourceEsm(id)) cache.sources.emplace(id, *source);
+                        cache.layout = revision;
+                    }
+                    cache.revision = revision;
                 }
-                std::unordered_map<std::uint32_t, std::filesystem::path> sources;
-                for (const auto& [id, path] : mDocument->models())
-                    if (auto source = mDocument->sourceEsm(id)) sources.emplace(id, *source);
-                mObjects->update(*mRenderer, references, mDocument->models(), sources, mPosition, hidden);
+                const auto objectsStart = std::chrono::steady_clock::now();
+                mObjects->update(*mRenderer, cache.references, mDocument->models(), cache.sources, mPosition, cache.hidden,
+                    cache.layout, cache.revision);
+                const auto coverageStart = std::chrono::steady_clock::now();
+                // Vanilla object LOD hides near the camera only in cells whose full models are drawn.
+                if (mStreamer)
+                    mStreamer->syncExternalObjectCoverage(*mRenderer, mObjects->coveredCells(), mObjects->coverageRevision());
+                if (mProfile.enabled)
+                {
+                    const auto coverageEnd = std::chrono::steady_clock::now();
+                    mProfile.objectsMs += std::chrono::duration<double, std::milli>(coverageStart - objectsStart).count();
+                    mProfile.coverageMs += std::chrono::duration<double, std::milli>(coverageEnd - coverageStart).count();
+                }
                 reconcileSelection();
                 std::vector<std::uint32_t> selectedInstances;
                 std::optional<std::uint32_t> activeInstance;
@@ -1806,18 +2721,173 @@ namespace openf4::editor
                 mPosition = glm::dvec3(center - forward() * radius * 2.5f);
             }
 
-            void erase()
+            // Plain Delete: disables in plugins (never erases there); see planReferenceDelete.
+            void erase() { deleteReferences(deletableSelection(), false, false); }
+
+            bool anySelectionRevertible() const
+            {
+                for (auto id : mSelection)
+                    if (reference(id))
+                        try { if (mDocument->referenceProvenance(id).canRevertToLoadOrder) return true; }
+                        catch (const std::exception&) {}
+                return false;
+            }
+
+            // Revert to load order: drop the active file's version of each record (references that
+            // are present must report canRevertToLoadOrder; absent ids are Deleted-flag overrides).
+            void revertToLoadOrder(const std::vector<std::uint32_t>& requested)
             {
                 if (mGizmoDragging || mInspectorEditing) return;
+                if (!mDocument->writable())
+                {
+                    mMessages.push_back("Revert blocked: " + mDocument->readOnlyReason());
+                    return;
+                }
                 finishStroke();
+                std::size_t count = 0;
                 mDocument->beginTransaction();
                 try
                 {
-                    for (const auto id : editableSelection()) mDocument->erase(id);
+                    for (const auto id : requested)
+                    {
+                        if (reference(id) && !mDocument->referenceProvenance(id).canRevertToLoadOrder) continue;
+                        mDocument->revertToLoadOrder(id); ++count;
+                    }
                     mDocument->endTransaction();
                     reconcileSelection();
                 }
-                catch (const std::exception& error) { mDocument->cancelTransaction(); recordError(error); }
+                catch (const std::exception& error) { mDocument->cancelTransaction(); recordError(error); return; }
+                const auto file = mDocument->path().filename().string();
+                mMessages.push_back(count
+                    ? "Reverted " + std::to_string(count) + " record(s) to the load order; " + file
+                        + "'s version is removed on save. Masters are not modified."
+                    : "Nothing to revert: " + file + " has no version of the selected record(s).");
+            }
+
+            void deleteReferences(const std::vector<std::uint32_t>& requested, bool hard, bool confirmed)
+            {
+                if (mGizmoDragging || mInspectorEditing) return;
+                if (!mDocument->writable())
+                {
+                    mMessages.push_back("Delete blocked: " + mDocument->readOnlyReason());
+                    return;
+                }
+                std::vector<std::uint32_t> ids;
+                for (auto id : requested) if (reference(id)) ids.push_back(id);
+                if (ids.empty()) return;
+                finishStroke();
+                std::size_t disabled = 0, already = 0, removed = 0, tombstones = 0;
+                mDocument->beginTransaction();
+                try
+                {
+                    for (const auto id : ids)
+                        switch (mDocument->deleteReference(id, hard, confirmed))
+                        {
+                        case ReferenceDeleteAction::disable: ++disabled; break;
+                        case ReferenceDeleteAction::alreadyDisabled: ++already; break;
+                        case ReferenceDeleteAction::removeRecord: ++removed; break;
+                        case ReferenceDeleteAction::deletedOverride: ++tombstones; break;
+                        case ReferenceDeleteAction::blocked: break;
+                        }
+                    mDocument->endTransaction();
+                    reconcileSelection();
+                }
+                catch (const std::exception& error) { mDocument->cancelTransaction(); recordError(error); return; }
+                const auto file = mDocument->path().filename().string();
+                if (disabled)
+                    mMessages.push_back("Disabled " + std::to_string(disabled) + " reference(s) in " + file
+                        + " (records kept). Ctrl+Shift+Delete deletes permanently.");
+                if (already)
+                    mMessages.push_back(std::to_string(already) + " reference(s) were already disabled. Ctrl+Shift+Delete deletes permanently.");
+                if (removed)
+                    mMessages.push_back("Removed " + std::to_string(removed) + " record(s) from " + file + ".");
+                if (tombstones)
+                    mMessages.push_back("Wrote " + std::to_string(tombstones) + " Deleted-flag override(s) into " + file
+                        + " on save; the defining master is not modified.");
+            }
+
+            // Ctrl+Shift+Delete: never deletes directly, only opens the confirmation modal.
+            void requestHardDelete()
+            {
+                if (mGizmoDragging || mInspectorEditing || mAssetMode) return;
+                if (!mDocument->writable())
+                {
+                    mMessages.push_back("Delete blocked: " + mDocument->readOnlyReason());
+                    return;
+                }
+                const auto ids = deletableSelection();
+                if (ids.empty()) { mMessages.push_back("Delete permanently: select an unlocked, visible reference first"); return; }
+                mHardDeleteIds = ids; mHardDeleteOpen = true; mHardDeleteAcknowledged = false;
+            }
+
+            void hardDeleteModal()
+            {
+                if (mHardDeleteOpen) { ImGui::OpenPopup("Delete permanently?"); mHardDeleteOpen = false; }
+                if (!ImGui::BeginPopupModal("Delete permanently?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+                const auto close = [&] { mHardDeleteIds.clear(); mHardDeleteAcknowledged = false; ImGui::CloseCurrentPopup(); };
+                std::vector<std::uint32_t> ids;
+                std::vector<ReferenceDeletePlan> plans;
+                for (auto id : mHardDeleteIds)
+                    if (reference(id))
+                        try { plans.push_back(mDocument->planReferenceDelete(id, true)); ids.push_back(id); }
+                        catch (const std::exception&) {}
+                std::size_t overrides = 0, removals = 0, blocked = 0;
+                bool fromMaster = false;
+                std::string crashWarning, removalWarning;
+                for (const auto& plan : plans)
+                {
+                    if (plan.action == ReferenceDeleteAction::deletedOverride) { ++overrides; if (crashWarning.empty()) crashWarning = plan.warning; }
+                    else if (plan.action == ReferenceDeleteAction::removeRecord) { ++removals; if (removalWarning.empty()) removalWarning = plan.warning; }
+                    else ++blocked;
+                    fromMaster |= plan.erasesFromMaster;
+                }
+                const auto file = mDocument->path().filename().string();
+                const ImVec4 red{1.0f, 0.3f, 0.25f, 1.0f};
+                ImGui::PushTextWrapPos(ImGui::GetFontSize() * 38.0f);
+                ImGui::TextColored(red, "PERMANENTLY DELETE %zu reference(s) in %s?", ids.size() - blocked, file.c_str());
+                ImGui::TextWrapped("This is not Delete. Plain Delete only disables a reference (Initially Disabled) and keeps the "
+                    "record, which is the Fallout-safe way to remove something in a plugin.");
+                if (overrides)
+                {
+                    ImGui::Separator();
+                    ImGui::TextColored(red, "%zu master-owned reference(s): a Deleted-flag override is written into %s.",
+                        overrides, file.c_str());
+                    ImGui::TextColored(red, "%s", crashWarning.c_str());
+                }
+                if (removals)
+                {
+                    ImGui::Separator();
+                    ImGui::Text("%zu record(s) of %s itself will be erased from it.", removals, file.c_str());
+                    ImGui::TextWrapped("%s", removalWarning.c_str());
+                }
+                if (fromMaster)
+                    ImGui::TextColored(red, "MASTER EDITING IS ENABLED: THIS ERASES RECORDS FROM THE MASTER FILE %s.", file.c_str());
+                if (blocked) ImGui::TextColored({1.0f, 0.65f, 0.2f, 1.0f}, "%zu reference(s) are blocked and will be skipped.", blocked);
+                if (ImGui::TreeNode("Details"))
+                {
+                    for (const auto& plan : plans) ImGui::BulletText("%s", plan.summary.c_str());
+                    ImGui::TreePop();
+                }
+                ImGui::TextDisabled("Undo (Ctrl+Z) works until you save; after saving the deletion is in the file.");
+                ImGui::PopTextWrapPos();
+                ImGui::Checkbox("I understand this permanently deletes these references", &mHardDeleteAcknowledged);
+                ImGui::BeginDisabled(!mHardDeleteAcknowledged || ids.size() == blocked);
+                ImGui::PushStyleColor(ImGuiCol_Button, {0.6f, 0.1f, 0.08f, 1.0f});
+                if (ImGui::Button("Delete permanently"))
+                {
+                    std::vector<std::uint32_t> doomed;
+                    for (std::size_t i = 0; i < plans.size(); ++i)
+                        if (plans[i].action != ReferenceDeleteAction::blocked) doomed.push_back(ids[i]);
+                    close();
+                    deleteReferences(doomed, true, true);
+                }
+                ImGui::PopStyleColor();
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (ImGui::Button("Disable instead")) { const auto keep = ids; close(); deleteReferences(keep, false, false); }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) close();
+                ImGui::EndPopup();
             }
 
             void duplicate()
@@ -1849,7 +2919,7 @@ namespace openf4::editor
 
             void synchronizeTerrain()
             {
-                if (mTerrain) mDocument->synchronizeTerrain(mTerrain->snapshot());
+                if (mTerrain && mDocument->writable()) mDocument->synchronizeTerrain(mTerrain->snapshot());
             }
 
             void restoreTerrain()
@@ -1887,11 +2957,16 @@ namespace openf4::editor
                 if (exportBusy()) throw std::runtime_error("Export is using the saved source; cancel or finish it before saving");
                 if (bakeBusy())
                     throw std::runtime_error("LOD bake is using the saved source; cancel or finish it before saving");
+                if (!mDocument->writable())
+                {
+                    if (mDocument->dirty()) throw std::runtime_error(mDocument->readOnlyReason());
+                    return; // nothing to write, and nothing may be written
+                }
                 finishManipulation(false);
                 finishStroke();
                 synchronizeTerrain();
                 mDocument->save();
-                mMessages.push_back("Saved " + mDocument->path().string());
+                mMessages.push_back(std::string(mLoadOrder.masterEditingEnabled() ? "Saved MASTER " : "Saved ") + mDocument->path().string());
                 std::cout << "Editor saved: " << mDocument->path().string() << '\n';
             }
 
@@ -1926,7 +3001,7 @@ namespace openf4::editor
                             if (!mDocument->undo() || !mDocument->redo())
                                 throw std::runtime_error("Editor smoke transform undo/redo failed");
                             duplicate();
-                            erase();
+                            deleteReferences(deletableSelection(), true, true);
                             history(false);
                             history(true);
                             select(id);
@@ -2218,6 +3293,22 @@ namespace openf4::editor
             std::unique_ptr<render::VulkanRenderer> mRenderer;
             std::unique_ptr<EditorUi> mUi;
             std::unique_ptr<EditorDocument> mDocument;
+            // Load order and the single active edit target. Never persisted: master editing
+            // must be re-enabled (typed confirmation + fresh backup) in every session.
+            assets::LoadOrder mLoadOrder;
+            bool mLoadOrderDirect = false;
+            std::optional<std::size_t> mLoadOrderSelected;
+            std::vector<assets::WorldspaceInfo> mWorldspaces;
+            std::optional<std::uint32_t> mActiveWorld;
+            std::string mActiveWorldEditorId;
+            std::optional<assets::LoadOrder::AddResult> mMissingOffer;
+            std::string mMissingOfferPlugin;
+            bool mMasterConfirmOpen = false;
+            std::array<char, 260> mMasterConfirm{};
+            bool mQuitConfirm = false, mDiscardOnExit = false;
+            std::vector<std::uint32_t> mHardDeleteIds;
+            bool mHardDeleteOpen = false, mHardDeleteAcknowledged = false;
+            std::string mWindowTitle;
             std::unique_ptr<AssetWorkspace> mAsset;
             bool mAssetMode = false;
             unsigned mAssetSmokeReplacements = 0;
@@ -2227,6 +3318,22 @@ namespace openf4::editor
             std::unique_ptr<world::LandscapeEditor> mTerrain;
             std::unique_ptr<world::WorldStreamer> mStreamer;
             std::unique_ptr<world::ObjectScene> mObjects;
+            double mBenchSpeed = 0.0;
+            int mBenchWarmup = 0;
+            struct ProjectionCache
+            {
+                std::uint64_t revision = 0, layout = 0;
+                std::vector<assets::PlacedReference> references;
+                std::vector<std::uint32_t> hidden;
+                std::unordered_map<std::uint32_t, std::size_t> index;
+                std::unordered_map<std::uint32_t, std::filesystem::path> sources;
+            } mProjection;
+            struct OutlinerCache { std::uint64_t revision = 0; std::string filter; std::vector<std::uint32_t> rows; } mOutliner;
+            struct ModelRows { std::uint64_t revision = 0; std::vector<std::uint32_t> ids; } mModelRows;
+            FrameProfile mProfile;
+            std::uint32_t mActorBaseEditFor = 0;
+            char mActorBaseText[16]{};
+            char mPlaceActorText[16]{};
             std::shared_ptr<DialogMailbox> mDialogMailbox = std::make_shared<DialogMailbox>();
             std::optional<PendingImport> mImport;
             std::future<assets::LodBakePreflight> mBakePreview;

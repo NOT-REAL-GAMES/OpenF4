@@ -1,6 +1,7 @@
 #include "assets/fo4_world_writer.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -519,5 +520,35 @@ namespace openf4::assets
             output.endGroup(block);
         }
         output.endGroup(children); output.endGroup(top); output.finish();
+    }
+
+    void createFo4OverridePlugin(const std::filesystem::path& path, const std::vector<std::string>& masters,
+        const std::string& description)
+    {
+        if (masters.empty()) throw std::runtime_error("A new plugin needs at least one master");
+        if (masters.size() > 254) throw std::runtime_error("Too many masters for one plugin");
+        const auto extension = [&] { auto e = path.extension().string(); for (auto& c : e) c = char(std::tolower((unsigned char)c)); return e; }();
+        if (extension != ".esp") throw std::runtime_error("New plugins must use the .esp extension");
+        if (std::filesystem::exists(path)) throw std::runtime_error("Plugin already exists: " + path.string());
+        for (std::size_t i = 0; i < masters.size(); ++i)
+        {
+            if (masters[i].empty() || masters[i].find_first_of("/\\:") != std::string::npos)
+                throw std::runtime_error("Invalid master filename: " + masters[i]);
+            for (std::size_t j = 0; j < i; ++j)
+            {
+                auto a = masters[i], b = masters[j];
+                for (auto& c : a) c = char(std::tolower((unsigned char)c));
+                for (auto& c : b) c = char(std::tolower((unsigned char)c));
+                if (a == b) throw std::runtime_error("Duplicate master: " + masters[i]);
+            }
+        }
+        Output output(path);
+        Bytes header, hedr;
+        put(hedr, 1.0f); put(hedr, std::uint32_t{}); put(hedr, std::uint32_t{0x800});
+        sub(header, "HEDR", hedr); text(header, "CNAM", "OpenF4");
+        if (!description.empty()) text(header, "SNAM", description);
+        for (const auto& master : masters) { text(header, "MAST", master); scalar(header, "DATA", std::uint64_t{}); }
+        output.record("TES4", 0, header);
+        output.finish();
     }
 }

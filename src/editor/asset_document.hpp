@@ -1,6 +1,7 @@
 #pragma once
 
 #include "assets/native_model_export.hpp"
+#include "physics/convex_decomposition.hpp"
 
 #include <filesystem>
 #include <memory>
@@ -58,7 +59,11 @@ namespace openf4::editor
         AssetDocument(std::filesystem::path sourceEsm, std::string modelPath,
             std::optional<std::filesystem::path> dataDirectory = std::nullopt,
             std::optional<bool> movableRecordHint = std::nullopt);
-        explicit AssetDocument(assets::ModelGeometry geometry);
+        // allowEmpty permits a geometry with no surfaces (a blank asset to build from scratch).
+        explicit AssetDocument(assets::ModelGeometry geometry, bool allowEmpty = false);
+        // PROTOTYPE: new blank mesh asset with no surfaces and one empty static collision body.
+        // It has no source ESM/model path; the workspace assigns a world base on first save.
+        [[nodiscard]] static AssetDocument createEmpty();
         ~AssetDocument();
         AssetDocument(AssetDocument&&) noexcept;
         AssetDocument& operator=(AssetDocument&&) noexcept;
@@ -104,6 +109,53 @@ namespace openf4::editor
             std::size_t system = 0, std::size_t body = 0) const;
         void setPartTransform(AssetCollisionPart kind, std::size_t part, const glm::mat4& transform,
             std::size_t system = 0, std::size_t body = 0);
+
+        // PROTOTYPE convex collision editing. Positions are body-local engine space with the
+        // part transform applied (what the collision overlay draws); indices are the polytope
+        // triangles (Havok winding). Vertex edits may make a part non-convex: that state is
+        // kept and previewed through its hull, but Save refuses it until the part is split or
+        // re-hulled, because Fallout 4's hknpConvexPolytopeShape must be convex.
+        [[nodiscard]] std::vector<glm::vec3> convexPartPositions(std::size_t part,
+            std::size_t system = 0, std::size_t body = 0) const;
+        [[nodiscard]] std::vector<std::uint32_t> convexPartIndices(std::size_t part,
+            std::size_t system = 0, std::size_t body = 0) const;
+        // Same count/order as convexPartPositions; recomputes mass properties.
+        void setConvexPartPositions(std::size_t part, std::span<const glm::vec3> positions,
+            std::size_t system = 0, std::size_t body = 0);
+        // Exact export check (matches the Havok writer).
+        [[nodiscard]] bool convexPartIsConvex(std::size_t part,
+            std::size_t system = 0, std::size_t body = 0) const;
+        // convex = exact export check; depth = deepest dent below the hull, engine units.
+        [[nodiscard]] physics::ConvexityReport convexPartConvexity(std::size_t part,
+            std::size_t system = 0, std::size_t body = 0) const;
+        // Every convex part of every body passes the export check.
+        [[nodiscard]] bool collisionConvex() const;
+        // Replaces the part with the convex hull of its current vertices (one undo step).
+        void rehullConvexPart(std::size_t part, std::size_t system = 0, std::size_t body = 0);
+        // Replaces the part with approximately convex pieces sharing its part transform
+        // (one undo step); returns the piece count. See physics/convex_decomposition.cpp.
+        std::size_t splitConvexPart(std::size_t part, const physics::ConvexDecompositionSettings& settings = {},
+            std::size_t system = 0, std::size_t body = 0);
+        // Convexity of the union of surfaces (engine units).
+        [[nodiscard]] physics::ConvexityReport surfaceConvexity(std::span<const std::size_t> surfaces) const;
+        // Like generateCollision(convex) but decomposes non-convex surfaces into convex pieces.
+        std::size_t generateConvexDecomposition(std::span<const std::size_t> surfaces,
+            const physics::ConvexDecompositionSettings& settings = {}, std::size_t system = 0, std::size_t body = 0);
+
+        // PROTOTYPE 0.1 mesh editing. Geometry is part of undoable state; edits are
+        // only allowed when materials are editable (OpenF4-authored/imported assets),
+        // since source-preserving native NIFs never re-export geometry.
+        [[nodiscard]] bool meshEditable() const noexcept;
+        // Shared, immutable snapshot of the current geometry; identity changes on every
+        // geometry edit, undo or redo that alters geometry.
+        [[nodiscard]] std::shared_ptr<const assets::ModelGeometry> geometryHandle() const noexcept;
+        // Appends a surface with its material; returns the new surface index.
+        std::size_t addSurface(assets::ModelSurface surface, AssetMaterial material);
+        // Replaces every vertex position of one surface (engine units); normals around
+        // moved vertices are recomputed.
+        void setSurfacePositions(std::size_t surface, std::span<const glm::vec3> positions);
+        // Removes one surface and its material (one undo step). Collision is left untouched.
+        void eraseSurface(std::size_t surface);
 
         [[nodiscard]] assets::ModelGeometry geometryForExport() const;
         // Does not mark saved: caller first assigns the package to the world transaction.

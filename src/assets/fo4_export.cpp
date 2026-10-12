@@ -349,7 +349,7 @@ namespace
                 "Native distant terrain/static LOD is not generated.",
                 "Existing Fallout overrides, large-world partitioning and game compatibility are not certified."};
             summary.cells = document.terrainCells().size();
-            summary.references = std::ranges::count_if(document.references(), [](const auto& r) { return !r.deleted; });
+            summary.references = std::ranges::count_if(document.references(), [](const auto& r) { return !r.deleted && !r.disabled; });
             summary.estimatedBytes = summary.cells * 8192 + summary.references * 128 + 4096;
             if (!document.isOpenF4Owned() || document.isDemOverlay() || document.masters().size() != 1
                 || folded(document.masters()[0]) != "fallout4.esm" || document.worldFormId() >> 24 != 1)
@@ -381,7 +381,10 @@ namespace
             std::set<std::uint32_t> needed;
             for (const auto& reference : document.references())
             {
-                if (reference.deleted) continue;
+                if (reference.deleted || reference.disabled) continue;
+                if (reference.placement.actor)
+                    throw std::runtime_error("Actors (ACHR) are not exported by the world exporter yet; "
+                        "author them in an ESP over Fallout4.esm instead (" + reference.editorId + ")");
                 if (!models.contains(reference.placement.baseObject)) throw std::runtime_error("Reference has a missing or unsupported inherited model base");
                 if (!document.terrainCells().contains(reference.placement.cell)) throw std::runtime_error("Reference is outside exported terrain");
                 needed.insert(reference.placement.baseObject); request.references.push_back(reference);

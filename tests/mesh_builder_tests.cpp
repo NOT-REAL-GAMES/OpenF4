@@ -140,6 +140,13 @@ try
     static_assert(openf4::render::detail::sparseFirstResidentMip(4096, 4096, 13, 6) == 2);
     static_assert(openf4::render::detail::sparseFirstResidentMip(8192, 8192, 2, 2) == 1);
     static_assert(openf4::render::detail::sparseFirstResidentMip(4096, 4096, 13, 1) == 1);
+    // Streamed textures start at <= 128 px, clamped to the sparse mip tail and the target cap.
+    static_assert(openf4::render::detail::textureStreamInitialMip(2048, 2048, 12, 1, 12, 128) == 4);
+    static_assert(openf4::render::detail::textureStreamInitialMip(2048, 2048, 12, 1, 3, 128) == 3);
+    static_assert(openf4::render::detail::textureStreamInitialMip(4096, 4096, 13, 2, 1, 128) == 2);
+    static_assert(openf4::render::detail::textureStreamInitialMip(128, 128, 8, 0, 8, 128) == 0);
+    static_assert(openf4::render::detail::textureStreamInitialMip(1024, 256, 11, 0, 11, 128) == 3);
+    static_assert(openf4::render::detail::textureStreamInitialMip(2048, 2048, 1, 0, 1, 128) == 0);
 
     constexpr float nearPlane = 0.1f;
     constexpr float farPlane = 100000.0f;

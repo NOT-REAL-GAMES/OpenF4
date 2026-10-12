@@ -57,6 +57,8 @@ namespace openf4::assets
         float localScale = 1.0f;
         bool hasLocalTransform = false;
         bool replacesDistantLod = false;
+        // ACHR (placed actor, base is an NPC_) rather than REFR. Same transform layout.
+        bool actor = false;
         bool operator==(const PlacedReference&) const = default;
     };
 
@@ -132,4 +134,6 @@ namespace openf4::assets
 
     [[nodiscard]] ExteriorWorld loadCommonwealth(const std::filesystem::path& esmPath);
     [[nodiscard]] ExteriorWorld loadExteriorWorld(const std::filesystem::path& esmPath);
+    // Loads one specific WRLD (FormID in esmPath's own FormID space).
+    [[nodiscard]] ExteriorWorld loadExteriorWorld(const std::filesystem::path& esmPath, std::uint32_t worldFormId);
 }

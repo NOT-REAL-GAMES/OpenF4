@@ -777,7 +777,7 @@ namespace openf4::assets
         {
             for (auto model : stack.models) models.emplace(model.formId, std::move(model));
             for (auto reference : stack.references)
-                if (!reference.deleted && models.contains(reference.placement.baseObject)
+                if (!reference.deleted && !reference.disabled && models.contains(reference.placement.baseObject)
                     && models.at(reference.placement.baseObject).kind == ESMModelKind::staticObject)
                     byTile[tileOf(reference.placement.cell)].push_back(std::move(reference));
         }

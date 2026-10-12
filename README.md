@@ -50,6 +50,31 @@ The vcpkg manifest installs the rendering, physics, GIS, and model-import depend
 including Assimp and stb. Dear ImGui docking and ImGuizmo are linked only by the editor.
 Nifly is pinned to a specific revision through CMake FetchContent.
 
+### MSYS2 / GCC (C++26 side build)
+
+MSVC remains the primary toolchain. An optional MSYS2 UCRT64 GCC 16+ build unlocks C++26
+features MSVC 19.51 does not ship yet: static reflection (`-freflection`, enabled by
+`OPENF4_ENABLE_REFLECTION`), `std::inplace_vector`, and P2300 senders through
+[stdexec](https://github.com/NVIDIA/stdexec). On MinGW the manifest also pulls oneTBB, which
+libstdc++ needs for `std::execution::par`/`par_unseq` to run in parallel (without TBB they
+silently run serially). Both deps are `"platform": "mingw"` only, so MSVC builds are unaffected.
+
+```powershell
+# One-time: pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-ninja
+$env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"   # UCRT64 must precede mingw64
+cmake -S . -B build-mingw -G Ninja -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ `
+  -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+  -DVCPKG_TARGET_TRIPLET=x64-mingw-dynamic-release -DVCPKG_HOST_TRIPLET=x64-windows
+cmake --build build-mingw --parallel
+ctest --test-dir build-mingw --output-on-failure
+```
+
+Keep the same `PATH` for every configure: the community `x64-mingw-dynamic-release`
+triplet passes `PATH` through to vcpkg, so changing it changes package ABI hashes and
+triggers a full dependency rebuild. `openf4-execution-tests` verifies that the TBB parallel
+backend is active and that stdexec senders (`schedule`/`then`/`when_all`/`bulk`) work.
+
 ## Run
 
 ```powershell

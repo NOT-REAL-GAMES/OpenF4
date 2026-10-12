@@ -182,10 +182,91 @@ void nativeExport(const std::filesystem::path& root) {
     std::filesystem::rename(scriptRoot/"OpenF4VmBase.pex",scriptRoot/"OpenF4VmBase.saved");
     require(!inspectFo4Export(path,options).canWriteWorldProof(),"Missing project script parent accepted");
 }
+void startAwake() {
+    const std::string wake = "OpenF4WakeOnLoad";
+    PapyrusBindings base, local = binding();
+    require(!papyrusScriptActive(base, local, wake), "Wake script active before Start Awake");
+    setPapyrusScriptActive(local, base, wake, true); setPapyrusScriptActive(local, base, "openf4wakeonload", true);
+    require(local.scripts.size() == 2 && papyrusScriptActive(base, local, wake), "Start Awake did not attach exactly once");
+    setPapyrusScriptActive(local, base, wake, false);
+    require(local.scripts == binding().scripts && !papyrusScriptActive(base, local, wake), "Clearing Start Awake touched other scripts");
+    base.scripts.push_back({wake, 0, {}}); local = {};
+    require(papyrusScriptActive(base, local, wake), "Inherited wake script not reported");
+    setPapyrusScriptActive(local, base, wake, false);
+    require(local.scripts.size() == 1 && local.scripts[0].flags == 2 && !papyrusScriptActive(base, local, wake), "Inherited wake not disabled locally");
+    setPapyrusScriptActive(local, base, wake, true);
+    require(local.scripts.empty() && papyrusScriptActive(base, local, wake), "Re-enabling inherited wake left a local override");
+    PapyrusBindings opaque; opaque.editable = false;
+    rejects([&] { setPapyrusScriptActive(opaque, base, wake, true); }, "Start Awake edited read-only VMAD");
+}
+
+void startAwakeDefault(const std::filesystem::path& root) {
+    const std::string wake(wakeOnLoadScriptName);
+    const auto active=[&](const EditorDocument& doc,std::uint32_t ref){
+        const auto& r=*std::ranges::find_if(doc.references(),[&](const auto& x){return x.placement.formId==ref;});
+        return papyrusScriptActive(doc.model(r.placement.baseObject)->scripts,r.scripts,wake);};
+    const auto count=[&](const PapyrusBindings& b){return std::ranges::count_if(b.scripts,[&](const auto& s){return s.name==wake;});};
+    // Library default stays literal.
+    { EditorDocument plain(root/"awake-off.esm");const auto m=plain.addModel("models/a.glb",{},ESMModelKind::movableStatic);
+      require(!plain.startAwakeByDefault()&&!plain.model(m)->scripts.present,"Wake attached with default policy off"); }
+    const auto path=root/"awake.esm";EditorDocument editor(path);editor.setStartAwakeByDefault(true);
+    const auto mstt=editor.addModel("models/m.glb",{},ESMModelKind::movableStatic);
+    require(count(editor.model(mstt)->scripts)==1&&editor.model(mstt)->scripts.present,"New MSTT base lacks wake script");
+    require(editor.undo()&&!editor.model(mstt),"New MSTT + wake was not one undo step");require(editor.redo(),"Redo failed");
+    const auto placed=editor.place(mstt,glm::mat4(1));require(active(editor,placed),"New MSTT placement not Start Awake");
+    const auto stat=editor.addModel("models/s.glb");require(!editor.model(stat)->scripts.present,"STAT received wake script");
+    // Old per-placement Start Awake + another script on a STAT placement that becomes MSTT.
+    const auto ref=editor.place(stat,glm::mat4(1));auto local=binding();setPapyrusScriptActive(local,{},wake,true);
+    editor.setReferenceScripts(ref,local);
+    std::filesystem::create_directories(editor.assetRoot()/"meshes");write(editor.assetRoot()/"meshes/n.nif",{std::byte{1}});
+    const auto before=editor.wakeAttachments();
+    const auto moved=editor.assignNativeModel(stat,"meshes/n.nif",ESMModelKind::movableStatic);
+    require(moved!=stat&&count(editor.model(moved)->scripts)==1&&editor.wakeAttachments()==before+1,"STAT->MSTT retarget lacks wake script");
+    const auto& retargeted=*std::ranges::find_if(editor.references(),[&](const auto& r){return r.placement.formId==ref;});
+    require(count(retargeted.scripts)==0&&retargeted.scripts.scripts==binding().scripts,"Redundant placement wake kept or other scripts lost");
+    require(active(editor,ref),"Retargeted placement not awake");
+    require(editor.undo()&&editor.model(stat)->kind==ESMModelKind::staticObject,"Retarget+wake not one undo step");
+    require(count(std::ranges::find_if(editor.references(),[&](const auto& r){return r.placement.formId==ref;})->scripts)==1,"Undo lost placement wake");
+    require(editor.redo(),"Retarget redo failed");
+    (void)editor.assignNativeModel(moved,"meshes/n.nif",ESMModelKind::movableStatic);
+    require(count(editor.model(moved)->scripts)==1,"Re-saving an MSTT duplicated wake script");
+    const auto unique=editor.makeUnique(placed,"meshes/n.nif",ESMModelKind::movableStatic);
+    require(count(editor.model(unique)->scripts)==1,"Make Unique MSTT lacks wake script");
+    const auto statRef=editor.place(editor.addModel("models/t.glb"),glm::mat4(1));
+    const auto uniqueMovable=editor.makeUnique(statRef,"meshes/n.nif",ESMModelKind::movableStatic);
+    require(count(editor.model(uniqueMovable)->scripts)==1&&active(editor,statRef),"Make Unique STAT->MSTT lacks wake script");
+    // Per-placement opt-out survives save/reload as an inherited-removal marker.
+    auto off=std::ranges::find_if(editor.references(),[&](const auto& r){return r.placement.formId==ref;})->scripts;
+    setPapyrusScriptActive(off,editor.model(moved)->scripts,wake,false);editor.setReferenceScripts(ref,off);
+    require(!active(editor,ref)&&active(editor,placed),"Per-placement Start Awake opt-out failed");
+    editor.save();
+    { EditorDocument reopened(path);reopened.setStartAwakeByDefault(true);
+      require(!active(reopened,ref)&&active(reopened,placed),"Start Awake state did not survive reload");
+      require(reopened.migrateStartAwake()==0&&!reopened.dirty(),"Migration touched already-awake world"); }
+    // One-time migration of an ESM authored before the default.
+    const auto legacyPath=root/"legacy.esm";std::uint32_t legacyModel=0,legacyRef=0;
+    { EditorDocument legacy(legacyPath);legacyModel=legacy.addModel("models/l.glb",{},ESMModelKind::movableStatic);
+      const auto other=legacy.addModel("models/o.glb");(void)legacy.place(other,glm::mat4(1));
+      legacyRef=legacy.place(legacyModel,glm::mat4(1));legacy.setModelScripts(legacyModel,binding());legacy.save();
+      std::filesystem::create_directories(legacy.assetRoot()/"models");
+      for(const auto* name:{"models/l.glb","models/o.glb"})write(legacy.assetRoot()/name,{std::byte{1}}); }
+    { EditorDocument legacy(legacyPath);legacy.setStartAwakeByDefault(true);
+      require(legacy.migrateStartAwake()==1&&legacy.dirty()&&active(legacy,legacyRef),"Legacy MSTT not migrated");
+      require(count(legacy.model(legacyModel)->scripts)==1&&legacy.model(legacyModel)->scripts.scripts.front()==binding().scripts.front(),"Migration lost existing base scripts");
+      require(legacy.undo()&&!active(legacy,legacyRef)&&!legacy.dirty(),"Migration was not one undoable step"); }
+    // A protected master's MSTT is never mass-mutated through its overlay.
+    auto bytes=read(legacyPath);const std::string author="OpenF4";
+    const auto at=std::search(bytes.begin(),bytes.end(),reinterpret_cast<const std::byte*>(author.data()),reinterpret_cast<const std::byte*>(author.data()+author.size()));
+    require(at!=bytes.end(),"Missing author");*at=std::byte{'X'};write(legacyPath,bytes);
+    { EditorDocument overlay(legacyPath);overlay.setStartAwakeByDefault(true);
+      require(overlay.path()!=legacyPath,"Protected master opened without overlay");
+      require(overlay.migrateStartAwake()==0&&!overlay.dirty(),"Migration mutated a master MSTT");
+      require(read(legacyPath)==bytes,"Migration wrote protected master"); }
+}
 int main() try {
     const auto root=std::filesystem::temp_directory_path()/ ("openf4-papyrus-bindings-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     require(std::filesystem::create_directory(root),"Cannot create test directory");
-    codec();document(root);inheritance(root);rawPreservation(root);nativeWriter(root);
+    codec();startAwake();startAwakeDefault(root);document(root);inheritance(root);rawPreservation(root);nativeWriter(root);
 #ifdef _WIN32
     nativeExport(root);
 #endif

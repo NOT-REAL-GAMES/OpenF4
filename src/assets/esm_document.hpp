@@ -43,6 +43,19 @@ namespace openf4::assets
         bool operator==(const ESMRecordSource&) const = default;
     };
 
+    // Read-only index of an NPC_ record: enough to list, place and label actors. The record
+    // itself is never rewritten by OpenF4 yet (no NPC_ authoring in this slice).
+    struct ESMActorBase
+    {
+        std::uint32_t formId = 0;
+        std::string editorId;
+        std::string name;          // FULL; empty for localized files (string-table IDs)
+        std::uint32_t race = 0;    // RNAM
+        std::string sourceEsm;     // last file in the stack that contains the record
+        bool operator==(const ESMActorBase&) const = default;
+    };
+
+    // REFR and ACHR share this representation; placement.actor selects the record type.
     struct ESMReference
     {
         PlacedReference placement;
@@ -53,6 +66,9 @@ namespace openf4::assets
         std::uint32_t ownerCellFormId = 0;
         std::uint32_t childGroupType = 9;
         PapyrusBindings scripts;
+        // REFR record flag 0x800 "Initially Disabled". Plain Delete in a plugin sets this on a
+        // (same-FormID) override instead of erasing anything; the record itself stays.
+        bool disabled = false;
         bool operator==(const ESMReference&) const = default;
     };
 
@@ -66,12 +82,17 @@ namespace openf4::assets
     };
 
     // A raw-preserving index over one OpenF4-owned ESM.  It understands enough of
-    // the TES4 hierarchy to patch STAT, MSTT, REFR, and LAND records, and preserves every
+    // the TES4 hierarchy to patch STAT, MSTT, REFR, ACHR and LAND records (and to index NPC_
+    // bases read-only), and preserves every
     // record/group it does not own byte-for-byte.
     class EsmDocument
     {
     public:
         explicit EsmDocument(const std::filesystem::path& path);
+        // Indexes one specific worldspace (FormID in this file's own space). The WRLD record
+        // itself may live only in a master; save() then writes a parent WRLD override taken
+        // from `worldSource` the first time a CELL/REFR override needs it.
+        EsmDocument(const std::filesystem::path& path, std::optional<std::uint32_t> worldFormId);
         ~EsmDocument();
         EsmDocument(EsmDocument&&) noexcept;
         EsmDocument& operator=(EsmDocument&&) noexcept;
@@ -84,9 +105,14 @@ namespace openf4::assets
         [[nodiscard]] std::uint32_t nextFormId() const noexcept;
         [[nodiscard]] bool isDemOverlay() const noexcept;
         [[nodiscard]] bool isOpenF4Owned() const noexcept;
+        [[nodiscard]] bool isLocalized() const noexcept;
+        [[nodiscard]] bool containsRecord(std::uint32_t formId) const noexcept;
+        [[nodiscard]] bool hasWorldRecord() const noexcept;
+        void setWorldSource(ESMRecordSource source);
         [[nodiscard]] std::optional<ESMTerrainCell> terrainCell(CellCoord coord) const;
         [[nodiscard]] const std::vector<ESMModel>& models() const noexcept;
         [[nodiscard]] const std::vector<ESMReference>& references() const noexcept;
+        [[nodiscard]] const std::vector<ESMActorBase>& actorBases() const noexcept;
         [[nodiscard]] const std::map<CellCoord, ESMTerrainCell>& terrainCells() const noexcept;
 
         [[nodiscard]] std::uint32_t allocateFormId();
@@ -105,13 +131,31 @@ namespace openf4::assets
 
     struct ESMMasterStack
     {
+        // Active file's MAST list followed by its own filename: index == FormID high byte.
+        std::vector<std::string> canonicalNames;
         std::filesystem::path basePath;
         std::vector<std::filesystem::path> sourcePaths;
         std::vector<ESMModel> models;
         std::vector<ESMReference> references;
+        // NPC_ bases from every file in the stack, FormIDs in the active file's space.
+        std::vector<ESMActorBase> actorBases;
         std::uint32_t worldFormId = 0;
+        // For every REFR the selected (last) file overrides or deletes: the version that wins
+        // in the remaining load order without it. Revert to load order restores this.
+        std::vector<ESMReference> shadowedReferences;
     };
     [[nodiscard]] ESMMasterStack loadEsmMasterStack(const std::filesystem::path& path,
         std::optional<std::filesystem::path> dataDirectory = std::nullopt);
+    struct ESMStackOptions
+    {
+        std::optional<std::filesystem::path> dataDirectory;
+        // Worldspace in the selected file's FormID space; nullopt keeps the automatic choice.
+        std::optional<std::uint32_t> worldFormId;
+        // Files resolved by the Load Order panel; matched by filename before folder lookup.
+        std::vector<std::filesystem::path> resolvedFiles;
+        // Plain (non-OpenF4) plugins edited in place: their base is the master owning the world.
+        bool directPlugin = false;
+    };
+    [[nodiscard]] ESMMasterStack loadEsmMasterStack(const std::filesystem::path& path, const ESMStackOptions& options);
     [[nodiscard]] std::filesystem::path createEditorOverlay(const std::filesystem::path& master);
 }

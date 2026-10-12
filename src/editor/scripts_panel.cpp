@@ -19,15 +19,88 @@ namespace openf4::editor
                     + "\n" + result.diagnostics;
             }
             catch (const std::exception& error) { mDiagnostic = error.what(); }
+            if (mAwakeCompile) mAwakeStatus = mDiagnostic;
+            mAwakeCompile = false;
         }
+    }
+
+    void ScriptsPanel::compileWake(const EditorDocument& document, const std::filesystem::path& data)
+    {
+        const auto name = script::wakeScriptName;
+        const auto root = assets::AssetResolver::projectAssetRoot(document.path());
+        if (std::filesystem::is_regular_file(root / assets::papyrusScriptPath(name))) return;
+        if (!std::filesystem::is_regular_file(script::scriptSourcePath(document.path(), name)))
+            script::createWakeScript(document.path(), name);
+        if (!busy())
+        {
+            const auto path = document.path(); const std::string scriptName(name);
+            mCompile = std::async(std::launch::async, [path, data, scriptName] { return script::compilePapyrus(path, data, scriptName); });
+            mAwakeCompile = true;
+            mAwakeStatus = "Compiling " + std::string(name) + "...";
+        }
+        else mAwakeStatus = "Attached; compile " + std::string(name) + " in Papyrus scripts once the current build finishes.";
+    }
+
+    void ScriptsPanel::ensureWakeScript(const EditorDocument& document, const std::filesystem::path& data)
+    {
+        const bool reopened = mWakeSeenPath != document.path();
+        if ((!reopened && mWakeSeen == document.wakeAttachments()) || busy()) return;
+        mWakeSeenPath = document.path(); mWakeSeen = document.wakeAttachments();
+        bool used = !reopened;
+        if (!used)
+        {
+            const auto name = script::wakeScriptName;
+            for (const auto& ref : document.references())
+            {
+                const auto* model = document.model(ref.placement.baseObject);
+                if (model && model->kind == assets::ESMModelKind::movableStatic
+                    && assets::papyrusScriptActive(model->scripts, ref.scripts, name)) { used = true; break; }
+            }
+        }
+        if (!used) return;
+        try { compileWake(document, data); }
+        catch (const std::exception& error) { mAwakeStatus = error.what(); }
+    }
+
+    void ScriptsPanel::drawStartAwake(EditorDocument& document, std::uint32_t referenceId, const std::filesystem::path& data)
+    {
+        poll();
+        const auto* ref = document.findReference(referenceId);
+        if (!ref) return;
+        const auto* model = document.model(ref->placement.baseObject);
+        if (!model || model->kind != assets::ESMModelKind::movableStatic) return;
+        const auto name = script::wakeScriptName;
+        const bool editable = model->scripts.editable && ref->scripts.editable;
+        bool awake = editable && assets::papyrusScriptActive(model->scripts, ref->scripts, name);
+        ImGui::BeginDisabled(!editable);
+        if (ImGui::Checkbox("Start Awake", &awake))
+        {
+            try
+            {
+                auto bindings = ref->scripts;
+                assets::setPapyrusScriptActive(bindings, model->scripts, name, awake);
+                bindings.edited = true;
+                document.setReferenceScripts(referenceId, bindings);
+                mAwakeStatus.clear();
+                if (awake) compileWake(document, data);
+            }
+            catch (const std::exception& error) { mAwakeStatus = error.what(); }
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(editable ? "Attaches %s (OnLoad: SetMotionType dynamic + tiny impulse) so this rigid body\n"
+                "wakes when Fallout 4 loads it from the ESP. New MSTTs start awake by default (the script\n"
+                "lives on the MSTT base); unchecking disables it for this placement only."
+                : "This object's VMAD is preserved read-only; Start Awake is unavailable.", name.data());
+        if (!mAwakeStatus.empty()) ImGui::TextWrapped("%s", mAwakeStatus.c_str());
     }
 
     void ScriptsPanel::draw(EditorDocument& document, std::uint32_t referenceId, const std::filesystem::path& data)
     {
         poll();
         if (!ImGui::CollapsingHeader("Papyrus scripts")) return;
-        const auto ref = std::ranges::find_if(document.references(), [&](const auto& r) { return r.placement.formId == referenceId; });
-        if (ref == document.references().end()) return;
+        const auto* ref = document.findReference(referenceId);
+        if (!ref) return;
         const auto baseId = ref->placement.baseObject;
         const auto* model = document.model(baseId);
         if (!model) return;

@@ -118,6 +118,8 @@ struct Node
     std::uint64_t offset = 0, size = 0;
     std::uint32_t type = 0, form = 0, groupType = 0, world = 0, cell = 0, childGroupType = 0;
     std::vector<std::unique_ptr<Node>> children;
+    // Synthetic records (a parent WRLD override created during save) carry their bytes.
+    Bytes inlineBytes;
 };
 Bytes body(std::ifstream& file, const Node& n)
 {
@@ -190,6 +192,35 @@ LandscapeCell decodeLand(CellCoord coord, const Bytes& b)
     }
     return result;
 }
+// A parent CELL/WRLD copied into a dependent plugin. A non-localized target cannot hold a
+// localized FULL string ID, so that one field is dropped rather than shown as garbage.
+Bytes parentRecordBytes(std::ifstream& file, const Node& n, bool stripLocalizedName)
+{
+    Bytes raw = readFile(file, n.offset, static_cast<std::size_t>(n.size));
+    if (!stripLocalizedName) return raw;
+    Bytes payload; bool removed = false;
+    for (const auto& s : subs(body(file, n))) { if (s.type == cc("FULL")) { removed = true; continue; } sub(payload, s.type, s.bytes); }
+    if (!removed) return raw;
+    Bytes out = n.header;
+    overwrite(out, 4, static_cast<std::uint32_t>(payload.size()));
+    overwrite(out, 8, read<std::uint32_t>(out, 8) & ~0x40000u);
+    append(out, payload); return out;
+}
+// Fallout 4 top-level groups that follow WRLD; a synthetic WRLD group is inserted before them.
+bool groupFollowsWorld(std::uint32_t label)
+{
+    static const std::set<std::uint32_t> later = [] {
+        std::set<std::uint32_t> result;
+        for (const char* name : {"DIAL", "QUST", "IDLE", "PACK", "CSTY", "LSCR", "LVSP", "ANIO", "WATR", "EFSH", "EXPL",
+            "DEBR", "IMGS", "IMAD", "FLST", "PERK", "BPTD", "ADDN", "AVIF", "CAMS", "CPTH", "VTYP", "MATT", "IPCT", "IPDS",
+            "ARMA", "ECZN", "LCTN", "MESG", "DOBJ", "DFOB", "LGTM", "MUSC", "FSTP", "FSTS", "SMBN", "SMQN", "SMEN", "DLBR",
+            "MUST", "DLVW", "EQUP", "RELA", "SCEN", "ASTP", "OTFT", "ARTO", "MATO", "MOVT", "SNDR", "SNCT", "SOPM", "COLL",
+            "CLFM", "REVB", "PKIN", "RFGP", "AMDL", "LAYR", "COBJ", "OMOD", "MSWP", "ZOOM", "INNR", "KSSM", "AECH", "SCCO",
+            "AORU", "SCSN", "STAG", "NOCM", "LENS", "GDRY", "OVIS"}) result.insert(cc(name));
+        return result;
+    }();
+    return later.contains(label);
+}
 std::int32_t floorDiv(std::int32_t n, std::int32_t d) { return n / d - (n % d < 0); }
 std::uint32_t coordLabel(CellCoord c, std::int32_t divisor)
 {
@@ -224,17 +255,22 @@ struct EsmDocument::Impl
     std::vector<std::unique_ptr<Node>> roots;
     std::vector<std::string> masterNames;
     std::uint32_t world = 0, next = 0x800;
-    bool owned = false, dem = false;
+    bool owned = false, dem = false, localized = false;
+    std::optional<std::uint32_t> presetWorld;
+    std::optional<ESMRecordSource> worldSource;
     std::vector<ESMModel> modelList, originalModels;
     std::vector<ESMReference> refList, originalRefs;
+    std::vector<ESMActorBase> actorList;
     std::map<CellCoord, ESMTerrainCell> cells, changedTerrain;
     std::unordered_map<std::uint32_t, Node*> records, temporaryGroups, cellGroups;
     std::map<std::pair<std::uint32_t, std::uint32_t>, Node*> childGroups;
     std::map<std::uint32_t, CellCoord> cellCoords;
     Node* worldChildren = nullptr;
 
-    explicit Impl(std::filesystem::path path) : source(std::filesystem::absolute(path)), destination(source)
+    explicit Impl(std::filesystem::path path, std::optional<std::uint32_t> preset = std::nullopt)
+        : source(std::filesystem::absolute(path)), destination(source), presetWorld(preset)
     {
+        if (presetWorld) world = *presetWorld;
         std::ifstream file(source, std::ios::binary | std::ios::ate);
         if (!file || file.tellg() < 24) throw std::runtime_error("Could not open ESM: " + source.string());
         const auto size = static_cast<std::uint64_t>(file.tellg());
@@ -270,7 +306,7 @@ struct EsmDocument::Impl
 
     void scan(std::ifstream& file, std::vector<std::unique_ptr<Node>>& out, std::uint64_t begin,
         std::uint64_t end, std::uint32_t contextWorld, std::uint32_t contextCell, unsigned depth,
-        std::uint32_t childGroupType = 0)
+        std::uint32_t childGroupType = 0, std::uint32_t parentGroupType = 0)
     {
         if (depth > 32) throw std::runtime_error("ESM group nesting exceeds limit");
         for (auto p = begin; p < end;)
@@ -288,14 +324,17 @@ struct EsmDocument::Impl
                 if (n.groupType == 1) n.world = n.form;
                 if (n.groupType == 6) { n.cell = n.form; cellGroups[n.form] = &n; }
                 if (n.groupType == 9) temporaryGroups[n.form] = &n;
-                if (n.groupType == 8 || n.groupType == 9 || n.groupType == 10)
+                // Fallout 4 CELL reference children are only types 8 (persistent) and 9 (temporary).
+                // Type 10 is Quest Children (labelled with a QUST FormID under the top-level QUST group),
+                // not Oblivion's visible-distant CELL group, so it must not be validated as CELL-owned.
+                if (n.groupType == 8 || n.groupType == 9)
                 {
                     n.childGroupType = n.groupType;
                     childGroups[{n.form, n.groupType}] = &n;
                     if (contextCell != n.form) throw std::runtime_error("Reference child group has incorrect CELL ownership");
                 }
                 if (n.groupType == 1 && n.form == world) worldChildren = &n;
-                scan(file, n.children, p + 24, p + n.size, n.world, n.cell, depth + 1, n.childGroupType);
+                scan(file, n.children, p + 24, p + n.size, n.world, n.cell, depth + 1, n.childGroupType, n.groupType);
             }
             else
             {
@@ -303,6 +342,7 @@ struct EsmDocument::Impl
                 if (n.form && !records.emplace(n.form, &n).second) throw std::runtime_error("Duplicate ESM record FormID");
                 if (n.type == cc("TES4"))
                 {
+                    localized = (read<std::uint32_t>(n.header, 8) & 0x80u) != 0;
                     for (const auto& s : subs(body(file, n)))
                     {
                         if (s.type == cc("MAST")) masterNames.push_back(string(s.bytes));
@@ -311,7 +351,7 @@ struct EsmDocument::Impl
                         if (s.type == cc("EMGI")) { auto text = string(s.bytes); dem = (text.starts_with("OPENF4_DEM 1\n") || text.starts_with("EMPIRE_DEM 1\n")) && text.find("\nROLE OVERLAY\n") != std::string::npos; }
                     }
                 }
-                else if (n.type == cc("WRLD"))
+                else if (n.type == cc("WRLD") && !presetWorld)
                 {
                     if (!world) world = n.form;
                     for (const auto& s : subs(body(file, n))) if (s.type == cc("EDID") && folded(string(s.bytes)) == "commonwealth" && world != n.form)
@@ -323,7 +363,11 @@ struct EsmDocument::Impl
                 }
                 else if (n.type == cc("CELL"))
                 {
-                    for (const auto& s : subs(body(file, n))) if (s.type == cc("XCLC"))
+                    // A CELL directly in the World Children group (type 1) is the world's persistent
+                    // cell, not a grid cell. Bethesda masters give it XCLC 0,0 (Fallout4.esm:
+                    // Commonwealth 00018AA2 vs exterior 0,0 0000E400), so it must not claim a grid slot.
+                    // Its references sit in a persistent (type 8) group and get positional coordinates.
+                    if (parentGroupType != 1) for (const auto& s : subs(body(file, n))) if (s.type == cc("XCLC"))
                     {
                         CellCoord c{read<std::int32_t>(s.bytes, 0), read<std::int32_t>(s.bytes, 4)};
                         cellCoords[n.form] = c;
@@ -365,9 +409,21 @@ struct EsmDocument::Impl
                     }
                     if (!model.path.empty()) modelList.push_back(std::move(model));
                 }
-                else if (n.type == cc("REFR"))
+                else if (n.type == cc("NPC_"))
+                {
+                    ESMActorBase actor; actor.formId = n.form; actor.sourceEsm = source.string();
+                    for (const auto& s : subs(body(file, n)))
+                    {
+                        if (s.type == cc("EDID")) actor.editorId = string(s.bytes);
+                        if (s.type == cc("FULL") && !localized) actor.name = string(s.bytes);
+                        if (s.type == cc("RNAM") && s.bytes.size() >= 4) actor.race = read<std::uint32_t>(s.bytes, 0);
+                    }
+                    actorList.push_back(std::move(actor));
+                }
+                else if (n.type == cc("REFR") || n.type == cc("ACHR"))
                 {
                     ESMReference ref; ref.placement.formId = n.form; ref.placement.instanceId = n.form;
+                    ref.placement.actor = n.type == cc("ACHR");
                     ref.recordSource = {source.string(), n.form};
                     ref.ownerCellFormId = n.cell;
                     ref.childGroupType = n.childGroupType;
@@ -378,7 +434,7 @@ struct EsmDocument::Impl
                         if (s.type == cc("DATA") && s.bytes.size() >= 24)
                         { std::memcpy(ref.placement.position, s.bytes.data(), 12); std::memcpy(ref.placement.rotation, s.bytes.data() + 12, 12); }
                         if (s.type == cc("XSCL")) ref.placement.scale = read<float>(s.bytes, 0);
-                        if (s.type == cc("XMSP")) ref.placement.materialSwap = read<std::uint32_t>(s.bytes, 0);
+                        if (s.type == cc("XMSP") && !ref.placement.actor) ref.placement.materialSwap = read<std::uint32_t>(s.bytes, 0);
                         if (s.type == cc("VMAD"))
                         {
                             if (!ref.scripts.present) ref.scripts = decodePapyrusBindings(s.bytes, source.string());
@@ -386,6 +442,7 @@ struct EsmDocument::Impl
                         }
                     }
                     ref.deleted = (read<std::uint32_t>(n.header, 8) & 0x20u) != 0;
+                    ref.disabled = (read<std::uint32_t>(n.header, 8) & 0x800u) != 0;
                     refList.push_back(std::move(ref));
                 }
             }
@@ -425,15 +482,17 @@ struct EsmDocument::Impl
         for (const auto& m : originalModels) oldModels.emplace(m.formId, m);
         std::set<std::uint32_t> modelIds;
         std::map<std::string, std::unique_ptr<Impl>> modelSources;
-        const auto inheritedRecord = [&](const ESMRecordSource& origin, std::uint32_t type)
+        const auto inheritedRecord = [&](const ESMRecordSource& origin, std::uint32_t type, bool parentCopy = false)
             -> std::pair<const Node*, std::unique_ptr<std::ifstream>> {
             if (origin.esm.empty() || !origin.formId) throw std::runtime_error("Inherited record is missing source provenance");
             auto& indexed = modelSources[origin.esm];
-            if (!indexed) indexed = std::make_unique<Impl>(origin.esm);
+            // Masters share the low FormID slots (checked below), so this file's world ID
+            // names the same WRLD in the source.
+            if (!indexed) indexed = std::make_unique<Impl>(origin.esm, world ? std::optional(world) : std::nullopt);
             const auto found = indexed->records.find(origin.formId);
             if (found == indexed->records.end() || found->second->type != type)
                 throw std::runtime_error("Original record is missing or has a different type");
-            if ((type == cc("CELL") || type == cc("LAND") || type == cc("REFR")) && found->second->world != world)
+            if ((type == cc("CELL") || type == cc("LAND") || type == cc("REFR") || type == cc("ACHR")) && found->second->world != world)
                 throw std::runtime_error("Cannot preserve an inherited record from a different world");
             // Unknown FormID fields remain valid only when every source slot retains its meaning.
             for (std::size_t i = 0; i < indexed->masterNames.size(); ++i)
@@ -445,7 +504,7 @@ struct EsmDocument::Impl
                 throw std::runtime_error("Cannot preserve an inherited record with a remapped self slot");
             auto file = std::make_unique<std::ifstream>(origin.esm, std::ios::binary);
             if (!*file) throw std::runtime_error("Cannot reopen original record");
-            if (indexed->source != source && (read<std::uint32_t>(indexed->roots.front()->header, 8) & 0x80u))
+            if (!parentCopy && indexed->source != source && (read<std::uint32_t>(indexed->roots.front()->header, 8) & 0x80u))
                 for (const auto& field : subs(body(*file, *found->second)))
                     if (field.type == cc("FULL"))
                         throw std::runtime_error("Cannot preserve an inherited localized name without its string table");
@@ -483,7 +542,8 @@ struct EsmDocument::Impl
             }
             if (m.kind == ESMModelKind::movableStatic)
             {
-                if (!originalFields.contains(cc("FULL"))) textSub(fields, cc("FULL"), m.editorId);
+                // A localized file stores FULL as a string-table ID; never write a raw name there.
+                if (!originalFields.contains(cc("FULL")) && !localized) textSub(fields, cc("FULL"), m.editorId);
                 if (!originalFields.contains(cc("DATA"))) scalar(fields, cc("DATA"), std::uint8_t{1});
             }
             std::set<std::uint32_t> replace{cc("EDID"), cc("MODL"), cc("ESRC")};
@@ -503,15 +563,17 @@ struct EsmDocument::Impl
             for (float v : p.position) if (!std::isfinite(v)) throw std::runtime_error("Reference position is not finite");
             for (float v : p.rotation) if (!std::isfinite(v)) throw std::runtime_error("Reference rotation is not finite");
             if (!std::isfinite(p.scale) || p.scale <= 0) throw std::runtime_error("Reference scale must be positive and finite");
+            // ACHR and REFR share placement fields; an identity never changes record type.
+            const auto recordType = p.actor ? cc("ACHR") : cc("REFR");
             const Node* node = records.contains(p.formId) ? records.at(p.formId) : nullptr;
-            if (node && node->type != cc("REFR")) throw std::runtime_error("Reference FormID has a different record type");
+            if (node && node->type != recordType) throw std::runtime_error("Reference FormID has a different record type");
             const Node* prototype = node;
             std::unique_ptr<std::ifstream> inherited;
             if (!prototype && r.recordSource.esm.empty() && (p.formId >> 24) < masterNames.size())
                 throw std::runtime_error("Inherited reference is missing source provenance");
             if (!prototype && !r.recordSource.esm.empty())
             {
-                auto original = inheritedRecord(r.recordSource, cc("REFR"));
+                auto original = inheritedRecord(r.recordSource, recordType);
                 prototype = original.first; inherited = std::move(original.second);
             }
             const auto childType = prototype ? prototype->childGroupType : r.childGroupType;
@@ -531,11 +593,15 @@ struct EsmDocument::Impl
             scalar(fields, cc("NAME"), p.baseObject); Bytes transform;
             for (float v : p.position) put(transform, v); for (float v : p.rotation) put(transform, v);
             sub(fields, cc("DATA"), transform); scalar(fields, cc("XSCL"), p.scale);
-            if (p.materialSwap) scalar(fields, cc("XMSP"), p.materialSwap);
-            std::set<std::uint32_t> replace{cc("EDID"), cc("NAME"), cc("DATA"), cc("XSCL"), cc("XMSP")};
+            if (p.materialSwap && !p.actor) scalar(fields, cc("XMSP"), p.materialSwap);
+            // ACHR has no XMSP: its unknown fields (and anything else) are left to the prototype.
+            std::set<std::uint32_t> replace{cc("EDID"), cc("NAME"), cc("DATA"), cc("XSCL")};
+            if (!p.actor) replace.insert(cc("XMSP"));
             patchScripts(inherited ? *inherited : input, prototype, r.scripts, fields, replace);
-            auto encoded = patchRecord(inherited ? *inherited : input, prototype, cc("REFR"), p.formId, fields, replace);
-            overwrite(encoded, 8, (read<std::uint32_t>(encoded, 8) & ~0x20u) | (r.deleted ? 0x20u : 0u));
+            auto encoded = patchRecord(inherited ? *inherited : input, prototype, recordType, p.formId, fields, replace);
+            // 0x20 Deleted, 0x800 Initially Disabled; every other header flag is preserved.
+            overwrite(encoded, 8, (read<std::uint32_t>(encoded, 8) & ~0x820u)
+                | (r.deleted ? 0x20u : 0u) | (r.disabled ? 0x800u : 0u));
             if (node && node->cell == owner) replacements[node] = std::move(encoded);
             else { if (node) removed.insert(node); append(newRefs[owner][childType], encoded); }
         }
@@ -586,10 +652,12 @@ struct EsmDocument::Impl
             Bytes tree;
             if (!terrain.cellSource.esm.empty())
             {
-                auto original = inheritedRecord(terrain.cellSource, cc("CELL"));
+                auto original = inheritedRecord(terrain.cellSource, cc("CELL"), true);
                 if (terrain.cellFormId != original.first->form)
                     throw std::runtime_error("Cannot remap inherited CELL ownership");
-                tree = readFile(*original.second, original.first->offset, static_cast<std::size_t>(original.first->size));
+                const bool strip = modelSources.at(terrain.cellSource.esm)->localized && !localized
+                    && modelSources.at(terrain.cellSource.esm)->source != source;
+                tree = parentRecordBytes(*original.second, *original.first, strip);
             }
             else
             {
@@ -604,14 +672,46 @@ struct EsmDocument::Impl
             append(tree, encodeChildren(terrain.cellFormId));
             append(trees[coordLabel(coord, 32)][coordLabel(coord, 8)], tree);
         }
+        // A plugin that overrides world content for the first time needs the parent WRLD
+        // record and its children group. Both are synthesized here, never on open.
+        const auto ensureWorldChildren = [&] {
+            if (worldChildren) return;
+            if (!worldSource || !world) throw std::runtime_error("ESM has no active world children group");
+            auto original = inheritedRecord(*worldSource, cc("WRLD"), true);
+            const auto& indexed = *modelSources.at(worldSource->esm);
+            Bytes wrld = parentRecordBytes(*original.second, *original.first, indexed.localized && !localized && indexed.source != source);
+            overwrite(wrld, 12, world);
+            auto recordNode = std::make_unique<Node>();
+            recordNode->type = cc("WRLD"); recordNode->form = world; recordNode->world = world;
+            recordNode->header = Bytes(wrld.begin(), wrld.begin() + 24); recordNode->size = wrld.size();
+            recordNode->inlineBytes = std::move(wrld);
+            auto children = std::make_unique<Node>();
+            children->type = cc("GRUP"); children->groupType = 1; children->form = world; children->world = world;
+            children->header = group(world, 1, {}); children->size = 24;
+            Node* top = nullptr;
+            for (const auto& n : roots) if (n->type == cc("GRUP") && n->groupType == 0 && n->form == cc("WRLD")) top = n.get();
+            if (!top)
+            {
+                auto fresh = std::make_unique<Node>();
+                fresh->type = cc("GRUP"); fresh->groupType = 0; fresh->form = cc("WRLD");
+                fresh->header = group(cc("WRLD"), 0, {}); fresh->size = 24; top = fresh.get();
+                auto at = std::find_if(roots.begin() + 1, roots.end(), [](const auto& n) {
+                    return n->type == cc("GRUP") && n->groupType == 0 && groupFollowsWorld(n->form); });
+                roots.insert(at, std::move(fresh));
+            }
+            worldChildren = children.get();
+            top->children.push_back(std::move(recordNode)); top->children.push_back(std::move(children));
+        };
+        if (!trees.empty() || !persistentOwners.empty()) ensureWorldChildren();
         for (const auto& [id, origin] : persistentOwners)
         {
-            auto original = inheritedRecord(origin, cc("CELL"));
+            auto original = inheritedRecord(origin, cc("CELL"), true);
             if (original.first->world != world || !worldChildren)
                 throw std::runtime_error("Persistent reference belongs to a different world");
             if (modelSources.at(origin.esm)->cellCoords.contains(id))
                 throw std::runtime_error("Persistent reference CELL must retain its original world-level ownership");
-            auto tree = readFile(*original.second, original.first->offset, static_cast<std::size_t>(original.first->size));
+            auto tree = parentRecordBytes(*original.second, *original.first,
+                modelSources.at(origin.esm)->localized && !localized && modelSources.at(origin.esm)->source != source);
             append(tree, encodeChildren(id)); append(additions[worldChildren], tree);
         }
         for (auto& [id, land] : newLand)
@@ -693,6 +793,7 @@ struct EsmDocument::Impl
             if (!output) throw std::runtime_error("Could not create temporary ESM");
             auto write = [&](const Bytes& b) { output.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size())); };
             auto copy = [&](const Node& n) {
+                if (!n.inlineBytes.empty()) { write(n.inlineBytes); return; }
                 constexpr std::size_t chunk = 1024 * 1024;
                 for (std::uint64_t p = 0; p < n.size; p += chunk) write(readFile(input, n.offset + p, static_cast<std::size_t>(std::min<std::uint64_t>(chunk, n.size - p))));
             };
@@ -718,6 +819,8 @@ struct EsmDocument::Impl
 };
 
 EsmDocument::EsmDocument(const std::filesystem::path& path) : mImpl(std::make_unique<Impl>(path)) {}
+EsmDocument::EsmDocument(const std::filesystem::path& path, std::optional<std::uint32_t> worldFormId)
+    : mImpl(std::make_unique<Impl>(path, worldFormId && *worldFormId ? worldFormId : std::nullopt)) {}
 EsmDocument::~EsmDocument() = default;
 EsmDocument::EsmDocument(EsmDocument&&) noexcept = default;
 EsmDocument& EsmDocument::operator=(EsmDocument&&) noexcept = default;
@@ -727,8 +830,17 @@ std::span<const std::string> EsmDocument::masters() const noexcept { return mImp
 std::uint32_t EsmDocument::nextFormId() const noexcept { return mImpl->next; }
 bool EsmDocument::isDemOverlay() const noexcept { return mImpl->dem; }
 bool EsmDocument::isOpenF4Owned() const noexcept { return mImpl->owned; }
+bool EsmDocument::isLocalized() const noexcept { return mImpl->localized; }
+bool EsmDocument::containsRecord(std::uint32_t formId) const noexcept { return mImpl->records.contains(formId); }
+bool EsmDocument::hasWorldRecord() const noexcept
+{
+    const auto found = mImpl->records.find(mImpl->world);
+    return found != mImpl->records.end() && found->second->type == cc("WRLD");
+}
+void EsmDocument::setWorldSource(ESMRecordSource value) { mImpl->worldSource = std::move(value); }
 const std::vector<ESMModel>& EsmDocument::models() const noexcept { return mImpl->modelList; }
 const std::vector<ESMReference>& EsmDocument::references() const noexcept { return mImpl->refList; }
+const std::vector<ESMActorBase>& EsmDocument::actorBases() const noexcept { return mImpl->actorList; }
 const std::map<CellCoord, ESMTerrainCell>& EsmDocument::terrainCells() const noexcept { return mImpl->cells; }
 std::optional<ESMTerrainCell> EsmDocument::terrainCell(CellCoord coord) const
 {
@@ -758,25 +870,44 @@ void EsmDocument::replaceTerrainCells(std::span<const ESMTerrainCell> values)
     for (const auto& c : values) mImpl->changedTerrain[c.landscape.cell] = c;
 }
 void EsmDocument::setPath(std::filesystem::path path) { mImpl->destination = std::filesystem::absolute(path); }
-void EsmDocument::save() { mImpl->save(); mImpl = std::make_unique<Impl>(mImpl->destination); }
+void EsmDocument::save()
+{
+    mImpl->save();
+    auto preset = mImpl->presetWorld; auto origin = mImpl->worldSource;
+    mImpl = std::make_unique<Impl>(mImpl->destination, preset); mImpl->worldSource = std::move(origin);
+}
 
 ESMMasterStack loadEsmMasterStack(const std::filesystem::path& path, std::optional<std::filesystem::path> dataDirectory)
 {
-    EsmDocument selected(path); ESMMasterStack result; result.worldFormId = selected.worldFormId(); result.basePath = path;
-    if (selected.isOpenF4Owned() && !selected.isDemOverlay() && !selected.masters().empty()
+    ESMStackOptions options; options.dataDirectory = std::move(dataDirectory);
+    return loadEsmMasterStack(path, options);
+}
+
+ESMMasterStack loadEsmMasterStack(const std::filesystem::path& path, const ESMStackOptions& options)
+{
+    const auto& dataDirectory = options.dataDirectory;
+    EsmDocument selected(path, options.worldFormId); ESMMasterStack result; result.worldFormId = selected.worldFormId(); result.basePath = path;
+    const auto locate = [&](const std::string& name) {
+        for (const auto& file : options.resolvedFiles) if (folded(file.filename().string()) == folded(name)) return file;
+        auto candidate = path.parent_path() / std::filesystem::u8path(name);
+        if (!std::filesystem::exists(candidate) && dataDirectory) candidate = *dataDirectory / std::filesystem::u8path(name);
+        return candidate;
+    };
+    if ((selected.isOpenF4Owned() || options.directPlugin) && !selected.isDemOverlay() && !selected.masters().empty()
         && (selected.worldFormId() >> 24) < selected.masters().size())
     {
-        auto candidate = path.parent_path() / selected.masters().back();
-        if (!std::filesystem::exists(candidate) && dataDirectory) candidate = *dataDirectory / selected.masters().back();
+        // The base is the master that owns the world FormID (historically the last master).
+        auto candidate = locate(selected.masters()[selected.worldFormId() >> 24]);
         if (std::filesystem::exists(candidate)) result.basePath = candidate;
     }
     std::map<std::uint32_t, ESMModel> models; std::map<std::uint32_t, ESMReference> refs;
+    std::map<std::uint32_t, ESMActorBase> actors;
     std::vector<std::string> canonical(selected.masters().begin(), selected.masters().end());
     canonical.push_back(path.filename().string());
+    result.canonicalNames = canonical;
     for (std::size_t fileIndex = 0; fileIndex < canonical.size(); ++fileIndex)
     {
-        auto source = fileIndex + 1 == canonical.size() ? path : path.parent_path() / canonical[fileIndex];
-        if (!std::filesystem::exists(source) && dataDirectory) source = *dataDirectory / canonical[fileIndex];
+        auto source = fileIndex + 1 == canonical.size() ? path : locate(canonical[fileIndex]);
         // Base Fallout assets are optional for synthetic OpenF4 fixtures. Terrain shards
         // contain no STAT/REFR, and must not be scanned to display a project overlay.
         if (!std::filesystem::exists(source))
@@ -786,9 +917,39 @@ ESMMasterStack loadEsmMasterStack(const std::filesystem::path& path, std::option
         }
         const auto name = folded(canonical[fileIndex]);
         if (name.find(".terrain.r") != std::string::npos) continue;
-        if (selected.isOpenF4Owned() && selected.worldFormId() != 0x3Cu && name == "fallout4.esm") continue;
+        // OpenF4-authored worlds skip the huge base master unless they edit a world it owns.
+        const auto worldSlot = selected.worldFormId() >> 24;
+        const bool worldInFallout4 = selected.worldFormId() && worldSlot + 1 < canonical.size()
+            && folded(canonical[worldSlot]) == "fallout4.esm";
+        if (selected.isOpenF4Owned() && name == "fallout4.esm" && !worldInFallout4) continue;
         result.sourcePaths.push_back(std::filesystem::absolute(source).lexically_normal());
-        EsmDocument document(source);
+        // Index the selected world in each file's own FormID space.
+        std::optional<std::uint32_t> localWorld;
+        if (options.worldFormId && *options.worldFormId)
+        {
+            if (fileIndex + 1 == canonical.size()) localWorld = options.worldFormId;
+            else
+            {
+                const auto owner = folded(canonical[*options.worldFormId >> 24]);
+                std::vector<std::string> fileMasters;
+                {
+                    // Header-only read: master names decide the local slot.
+                    std::ifstream file(source, std::ios::binary);
+                    Bytes header(24); file.read(reinterpret_cast<char*>(header.data()), 24);
+                    if (!file || read<std::uint32_t>(header, 0) != cc("TES4")) throw std::runtime_error("Invalid master: " + source.string());
+                    Bytes payload(read<std::uint32_t>(header, 4)); file.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+                    if (!file) throw std::runtime_error("Truncated master header: " + source.string());
+                    for (const auto& s : subs(payload)) if (s.type == cc("MAST")) fileMasters.push_back(string(s.bytes));
+                }
+                std::optional<std::uint32_t> slot;
+                for (std::size_t i = 0; i < fileMasters.size(); ++i) if (folded(fileMasters[i]) == owner) slot = static_cast<std::uint32_t>(i);
+                if (folded(source.filename().string()) == owner) slot = static_cast<std::uint32_t>(fileMasters.size());
+                // A file that cannot name the world's owner cannot contain its records; any
+                // unused ID keeps its references out of this world.
+                localWorld = slot ? ((*slot << 24) | (*options.worldFormId & 0xFFFFFFu)) : 0xFFFFFFFFu;
+            }
+        }
+        EsmDocument document(source, localWorld);
         auto remap = [&](std::uint32_t form) {
             if (!form) return form;
             const auto local = form >> 24; std::string owner;
@@ -815,6 +976,14 @@ ESMMasterStack loadEsmMasterStack(const std::filesystem::path& path, std::option
             }
             models[m.formId] = std::move(m);
         }
+        for (auto a : document.actorBases())
+        {
+            a.formId = remap(a.formId);
+            // A malformed race slot only loses the label; it must not block loading.
+            try { a.race = remap(a.race); } catch (const std::exception&) { a.race = 0; }
+            actors[a.formId] = std::move(a);
+        }
+        if (localWorld && *localWorld == 0xFFFFFFFFu) continue;
         if (remap(document.worldFormId()) != result.worldFormId) continue;
         for (auto r : document.references())
         {
@@ -822,12 +991,16 @@ ESMMasterStack loadEsmMasterStack(const std::filesystem::path& path, std::option
             r.placement.baseObject = remap(r.placement.baseObject); r.placement.materialSwap = remap(r.placement.materialSwap);
             r.ownerCellFormId = remap(r.ownerCellFormId);
             remapPapyrusBindings(r.scripts, remap);
+            if (fileIndex + 1 == canonical.size())
+                if (const auto prior = refs.find(r.placement.formId); prior != refs.end())
+                    result.shadowedReferences.push_back(prior->second);
             if (r.deleted) refs.erase(r.placement.formId);
             else refs[r.placement.formId] = std::move(r);
         }
     }
     for (auto& [id, m] : models) result.models.push_back(std::move(m));
     for (auto& [id, r] : refs) result.references.push_back(std::move(r));
+    for (auto& [id, a] : actors) result.actorBases.push_back(std::move(a));
     return result;
 }
 

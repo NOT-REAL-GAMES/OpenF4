@@ -41,7 +41,11 @@ namespace openf4::render
         std::uint32_t triangleCount = 0;
         glm::vec4 sphere{};
         std::uint32_t materialIndex = 0;
-        std::uint32_t padding[3]{};
+        // Normal cone for back-face meshlet culling: packSnorm4x8(outward axis xyz, sine of the
+        // cone half-angle) in mesh space; coneFlags bit 0 marks it valid.
+        std::uint32_t cone = 0;
+        std::uint32_t coneFlags = 0;
+        std::uint32_t padding = 0;
     };
 
     struct PackedMesh

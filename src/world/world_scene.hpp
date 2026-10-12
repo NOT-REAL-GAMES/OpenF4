@@ -50,6 +50,10 @@ namespace openf4::world
         inline constexpr float demHorizonFadeStart = 80.0f * 4096.0f;
         inline constexpr float demHorizonFadeEnd = 92.0f * 4096.0f;
 
+        // Camera-relative horizontal band (world units) over which ObjectScene full-detail
+        // references dissolve out and the distant object LOD standing in for them dissolves
+        // in (cells 3..4). nullopt when OPENF4_OBJECT_FADE=0.
+        [[nodiscard]] std::optional<glm::vec2> objectFadeBand() noexcept;
         [[nodiscard]] std::optional<assets::CellCoord> demBtrOrigin(
             const std::filesystem::path& path);
         [[nodiscard]] bool preferDemBtr(const std::filesystem::path& candidate,
@@ -86,6 +90,11 @@ namespace openf4::world
             const DemLodSelection& previous, bool landReady = true);
         [[nodiscard]] std::set<assets::CellCoord> demTerrainCoverage(
             const render::PackedMesh& mesh, assets::LodTerrainTile tile);
+
+        // Prototype actor stand-in: ACHR references render this capsule (engine Y-up model
+        // space, 128 units tall, nose toward the Bethesda +Y facing) instead of a skeleton.
+        inline constexpr std::string_view actorPlaceholderModel = "openf4:actor-placeholder";
+        [[nodiscard]] assets::ModelGeometry actorPlaceholderGeometry();
 
         [[nodiscard]] inline glm::vec4 demWaterLodRange() noexcept
         {
@@ -173,7 +182,15 @@ namespace openf4::world
             const std::map<std::uint32_t, std::string>& models,
             const std::unordered_map<std::uint32_t, std::filesystem::path>& modelSources,
             const glm::dvec3& cameraPosition,
-            std::span<const std::uint32_t> hiddenForms = {});
+            std::span<const std::uint32_t> hiddenForms = {},
+            std::uint64_t layoutRevision = 0, std::uint64_t contentRevision = 0);
+        // layoutRevision: nonzero while references (order, cells, bases), models, sources and
+        // hiddenForms are unchanged, so the cell index/key caches are reused across frames.
+        // Placements in an unchanged layout may still move (gizmo drags): they are re-read
+        // every frame. 0 rebuilds every call.
+        // contentRevision: nonzero and unchanged only while every placement (transform, base,
+        // visibility) is unchanged; then a frame with the same camera cell and no newly
+        // installed model skips the per-reference walk entirely. 0 re-reads every frame.
         [[nodiscard]] std::optional<glm::vec4> bounds(std::uint32_t formId) const;
         // Picking and bounds use absolute engine coordinates, without camera reflection.
         [[nodiscard]] std::optional<ObjectPick> pick(const glm::dvec3& origin,
@@ -184,6 +201,11 @@ namespace openf4::world
         [[nodiscard]] std::optional<std::uint32_t> rendererInstance(std::uint32_t formId) const;
         [[nodiscard]] std::size_t pending() const noexcept;
         [[nodiscard]] std::size_t loaded() const noexcept;
+        // Cells whose full-detail references are all drawn (no model still loading or failed in
+        // the cell or its in-window neighbours), inside the 9x9 window around the camera. Only
+        // these may hand off from distant object LOD; the revision changes after every walk.
+        [[nodiscard]] std::vector<assets::CellCoord> coveredCells() const;
+        [[nodiscard]] std::uint64_t coverageRevision() const noexcept;
         [[nodiscard]] const std::vector<std::string>& diagnostics() const noexcept;
         void refreshDerivedLod(render::VulkanRenderer& renderer,
             std::span<const std::filesystem::path> publishedPaths);
@@ -207,7 +229,10 @@ namespace openf4::world
             std::optional<assets::CellCoord> requestedCenter = std::nullopt, int cellRadius = 1,
             bool includeObjects = true,
             std::size_t maxObjects = std::numeric_limits<std::size_t>::max(),
-            std::optional<std::filesystem::path> masterPath = std::nullopt);
+            std::optional<std::filesystem::path> masterPath = std::nullopt,
+            // FormID of the WRLD to stream, in masterPath's own FormID space; nullopt keeps
+            // the historical choice (Commonwealth for Fallout4.esm, else the first WRLD).
+            std::optional<std::uint32_t> worldFormId = std::nullopt);
         ~WorldStreamer();
         WorldStreamer(WorldStreamer&&) noexcept;
         WorldStreamer& operator=(WorldStreamer&&) noexcept;
@@ -220,6 +245,15 @@ namespace openf4::world
             bool spawnPhysicsSample = false);
         void update(render::VulkanRenderer& renderer, const glm::dvec3& playerPosition);
         [[nodiscard]] bool streamNext(render::VulkanRenderer& renderer);
+        // Call once after the initial scene is installed when an ObjectScene draws the
+        // full-detail references (includeObjects == false): BTO and reference LOD then stay
+        // hidden near the camera and dissolve in where those objects dissolve out.
+        void fadeObjectLodIntoExternalObjects(render::VulkanRenderer& renderer);
+        // Per frame (cheap when the revision is unchanged): object LOD of a cell only hides near
+        // the camera once the ObjectScene reports that cell covered; until then (model still
+        // loading or failed) it stays fully visible so nothing ever goes missing.
+        void syncExternalObjectCoverage(render::VulkanRenderer& renderer,
+            std::span<const assets::CellCoord> coveredCells, std::uint64_t revision);
         [[nodiscard]] std::size_t streamedObjects() const noexcept;
         [[nodiscard]] std::size_t pendingObjects() const noexcept;
         [[nodiscard]] bool collisionReady(assets::CellCoord cell) const;

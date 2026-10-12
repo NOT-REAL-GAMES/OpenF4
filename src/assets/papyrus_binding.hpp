@@ -11,6 +11,9 @@
 
 namespace openf4::assets
 {
+    // Script that MSTT "Start Awake" attaches; FO4 keeps ESP-loaded rigid bodies asleep otherwise.
+    inline constexpr std::string_view wakeOnLoadScriptName = "OpenF4WakeOnLoad";
+
     struct PapyrusObject
     {
         std::uint32_t formId = 0;
@@ -54,6 +57,13 @@ namespace openf4::assets
         const std::function<std::uint32_t(std::uint32_t)>& remap);
     [[nodiscard]] std::vector<PapyrusScript> effectivePapyrusScripts(
         const PapyrusBindings& base, const PapyrusBindings& reference);
+    // True when the named script survives base/reference layering (case-insensitive).
+    [[nodiscard]] bool papyrusScriptActive(const PapyrusBindings& base,
+        const PapyrusBindings& reference, std::string_view name);
+    // Enables or disables one script on a local layer, leaving every other attachment untouched.
+    // Inherited scripts are disabled with a flag-2 marker and restored by dropping that marker.
+    void setPapyrusScriptActive(PapyrusBindings& local, const PapyrusBindings& inherited,
+        std::string_view name, bool active);
     [[nodiscard]] std::string papyrusScriptPath(std::string_view name,
         std::string_view extension = ".pex");
 }

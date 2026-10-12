@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -112,7 +113,7 @@ namespace
         {
             for (const auto& record : records.references)
             {
-                if (record.deleted) continue;
+                if (record.deleted || record.disabled) continue;
                 const auto model = std::ranges::find(records.models, record.placement.baseObject,
                     &openf4::assets::ESMModel::formId);
                 if (model == records.models.end())
@@ -384,7 +385,9 @@ try
     bool landOnly = false;
     bool physicsSample = false;
     bool editorConflict = false;
-    int worldRadius = 1;
+    // Full-detail cell radius: 2 matches vanilla uGridsToLoad=5. Radius 1 put object LOD one
+    // cell from the camera. --radius overrides.
+    int worldRadius = 2;
     std::size_t maxObjects = std::numeric_limits<std::size_t>::max();
     std::optional<std::string> requestedModel;
     std::optional<openf4::assets::CellCoord> requestedCell;
@@ -416,6 +419,18 @@ try
             demImportPath = argv[++index];
             for (auto& source : demSources)
                 source = argv[++index];
+        }
+        else if (std::string_view(argv[index]) == "--memory-preset")
+        {
+            // Total GPU budget for scene buffers + textures combined:
+            // ultralow (1 GiB) | low (2 GiB) | medium (4 GiB) | veryhigh (1/3 VRAM, max 12 GiB)
+            if (++index >= argc)
+                throw std::runtime_error("--memory-preset expects ultralow, low, medium or veryhigh");
+#ifdef _WIN32
+            _putenv_s("OPENF4_MEMORY_PRESET", argv[index]);
+#else
+            setenv("OPENF4_MEMORY_PRESET", argv[index], 1);
+#endif
         }
         else if (std::string_view(argv[index]) == "--benchmark")
         {
@@ -729,6 +744,9 @@ try
             initialTarget = *target;
             initialPosition = initialTarget + glm::vec3(500.0f, 320.0f, 500.0f);
         }
+        // Project references are drawn by projectObjects; vanilla object LOD hands off to them.
+        if (projectObjects)
+            worldStreamer->fadeObjectLodIntoExternalObjects(*renderer);
     }
     if (projectObjects && !landscapeEditing)
     {
@@ -834,6 +852,20 @@ try
     benchmarkFrameTimes.reserve(static_cast<std::size_t>(benchmarkFrames));
     benchmarkStreamTimes.reserve(static_cast<std::size_t>(benchmarkFrames));
     const int cellCrossFrame = benchmarkFrames > 180 ? benchmarkFrames - 60 : 60;
+    // OPENF4_FLY="speed[,warmupFrames]": after warmup, fly horizontally along the initial heading
+    // at speed units/s (reproducible cell crossings). Frames over 8 ms are broken down on stdout
+    // and a percentile summary is printed for the flight.
+    double flySpeed = 0.0;
+    int flyWarmup = 0;
+    if (const char* fly = std::getenv("OPENF4_FLY"); fly && *fly)
+    {
+        double warmup = 0.0;
+        if (std::sscanf(fly, "%lf,%lf", &flySpeed, &warmup) < 1)
+            throw std::runtime_error("OPENF4_FLY expects speed[,warmupFrames]");
+        flyWarmup = static_cast<int>(std::max(0.0, warmup));
+    }
+    std::vector<float> flyFrames;
+    double flyUpdateMs = 0.0, flyStreamMs = 0.0;
 
     while (running)
     {
@@ -917,6 +949,8 @@ try
         position += glm::dvec3(right) * static_cast<double>(speed)
             * static_cast<double>(keys[SDL_SCANCODE_D] - keys[SDL_SCANCODE_A]);
         position.y += speed * static_cast<float>(keys[SDL_SCANCODE_SPACE] - keys[SDL_SCANCODE_C]);
+        if (flySpeed != 0.0 && renderedFrames >= flyWarmup)
+            position += glm::dvec3(std::sin(yaw), 0.0, std::cos(yaw)) * (flySpeed * delta);
 
         const auto streamStart = std::chrono::steady_clock::now();
         if (physicsWorld && physicsRunning && !projectObjects)
@@ -925,10 +959,23 @@ try
             landscapeEditor->update(*renderer, position, forward, delta, editorSculpting);
         if (projectObjects)
             projectObjects->update(*renderer, projectReferences, projectModels,
-                projectModelSources, position);
+                projectModelSources, position, {}, 1);  // project references are fixed after load
+        if (projectObjects && worldStreamer)
+            worldStreamer->syncExternalObjectCoverage(*renderer, projectObjects->coveredCells(),
+                projectObjects->coverageRevision());
         if (worldStreamer)
         {
+            const auto updateStart = std::chrono::steady_clock::now();
             worldStreamer->update(*renderer, position);
+            const auto updateEnd = std::chrono::steady_clock::now();
+            flyUpdateMs = std::chrono::duration<double, std::milli>(updateEnd - updateStart).count();
+            flyStreamMs = 0.0;
+            struct StreamTimer
+            {
+                std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+                double& out;
+                ~StreamTimer() { out = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); }
+            } streamTimer{std::chrono::steady_clock::now(), flyStreamMs};
             if (renderedFrames > 0 && worldStreamer->pendingObjects() > 0)
             {
                 constexpr std::size_t maxStreamItemsPerFrame = 256;
@@ -984,6 +1031,40 @@ try
                     std::chrono::steady_clock::now() - frameStart).count());
             benchmarkStreamTimes.push_back(
                 std::chrono::duration<double, std::milli>(streamEnd - streamStart).count());
+        }
+        if (flySpeed != 0.0 && renderedFrames >= flyWarmup)
+        {
+            const double frameMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - frameStart).count();
+            flyFrames.push_back(static_cast<float>(frameMs));
+            if (frameMs >= 8.0)
+            {
+                const auto& stats = renderer->stats();
+                std::printf("  hitch frame %d: %.2f ms | stream update %.2f, streamNext %.2f, other %.2f | %zu pending"
+                    " | addTexture %.2f, upload record %.2f (grow %.2f, bind %.2f, pool stall %.2f, %.2f MiB tex), %u textures streaming"
+                    " | fence wait %.2f, retire %.2f, submit wait %.2f (thread %.2f), renderer CPU %.2f\n",
+                    renderedFrames, frameMs, flyUpdateMs, flyStreamMs, frameMs - flyUpdateMs - flyStreamMs,
+                    worldStreamer ? worldStreamer->pendingObjects() : std::size_t{0},
+                    stats.textureCreateMs, stats.streamUploadMs, stats.uploadGrowMs, stats.sparseBindMs,
+                    stats.sparsePoolStallMs,
+                    static_cast<double>(stats.textureUploadBytes) / (1024.0 * 1024.0), stats.streamingTextures,
+                    stats.frameWaitMs, stats.retireMs, stats.submitWaitMs, stats.submitThreadMs, stats.cpuFrameMs);
+            }
+        }
+        else if (benchmarkFrames > 0 && renderedFrames > 0)
+        {
+            // Non-fly benchmarks (e.g. --cell-cross-test): break down every frame over 16 ms.
+            const double frameMs = benchmarkFrameTimes.back();
+            if (frameMs >= 16.0)
+            {
+                const auto& stats = renderer->stats();
+                std::printf("  hitch frame %d: %.2f ms | streaming CPU %.2f | addTexture %.2f, upload record %.2f"
+                    " (grow %.2f, bind %.2f, pool stall %.2f, %.2f MiB tex), renderer CPU %.2f (fence wait %.2f, retire %.2f),"
+                    " %u textures streaming\n",
+                    renderedFrames, frameMs, benchmarkStreamTimes.back(), stats.textureCreateMs,
+                    stats.streamUploadMs, stats.uploadGrowMs, stats.sparseBindMs, stats.sparsePoolStallMs, static_cast<double>(stats.textureUploadBytes) / (1024.0 * 1024.0),
+                    stats.cpuFrameMs, stats.frameWaitMs, stats.retireMs, stats.streamingTextures);
+            }
         }
         ++renderedFrames;
         if (cellCrossTest && renderedFrames == cellCrossFrame)
@@ -1044,6 +1125,23 @@ try
                   << " ms whole frame, " << benchmarkStreamTimes[cellCrossFrame]
                   << " ms streaming CPU\n";
     }
+    if (!flyFrames.empty())
+    {
+        std::ranges::sort(flyFrames);
+        double sum = 0.0;
+        std::size_t over8 = 0, over16 = 0, over33 = 0;
+        for (const float value : flyFrames)
+        {
+            sum += value;
+            over8 += value > 8.33f; over16 += value > 16.67f; over33 += value > 33.3f;
+        }
+        const auto at = [&](double q) {
+            return flyFrames[std::min(flyFrames.size() - 1, static_cast<std::size_t>(q * double(flyFrames.size())))];
+        };
+        std::printf("Fly summary (%zu frames): avg %.2f p50 %.2f p95 %.2f p99 %.2f p99.9 %.2f max %.2f ms | "
+            ">8.3ms %zu, >16.7ms %zu, >33ms %zu\n", flyFrames.size(), sum / double(flyFrames.size()), at(0.5),
+            at(0.95), at(0.99), at(0.999), flyFrames.back(), over8, over16, over33);
+    }
     reportTimings("Whole frame", std::move(benchmarkFrameTimes));
     reportTimings("Streaming CPU", std::move(benchmarkStreamTimes));
     std::cout << "Final CPU frame: " << finalStats.cpuFrameMs << " ms\n"
@@ -1055,7 +1153,20 @@ try
               << "Texture memory: "
               << finalStats.textureResidentBytes / (1024.0 * 1024.0) << " / "
               << finalStats.textureVirtualBytes / (1024.0 * 1024.0)
-              << " MiB resident / virtual\n";
+              << " MiB resident / virtual\n"
+              << "Memory preset " << finalStats.memoryPreset << ": "
+              << finalStats.memoryBudgetBytes / (1024.0 * 1024.0) << " MiB total | scene "
+              << finalStats.sceneUsedBytes / (1024.0 * 1024.0) << " used (peak "
+              << finalStats.scenePeakUsedBytes / (1024.0 * 1024.0) << ") / "
+              << finalStats.sceneAllocatedBytes / (1024.0 * 1024.0) << " allocated, max "
+              << finalStats.sceneCapBytes / (1024.0 * 1024.0) << " MiB, " << finalStats.sceneCapRejects
+              << " rejected appends | textures peak "
+              << finalStats.texturePeakResidentBytes / (1024.0 * 1024.0) << " / budget "
+              << finalStats.textureBudgetBytes / (1024.0 * 1024.0) << " MiB (min "
+              << finalStats.textureBudgetMinBytes / (1024.0 * 1024.0) << "), mip bias "
+              << finalStats.textureMipBias << ", " << finalStats.textureEvictions << " mip unloads, "
+              << finalStats.textureBudgetDeferrals << " budget deferrals | residency pass "
+              << finalStats.residencyMs << " ms\n";
     renderer.reset();
     SDL_DestroyWindow(window);
     return compatibility && !compatibility->passed ? 1 : 0;

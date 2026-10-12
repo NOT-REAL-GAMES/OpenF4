@@ -215,6 +215,8 @@ namespace openf4::physics
         }
     }
 
+    void ensureJoltRuntime() { (void)runtime(); }
+
     JPH::ShapeRefC makeJoltConvexHull(const assets::HavokConvexPolytope& polytope)
     {
         (void)runtime();

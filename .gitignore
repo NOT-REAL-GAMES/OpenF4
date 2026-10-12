@@ -3,3 +3,4 @@
 /out/
 *.user
 /imgui.ini
+/build-mingw

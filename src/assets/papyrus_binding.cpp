@@ -188,4 +188,28 @@ std::vector<PapyrusScript> effectivePapyrusScripts(const PapyrusBindings& base, 
     for (auto& script : scripts) std::erase_if(script.properties, [](const auto& p) { return p.flags == 3; });
     return scripts;
 }
+
+bool papyrusScriptActive(const PapyrusBindings& base, const PapyrusBindings& reference, std::string_view name)
+{
+    const auto key = lower(std::string(name));
+    return std::ranges::any_of(effectivePapyrusScripts(base, reference), [&](const auto& s) { return lower(s.name) == key; });
+}
+
+void setPapyrusScriptActive(PapyrusBindings& local, const PapyrusBindings& inherited, std::string_view name, bool active)
+{
+    if (!local.editable || !inherited.editable) throw std::runtime_error("Unsupported VMAD is read-only");
+    if (name.empty()) throw std::runtime_error("Script name is empty");
+    const auto key = lower(std::string(name));
+    const bool fromBase = papyrusScriptActive(inherited, {}, name);
+    const auto matches = [&](const PapyrusScript& s) { return lower(s.name) == key; };
+    auto found = std::ranges::find_if(local.scripts, matches);
+    if (!active)
+    {
+        std::erase_if(local.scripts, matches);
+        if (fromBase) local.scripts.push_back({std::string(name), 2, {}});
+    }
+    else if (found == local.scripts.end()) { if (!fromBase) local.scripts.push_back({std::string(name), 0, {}}); }
+    else if (fromBase && found->properties.empty()) local.scripts.erase(found);
+    else found->flags = std::uint8_t(found->flags & 0xFDu);
+}
 }

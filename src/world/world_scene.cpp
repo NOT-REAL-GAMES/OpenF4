@@ -20,8 +20,12 @@
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <chrono>
 #include <deque>
+#include <execution>
 #include <future>
 #include <fstream>
 #include <iostream>
@@ -65,6 +69,16 @@ namespace openf4::world
             "billboard", "impostor", "treelod", "_bb.nif", "_flat.nif", "flat_", "decal"};
         return std::ranges::none_of(blocked,
             [&](std::string_view blockedPart) { return value.find(blockedPart) != std::string::npos; });
+    }
+
+    std::optional<glm::vec2> detail::objectFadeBand() noexcept
+    {
+        static const bool enabled = [] {
+            const char* value = std::getenv("OPENF4_OBJECT_FADE");
+            return !(value && value[0] == '0');
+        }();
+        if (!enabled) return std::nullopt;
+        return glm::vec2(3.0f * 4096.0f, 4.0f * 4096.0f);
     }
 
     std::optional<assets::CellCoord> detail::demBtrOrigin(
@@ -1839,6 +1853,21 @@ namespace openf4::world
         std::set<ReferenceKey> queuedReferences;
         std::set<std::uint64_t> queuedPhysicsReferences;
         std::set<ReferenceKey> rejectedReferences;
+        // Cells whose full (bit 0) / LOD (bit 1) references are all loaded or rejected. Neither set
+        // ever shrinks, so a settled cell is never rescanned by queueDesiredReferences.
+        std::map<assets::CellCoord, std::uint8_t> settledReferenceCells;
+        // Per cell and kind (0 full, 1 LOD): reference indices not yet loaded/rejected, built on
+        // the cell's first scan and only filtered afterwards, so rescans touch shrinking lists.
+        struct PendingCellReferences
+        {
+            std::array<std::vector<std::uint32_t>, 2> remaining;
+            std::array<bool, 2> built{};
+        };
+        std::map<assets::CellCoord, PendingCellReferences> pendingCellReferences;
+        // hasModelPath() per (base object, lod): modelPath() builds strings and probes the archive
+        // index, and desired() asks it for every LOD reference on every scan/prune.
+        mutable std::mutex modelPathCacheMutex;
+        mutable std::unordered_map<std::uint64_t, bool> modelPathCache;
         std::set<assets::CellCoord> completedBtoHandoffs;
         std::set<assets::CellCoord> terrainPhysicsCells;
         std::map<assets::CellCoord, std::vector<std::uint32_t>> btoPartsByReplacementCell;
@@ -1851,8 +1880,58 @@ namespace openf4::world
         assets::CellCoord centerCell{};
         assets::CellCoord physicsOriginCell{};
         glm::dvec2 streamPosition{};
+        // Set when an ObjectScene draws the full-detail references (editor, project runtime):
+        // this streamer then loads no full objects of its own, so the BTO/reference-LOD
+        // replacement handshake never completes and the LOD would stay on under every full
+        // model. Instead the LOD dissolves in over the ObjectScene fade-out band.
+        std::optional<glm::vec4> externalObjectLodRange;
+        // Cells the ObjectScene reports fully drawn. Only their LOD takes externalObjectLodRange
+        // (hidden inside the fade band); every other cell keeps its LOD fully visible.
+        std::set<assets::CellCoord> externallyCoveredCells;
+        std::uint64_t externalCoverageRevision = 0;
         int fullRadius = 1;
         int lodRadius = 5;
+
+        // Vanilla runtime (this streamer owns the full objects): instead of popping a cell's
+        // object LOD off the moment its full models are loaded, full detail dissolves out and
+        // that cell's BTO LOD dissolves in over one band just inside the full-cell window, so
+        // the handoff is a soft radial blend around the camera rather than per-cell holes and
+        // LOD blocks right next to the player. OPENF4_OBJECT_FADE=0 restores the hard swap.
+        bool ownObjectFade() const noexcept
+        {
+            return includeObjects && !externalObjectLodRange && fullRadius > 0
+                && detail::objectFadeBand().has_value();
+        }
+
+        // Ends at the nearest full-window edge (fullRadius cells from a camera anywhere in the
+        // centre cell), so full objects never reach the cell-aligned window border.
+        glm::vec2 ownObjectFadeBand() const noexcept
+        {
+            const float end = static_cast<float>(fullRadius) * cellSize;
+            return {std::max(end - 0.75f * cellSize, 0.25f * cellSize), end};
+        }
+
+        glm::vec4 fullObjectLodRange() const noexcept
+        {
+            if (!ownObjectFade())
+                return render::SceneInstance{}.lodRange;
+            const auto band = ownObjectFadeBand();
+            return {0.0f, 0.0f, band.x, band.y};
+        }
+
+        // A BTO part whose full replacement is drawn fades in over the band; others stay solid.
+        glm::vec4 btoLodRange(bool replaced) const noexcept
+        {
+            const auto solid = render::SceneInstance{}.lodRange;
+            if (!replaced || !ownObjectFade())
+                return solid;
+            const auto band = ownObjectFadeBand();
+            return {band.x, band.y, solid.z, solid.w};
+        }
+        // Set by update() on the frame the centre cell changes. That frame already pays for the
+        // cell entry (re-queueing, activation, physics sync), so streamNext only keeps the worker
+        // pool fed and leaves model/terrain installs (GPU appends, materials) to later frames.
+        bool crossedThisFrame = false;
         std::size_t maxObjects = std::numeric_limits<std::size_t>::max();
         std::size_t workerCount = 2;
         std::size_t loadedObjects = 0;
@@ -1863,11 +1942,14 @@ namespace openf4::world
         Impl(const std::filesystem::path& dataDirectory,
             std::optional<assets::CellCoord> requestedCenter, int cellRadius,
             bool loadObjects, std::size_t objectLimit,
-            const std::optional<std::filesystem::path>& masterPath)
+            const std::optional<std::filesystem::path>& masterPath,
+            std::optional<std::uint32_t> worldFormId = std::nullopt)
             // ponytail: positional ESM loading reads that file directly. Merge its MAST
             // dependency graph when inherited records are needed for standalone mod loading.
-            : world(masterPath ? assets::loadExteriorWorld(*masterPath)
-                               : assets::loadCommonwealth(dataDirectory / "Fallout4.esm"))
+            : world(masterPath ? (worldFormId ? assets::loadExteriorWorld(*masterPath, *worldFormId)
+                                              : assets::loadExteriorWorld(*masterPath))
+                               : worldFormId ? assets::loadExteriorWorld(dataDirectory / "Fallout4.esm", *worldFormId)
+                                             : assets::loadCommonwealth(dataDirectory / "Fallout4.esm"))
             , archives(dataDirectory, masterPath.value_or(dataDirectory / "Fallout4.esm"))
             , materials(archives, initial)
             , fullRadius(cellRadius)
@@ -3115,8 +3197,25 @@ namespace openf4::world
         {
             return request.lod ? lodCell(request.reference.cell)
                     && !commonwealthObjectsCover(request.reference.cell)
-                    && modelPath(request).has_value()
+                    && hasModelPath(request.reference.baseObject, true)
                                : fullPrefetchCell(request.reference.cell);
+        }
+
+        bool hasModelPath(std::uint32_t baseObject, bool lod) const
+        {
+            const std::uint64_t key = (static_cast<std::uint64_t>(baseObject) << 1) | (lod ? 1u : 0u);
+            {
+                std::scoped_lock lock(modelPathCacheMutex);
+                if (const auto found = modelPathCache.find(key); found != modelPathCache.end())
+                    return found->second;
+            }
+            ReferenceRequest probe;
+            probe.reference.baseObject = baseObject;
+            probe.lod = lod;
+            const bool present = modelPath(probe).has_value();
+            std::scoped_lock lock(modelPathCacheMutex);
+            modelPathCache.emplace(key, present);
+            return present;
         }
 
         ReferenceKey referenceKey(const ReferenceRequest& request) const
@@ -3208,31 +3307,105 @@ namespace openf4::world
             if (queuedReferences.size() >= queueTarget)
                 return;
             const std::size_t available = queueTarget - queuedReferences.size();
-            std::vector<ReferenceRequest> candidates;
-            for (int y = centerCell.y - lodRadius; y <= centerCell.y + lodRadius; ++y)
+            // Used to rebuild a full ReferenceRequest (and probe the archive for a LOD path) for
+            // every reference in the 11x11 LOD window on each call: 80-300 ms on Commonwealth,
+            // once per cell crossing and again whenever the queues drained. Now settled cells are
+            // skipped, unsettled cells are filtered in parallel (read-only), and only the chosen
+            // few thousand requests are materialized.
+            struct Candidate
             {
+                std::uint32_t index = 0;
+                bool lod = false;
+            };
+            struct CellScan
+            {
+                assets::CellCoord cell{};
+                const std::vector<std::size_t>* references = nullptr;
+                PendingCellReferences* pending = nullptr;
+                std::uint8_t wanted = 0;  // bit 0 full, bit 1 LOD
+                std::uint8_t settled = 0;
+                std::vector<Candidate> candidates;
+            };
+            std::vector<CellScan> scans;
+            for (int y = centerCell.y - lodRadius; y <= centerCell.y + lodRadius; ++y)
                 for (int x = centerCell.x - lodRadius; x <= centerCell.x + lodRadius; ++x)
                 {
-                    const auto found = referencesByCell.find({x, y});
+                    const assets::CellCoord cell{x, y};
+                    const auto found = referencesByCell.find(cell);
                     if (found == referencesByCell.end())
                         continue;
-                    for (const std::size_t index : found->second)
-                    {
-                        const auto& reference = world.references[index];
-                        for (const bool lod : {false, true})
-                        {
-                            ReferenceRequest request{reference, lod};
-                            const auto key = referenceKey(request);
-                            if (!desired(request) || loadedReferences.contains(key)
-                                || rejectedReferences.contains(key) || queuedReferences.contains(key))
-                                continue;
-                            candidates.push_back(std::move(request));
-                        }
-                    }
+                    std::uint8_t wanted = 0;
+                    if (fullPrefetchCell(cell)) wanted |= 1;
+                    if (lodCell(cell) && !commonwealthObjectsCover(cell)) wanted |= 2;
+                    if (const auto settled = settledReferenceCells.find(cell); settled != settledReferenceCells.end())
+                        wanted &= static_cast<std::uint8_t>(~settled->second);
+                    if (wanted)
+                        scans.push_back({cell, &found->second, &pendingCellReferences[cell], wanted});
                 }
+            // Each scan only touches its own cell's list (map nodes are stable), so the cells are
+            // filtered with std::execution::par; the shared sets are only read.
+            std::for_each(std::execution::par, scans.begin(), scans.end(), [&](CellScan& scan) {
+                for (const bool lod : {false, true})
+                {
+                    const int kind = lod ? 1 : 0;
+                    if (!(scan.wanted & (lod ? 2 : 1)))
+                        continue;
+                    auto& remaining = scan.pending->remaining[kind];
+                    if (!scan.pending->built[kind])
+                    {
+                        scan.pending->built[kind] = true;
+                        for (const std::size_t index : *scan.references)
+                            if (!lod || hasModelPath(world.references[index].baseObject, true))
+                                remaining.push_back(static_cast<std::uint32_t>(index));
+                    }
+                    std::erase_if(remaining, [&](std::uint32_t index) {
+                        const ReferenceKey key{world.references[index].instanceId, lod};
+                        return loadedReferences.contains(key) || rejectedReferences.contains(key);
+                    });
+                    if (remaining.empty())
+                    {
+                        scan.settled |= static_cast<std::uint8_t>(lod ? 2 : 1);
+                        continue;
+                    }
+                    for (const std::uint32_t index : remaining)
+                        if (!queuedReferences.contains({world.references[index].instanceId, lod}))
+                            scan.candidates.push_back({index, lod});
+                }
+            });
+            std::vector<Candidate> candidates;
+            for (auto& scan : scans)
+            {
+                if (scan.settled)
+                {
+                    settledReferenceCells[scan.cell] |= scan.settled;
+                    if ((settledReferenceCells[scan.cell] & 3) == 3)
+                        pendingCellReferences.erase(scan.cell);
+                }
+                candidates.insert(candidates.end(), scan.candidates.begin(), scan.candidates.end());
             }
-            const auto nearer = [this](const auto& left, const auto& right) {
-                return requestNearer(left, right);
+            if (candidates.empty())
+                return;
+            // Same order as requestNearer, without materializing a request per candidate.
+            const auto nearer = [this](const Candidate& left, const Candidate& right) {
+                const auto& a = world.references[left.index];
+                const auto& b = world.references[right.index];
+                const auto priority = [&](const assets::PlacedReference& reference, bool lod) {
+                    if (lod) return 3;
+                    if (reference.cell == centerCell) return 0;
+                    return fullCell(reference.cell) ? 1 : 2;
+                };
+                const int leftPriority = priority(a, left.lod);
+                const int rightPriority = priority(b, right.lod);
+                if (leftPriority != rightPriority)
+                    return leftPriority < rightPriority;
+                const auto distanceSquared = [&](const assets::PlacedReference& reference) {
+                    const double x = reference.position[0] - streamPosition.x;
+                    const double y = reference.position[1] - streamPosition.y;
+                    return x * x + y * y;
+                };
+                const double leftDistance = distanceSquared(a);
+                const double rightDistance = distanceSquared(b);
+                return leftDistance != rightDistance ? leftDistance < rightDistance : a.instanceId < b.instanceId;
             };
             if (candidates.size() > available)
             {
@@ -3241,10 +3414,11 @@ namespace openf4::world
                 candidates.resize(available);
             }
             std::ranges::sort(candidates, nearer);
-            for (auto& request : candidates)
+            for (const auto& candidate : candidates)
             {
                 if (loadedObjects + queuedReferences.size() >= maxObjects)
                     break;
+                ReferenceRequest request{world.references[candidate.index], candidate.lod};
                 if (queuedReferences.insert(referenceKey(request)).second)
                     referenceRequests.push_back(std::move(request));
             }
@@ -3339,6 +3513,7 @@ namespace openf4::world
                 }
             }
             streamPosition = {-playerPosition.x, playerPosition.z};
+            crossedThisFrame = false;
             const assets::CellCoord playerCell{
                 static_cast<std::int32_t>(std::floor(-playerPosition.x / cellSize)),
                 static_cast<std::int32_t>(std::floor(playerPosition.z / cellSize))};
@@ -3346,7 +3521,13 @@ namespace openf4::world
                 return;
             const assets::CellCoord previousCenter = centerCell;
             centerCell = playerCell;
+            crossedThisFrame = true;
             std::cout << "Streamer center: " << centerCell.x << ", " << centerCell.y << '\n';
+            using CrossClock = std::chrono::steady_clock;
+            std::array<CrossClock::time_point, 10> crossMarks{};
+            std::size_t crossMark = 0;
+            const auto markCross = [&] { if (crossMark < crossMarks.size()) crossMarks[crossMark++] = CrossClock::now(); };
+            markCross();
             constexpr int physicsOriginRadius = 32;
             if (physicsWorld && cellDistance(centerCell, physicsOriginCell) >= physicsOriginRadius)
             {
@@ -3355,6 +3536,7 @@ namespace openf4::world
                     {centerCell.x * cellSize, 0.0f, centerCell.y * cellSize});
             }
             syncTerrainPhysics();
+            markCross();
 
             const auto pruneAndSort = [&](auto& requests) {
                 std::erase_if(requests, [&](const ReferenceRequest& request) {
@@ -3374,6 +3556,7 @@ namespace openf4::world
                 (void)key;
                 pruneAndSort(state.waiters);
             }
+            markCross();
 
             std::set<assets::CellCoord> affectedCells;
             const auto addCells = [&](assets::CellCoord center) {
@@ -3390,6 +3573,7 @@ namespace openf4::world
                 if (wasPrefetched != fullPrefetchCell(cell))
                     syncCellPhysics(renderer, cell);
             }
+            markCross();
 
             std::vector<std::uint32_t> enable;
             std::vector<std::uint32_t> disable;
@@ -3399,6 +3583,7 @@ namespace openf4::world
             };
             queueCommonwealthLod();
             refreshCommonwealthLod(renderer);
+            markCross();
             for (const auto& tile : lodTiles)
             {
                 const bool desired = commonwealthObjectsDesired(tile);
@@ -3409,12 +3594,15 @@ namespace openf4::world
                         tile.origin.y + static_cast<int>(index / LodTile::side)};
                     for (const auto& part : tile.objects[index])
                     {
-                        const bool active = desired && !replacementReady(cell)
-                            && std::ranges::none_of(
+                        const bool replaced = replacementReady(cell)
+                            || std::ranges::any_of(
                             part.replacementCells, [&](assets::CellCoord replacement) {
                                 return replacementReady(replacement);
                             });
+                        const bool active = desired && (!replaced || ownObjectFade());
                         (active ? enable : disable).push_back(part.instance);
+                        if (ownObjectFade())
+                            renderer.updateInstanceLodRange(part.instance, btoLodRange(replaced));
                     }
                 }
             }
@@ -3437,10 +3625,21 @@ namespace openf4::world
                     (lodObjectsActive ? enable : disable).end(),
                     state.lodObjects.begin(), state.lodObjects.end());
             }
+            markCross();
             renderer.setInstancesActive(disable, false);
             renderer.setInstancesActive(enable, true);
+            markCross();
             queueTerrain();
+            markCross();
             queueDesiredReferences();
+            markCross();
+            static const char* const crossNames[] = {"terrainPhysics", "pruneSort", "cellPhysics",
+                "lodRefresh", "lodTiles+cells", "setActive", "queueTerrain", "queueRefs"};
+            std::printf("  crossing cost:");
+            for (std::size_t stage = 1; stage < crossMark; ++stage)
+                std::printf(" %s %.2f", crossNames[stage - 1],
+                    std::chrono::duration<double, std::milli>(crossMarks[stage] - crossMarks[stage - 1]).count());
+            std::printf(" | %zu enable %zu disable\n", enable.size(), disable.size());
         }
 
         static void rebuildTerrainLodNormals(assets::ModelGeometry& geometry)
@@ -3712,8 +3911,12 @@ namespace openf4::world
                             const assets::CellCoord coveredCell{
                                 tile.origin.x + static_cast<int>(cell % LodTile::side),
                                 tile.origin.y + static_cast<int>(cell / LodTile::side)};
+                            if (externalObjectLodRange)
+                                sceneInstance.lodRange = externalLodRange(coveredCell);
                             sceneInstance.active = commonwealthObjectsDesired(tile)
-                                && !replacementReady(coveredCell);
+                                && (ownObjectFade() || !replacementReady(coveredCell));
+                            if (ownObjectFade())
+                                sceneInstance.lodRange = btoLodRange(replacementReady(coveredCell));
                             const auto instance = renderer.addInstance(sceneInstance);
                             tile.objects[cell].push_back(
                                 {instance, sceneInstance.bounds, {}});
@@ -3760,70 +3963,131 @@ namespace openf4::world
             return false;
         }
 
+        // A finished model job installs over several streamNext steps (collision, then one
+        // surface's material/textures per step, then the mesh and its waiters), so the main
+        // thread never spends 5-15 ms registering a large model in one go while cells stream.
+        struct ModelInstall
+        {
+            ModelKey key;
+            std::string path;
+            bool preparesCollision = false;
+            PreparedModel prepared;
+            render::PackedMesh packed;
+            std::size_t surface = 0;
+            bool collisionDone = false;
+        };
+        std::optional<ModelInstall> installing;
+
+        void failModel(render::VulkanRenderer& renderer, ModelState& state, const std::string& path,
+            bool preparesCollision, const std::exception& error)
+        {
+            if (preparesCollision)
+                failCollision(renderer, path, error.what());
+            state.failed = true;
+            state.loading = false;
+            for (const auto& waiter : state.waiters)
+            {
+                queuedReferences.erase(referenceKey(waiter));
+                rejectReference(renderer, waiter);
+            }
+            warnReference(state.waiters.empty() ? 0
+                : state.waiters.front().reference.formId, error);
+            state.waiters.clear();
+        }
+
         bool completeModel(render::VulkanRenderer& renderer)
         {
-            for (std::size_t index = 0; index < jobs.size(); ++index)
+            if (!installing)
             {
-                if (jobs[index].future.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
-                    continue;
-                const ModelKey key = jobs[index].key;
-                const std::string path = jobs[index].path;
-                const bool preparesCollision = jobs[index].preparesCollision;
-                auto& state = models[key];
-                state.loading = false;
-                try
+                for (std::size_t index = 0; index < jobs.size(); ++index)
                 {
-                    auto prepared = jobs[index].future.get();
-                    if (prepared.collision)
-                        completeCollision(renderer, path, std::move(*prepared.collision));
+                    if (jobs[index].future.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                        continue;
+                    auto job = std::move(jobs[index]);
+                    jobs[index] = std::move(jobs.back());
+                    jobs.pop_back();
+                    auto& state = models[job.key];
+                    try
+                    {
+                        installing.emplace(ModelInstall{job.key, job.path, job.preparesCollision, job.future.get()});
+                    }
+                    catch (const std::exception& error)
+                    {
+                        failModel(renderer, state, job.path, job.preparesCollision, error);
+                    }
+                    return true;
+                }
+                return false;
+            }
+            auto& install = *installing;
+            auto& state = models[install.key];
+            static const bool installProfile = std::getenv("OPENF4_STREAM_PROFILE") != nullptr;
+            const auto phaseStart = std::chrono::steady_clock::now();
+            const char* phase = !install.collisionDone ? "collision"
+                : install.surface < install.prepared.surfaces.size() ? "material" : "addMesh";
+            struct PhaseReport
+            {
+                bool on; const char* phase; std::string path; // copied: install may reset
+                std::chrono::steady_clock::time_point start;
+                ~PhaseReport()
+                {
+                    if (!on) return;
+                    const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - start).count();
+                    if (ms >= 3.0)
+                        std::printf("      install %s %.2f ms %s\n", phase, ms, path.c_str());
+                }
+            } phaseReport{installProfile, phase, installProfile ? install.path : std::string{}, phaseStart};
+            try
+            {
+                if (!install.collisionDone)
+                {
+                    install.collisionDone = true;
+                    if (install.prepared.collision)
+                        completeCollision(renderer, install.path, std::move(*install.prepared.collision));
                     if (state.waiters.empty())
                     {
-                        jobs[index] = std::move(jobs.back());
-                        jobs.pop_back();
-                        return true;
+                        state.loading = false;
+                        installing.reset();
                     }
-                    render::PackedMesh packed;
-                    for (auto& surface : prepared.surfaces)
-                    {
-                        const auto material = materials.addPreparedDynamic(
-                            renderer, std::move(surface.material));
-                        for (auto& meshlet : surface.mesh.meshlets)
-                            meshlet.materialIndex = material;
-                        (void)render::appendMesh(packed, std::move(surface.mesh));
-                    }
-                    packed.bounds = prepared.bounds;
-                    state.range = renderer.addMesh(std::move(packed));
-                    for (const auto& waiter : state.waiters)
-                    {
-                        if (desired(waiter))
-                            readyReferences.push_back(waiter);
-                        else
-                            queuedReferences.erase(referenceKey(waiter));
-                    }
-                    std::ranges::sort(readyReferences,
-                        [this](const auto& left, const auto& right) {
-                            return requestNearer(left, right);
-                        });
+                    return true;
                 }
-                catch (const std::exception& error)
+                if (install.surface < install.prepared.surfaces.size())
                 {
-                    if (preparesCollision)
-                        failCollision(renderer, path, error.what());
-                    state.failed = true;
-                    for (const auto& waiter : state.waiters)
-                    {
-                        queuedReferences.erase(referenceKey(waiter));
-                        rejectReference(renderer, waiter);
-                    }
-                    warnReference(state.waiters.empty() ? 0
-                        : state.waiters.front().reference.formId, error);
+                    auto& surface = install.prepared.surfaces[install.surface++];
+                    const auto material = materials.addPreparedDynamic(renderer, std::move(surface.material));
+                    for (auto& meshlet : surface.mesh.meshlets)
+                        meshlet.materialIndex = material;
+                    (void)render::appendMesh(install.packed, std::move(surface.mesh));
+                    return true;
                 }
+                install.packed.bounds = install.prepared.bounds;
+                state.range = renderer.addMesh(std::move(install.packed));
+                state.loading = false;
+                // The ready queue is already ordered: sort only this model's waiters and merge
+                // them in (re-sorting thousands of requests per model cost 3-10 ms).
+                const auto nearer = [this](const auto& left, const auto& right) {
+                    return requestNearer(left, right);
+                };
+                const auto firstNew = static_cast<std::ptrdiff_t>(readyReferences.size());
+                for (auto& waiter : state.waiters)
+                {
+                    if (desired(waiter))
+                        readyReferences.push_back(std::move(waiter));
+                    else
+                        queuedReferences.erase(referenceKey(waiter));
+                }
+                std::sort(readyReferences.begin() + firstNew, readyReferences.end(), nearer);
+                std::inplace_merge(readyReferences.begin(), readyReferences.begin() + firstNew,
+                    readyReferences.end(), nearer);
                 state.waiters.clear();
-                jobs[index] = std::move(jobs.back());
-                jobs.pop_back();
-                return true;
             }
-            return false;
+            catch (const std::exception& error)
+            {
+                failModel(renderer, state, install.path, install.preparesCollision, error);
+            }
+            installing.reset();
+            return true;
         }
 
         bool installTerrain(render::VulkanRenderer& renderer)
@@ -3843,16 +4107,87 @@ namespace openf4::world
                     continue;
                 const auto surface = terrainSurface(
                     landscape->second, world, materials, &renderer);
-                const auto range = renderer.addMesh(
-                    terrainCell(landscape->second, surface, request.lod ? 4 : 1));
-                auto sceneInstance = makeInstance(range, glm::mat4(1.0f));
-                sceneInstance.active = request.lod ? lodCell(request.cell)
-                    : fullCell(request.cell);
-                const auto instance = renderer.addInstance(sceneInstance);
-                (request.lod ? state.lodTerrain : state.fullTerrain) = instance;
+                try
+                {
+                    const auto range = renderer.addMesh(
+                        terrainCell(landscape->second, surface, request.lod ? 4 : 1));
+                    auto sceneInstance = makeInstance(range, glm::mat4(1.0f));
+                    sceneInstance.active = request.lod ? lodCell(request.cell)
+                        : fullCell(request.cell);
+                    const auto instance = renderer.addInstance(sceneInstance);
+                    (request.lod ? state.lodTerrain : state.fullTerrain) = instance;
+                }
+                catch (const std::exception& error)
+                {
+                    // e.g. the renderer's scene memory cap (memory preset): the cell stays bare.
+                    static int terrainWarnings = 0;
+                    if (terrainWarnings++ < 20)
+                        std::cerr << "Terrain skipped: " << error.what() << '\n';
+                }
                 return true;
             }
             return false;
+        }
+
+        void fadeObjectLodIntoExternalObjects(render::VulkanRenderer& renderer)
+        {
+            const auto band = detail::objectFadeBand();
+            if (!band || includeObjects)
+                return; // Fade off (legacy look) or this streamer owns the full objects.
+            externalObjectLodRange = glm::vec4(band->x, band->y,
+                render::SceneInstance{}.lodRange.z, render::SceneInstance{}.lodRange.w);
+            // Nothing is covered yet: every LOD part stays fully visible until the ObjectScene
+            // has actually drawn the references of its cell.
+            for (const auto& tile : lodTiles)
+                for (std::size_t index = 0; index < tile.objects.size(); ++index)
+                    for (const auto& part : tile.objects[index])
+                        renderer.updateInstanceLodRange(part.instance, externalLodRange(lodTileCell(tile, index)));
+            for (const auto& [cell, state] : cells)
+                for (const auto instance : state.lodObjects)
+                    renderer.updateInstanceLodRange(instance, externalLodRange(cell));
+        }
+
+        static assets::CellCoord lodTileCell(const LodTile& tile, std::size_t index)
+        {
+            return {tile.origin.x + static_cast<int>(index % LodTile::side),
+                tile.origin.y + static_cast<int>(index / LodTile::side)};
+        }
+
+        // LOD range of an object LOD part in `cell` while an ObjectScene owns the full objects.
+        glm::vec4 externalLodRange(assets::CellCoord cell) const
+        {
+            return externalObjectLodRange && externallyCoveredCells.contains(cell)
+                ? *externalObjectLodRange : render::SceneInstance{}.lodRange;
+        }
+
+        void syncExternalObjectCoverage(render::VulkanRenderer& renderer,
+            std::span<const assets::CellCoord> covered, std::uint64_t revision)
+        {
+            if (!externalObjectLodRange || revision == externalCoverageRevision)
+                return;
+            externalCoverageRevision = revision;
+            std::set<assets::CellCoord> next(covered.begin(), covered.end());
+            if (next == externallyCoveredCells)
+                return;
+            std::vector<assets::CellCoord> changed;
+            std::ranges::set_symmetric_difference(next, externallyCoveredCells, std::back_inserter(changed));
+            externallyCoveredCells = std::move(next);
+            for (const auto cell : changed)
+            {
+                const auto range = externalLodRange(cell);
+                if (const auto tile = lodTileByCell.find(cell); tile != lodTileByCell.end())
+                {
+                    const auto& lodTile = lodTiles[tile->second];
+                    const int localX = cell.x - lodTile.origin.x;
+                    const int localY = cell.y - lodTile.origin.y;
+                    if (localX >= 0 && localY >= 0 && localX < LodTile::side && localY < LodTile::side)
+                        for (const auto& part : lodTile.objects[localY * LodTile::side + localX])
+                            renderer.updateInstanceLodRange(part.instance, range);
+                }
+                if (const auto state = cells.find(cell); state != cells.end())
+                    for (const auto instance : state->second.lodObjects)
+                        renderer.updateInstanceLodRange(instance, range);
+            }
         }
 
         void completeBtoHandoff(
@@ -3875,6 +4210,12 @@ namespace openf4::world
             if (const auto parts = btoPartsByReplacementCell.find(replacementCell);
                 parts != btoPartsByReplacementCell.end())
                 instances.insert(instances.end(), parts->second.begin(), parts->second.end());
+            if (ownObjectFade())
+            {
+                for (const auto instance : instances)
+                    renderer.updateInstanceLodRange(instance, btoLodRange(true));
+                return;
+            }
             renderer.setInstancesActive(instances, false);
         }
 
@@ -3952,10 +4293,28 @@ namespace openf4::world
                 }
                 auto sceneInstance = makeInstance(
                     *model->second.range, referenceTransform(request.reference));
+                if (request.lod && externalObjectLodRange)
+                    sceneInstance.lodRange = externalLodRange(request.reference.cell);
+                if (!request.lod)
+                    sceneInstance.lodRange = fullObjectLodRange();
                 sceneInstance.active = request.lod ? lodCell(request.reference.cell)
                     && !commonwealthObjectsCover(request.reference.cell)
                                                    : fullCell(request.reference.cell);
-                const auto instance = renderer.addInstance(sceneInstance);
+                std::uint32_t instance = 0;
+                try
+                {
+                    instance = renderer.addInstance(sceneInstance);
+                }
+                catch (const std::exception& error)
+                {
+                    // Scene memory cap (memory preset): the reference is dropped like a bad model.
+                    static int referenceWarnings = 0;
+                    if (referenceWarnings++ < 20)
+                        std::cerr << "Reference skipped: " << error.what() << '\n';
+                    queuedReferences.erase(key);
+                    rejectReference(renderer, request);
+                    continue;
+                }
                 loadedReferences.emplace(key, instance);
                 auto& state = cells[request.reference.cell];
                 (request.lod ? state.lodObjects : state.fullObjects).push_back(instance);
@@ -3997,27 +4356,45 @@ namespace openf4::world
 
         bool streamNext(render::VulkanRenderer& renderer)
         {
+            // OPENF4_STREAM_PROFILE=1: name any single streaming step that takes over 3 ms.
+            static const bool profileSteps = [] { const char* v = std::getenv("OPENF4_STREAM_PROFILE"); return v && *v == '1'; }();
+            auto stepStart = std::chrono::steady_clock::now();
+            const auto step = [&](const char* name, bool result) {
+                if (profileSteps)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    const double ms = std::chrono::duration<double, std::milli>(now - stepStart).count();
+                    if (ms >= 3.0) std::printf("    stream step %s %.2f ms\n", name, ms);
+                    stepStart = now;
+                }
+                return result;
+            };
             scheduleJobs(renderer);
-            if (removeStalePhysics())
+            (void)step("scheduleJobs", false);
+            if (crossedThisFrame)
+                return false;
+            if (step("removeStalePhysics", removeStalePhysics()))
                 return true;
-            if (installTerrainPhysics())
+            if (step("installTerrainPhysics", installTerrainPhysics()))
                 return true;
-            if (completeLod(renderer))
+            if (step("completeLod", completeLod(renderer)))
                 return true;
-            if (installTerrain(renderer))
+            if (step("installTerrain", installTerrain(renderer)))
                 return true;
-            if (completeModel(renderer))
+            if (step("completeModel", completeModel(renderer)))
                 return true;
-            if (installReference(renderer))
+            if (step("installReference", installReference(renderer)))
                 return true;
-            if (installReferencePhysics(renderer))
+            if (step("installReferencePhysics", installReferencePhysics(renderer)))
                 return true;
             if (lodRequests.empty() && lodJobs.empty() && referenceRequests.empty()
-                && readyReferences.empty() && jobs.empty() && physicsReferences.empty())
+                && readyReferences.empty() && jobs.empty() && !installing && physicsReferences.empty())
             {
                 queueCommonwealthLod();
                 queueDesiredReferences();
+                (void)step("queueDesired", false);
                 scheduleJobs(renderer);
+                (void)step("scheduleJobs(idle)", false);
             }
             return false;
         }
@@ -4080,6 +4457,7 @@ namespace openf4::world
             std::vector<physics::BodyHandle> bodies;
             std::vector<physics::BodyState> savedBodies;
             std::optional<std::uint32_t> scriptMotion;
+            std::uint64_t seenWalk = 0;  // == Walk::epoch when the last walk wanted it resident
         };
         struct StaticPart
         {
@@ -4108,6 +4486,7 @@ namespace openf4::world
         std::map<std::filesystem::path, std::shared_ptr<Resources>> resources;
         std::map<std::string, Model> models;
         std::map<std::uint32_t, Instance> instances;
+        std::vector<Instance*> instanceList;  // every Instance node, for the flat activation sweep
         std::map<assets::LodStaticTile, StaticTile> staticTiles;
         std::vector<std::string> messages;
         std::size_t pending = 0;
@@ -4117,8 +4496,108 @@ namespace openf4::world
         WorldStreamer* streamedTerrain = nullptr;
         std::set<std::uint32_t> movableModels;
         std::set<assets::CellCoord> incompleteStaticCells;
+        // Cells (this walk) holding a reference whose model is still loading or failed, movable
+        // or not: their distant object LOD must stay up (coveredCells).
+        std::set<assets::CellCoord> undrawnCells;
+        std::uint64_t coverage = 0;
         assets::CellCoord physicsCenter{};
         std::unique_ptr<script::ObjectScripts> scripts;
+        // Per-layout caches so a frame only touches references near the camera instead of
+        // scanning (and hashing/allocating for) every reference of the worldspace.
+        struct Layout
+        {
+            std::uint64_t revision = 0;
+            const assets::PlacedReference* data = nullptr;
+            std::size_t size = 0;
+            std::size_t movableCount = 0;
+            bool built = false;
+            std::map<assets::CellCoord, std::vector<std::uint32_t>> cells;
+            std::unordered_map<std::uint32_t, std::uint32_t> byForm;
+            std::unordered_set<std::uint32_t> hidden;
+            std::unordered_set<std::uint32_t> available;
+            std::vector<std::string> keys;
+            std::vector<Model*> models;  // std::map nodes are stable and never erased here
+            // Per-reference iterator into `instances` (end() = not looked up / not resident).
+            // Instances are never erased, so iterators stay valid; this replaces an O(log n)
+            // tree descent per candidate per walk (the dominant cost of a cell-crossing walk).
+            std::vector<std::map<std::uint32_t, Instance>::iterator> residents;
+            // Hash of the placement fields a resident instance was last projected from (0 = none),
+            // so a drag only re-projects the references that actually moved.
+            std::vector<std::uint64_t> placementHashes;
+            std::vector<std::uint32_t> candidates;
+            std::vector<glm::mat4> transforms;  // per candidate, filled in parallel when placements changed
+            std::uint64_t builds = 0;
+        } layout;
+        // The last full candidate walk. When nothing it depends on changed (camera cell,
+        // placements, layout, installed models, physics), the next frame skips the walk.
+        struct Walk
+        {
+            bool valid = false;
+            std::uint64_t epoch = 0;
+            std::uint64_t contentRevision = 0;
+            std::uint64_t layoutBuilds = 0;
+            assets::CellCoord center{};
+        } walk;
+        struct Profile
+        {
+            bool enabled = false;
+            int calls = 0;
+            double install = 0.0, walk = 0.0, tiles = 0.0, transforms = 0.0;
+            std::size_t walks = 0, installs = 0, fast = 0, slow = 0;
+        } profile;
+
+        static std::uint64_t placementHash(const assets::PlacedReference& reference) noexcept
+        {
+            std::uint64_t hash = 0x243F6A8885A308D3ull;
+            const auto mix = [&hash](const void* data, std::size_t words) {
+                const auto* bytes = static_cast<const unsigned char*>(data);
+                for (std::size_t i = 0; i < words; ++i)
+                {
+                    std::uint32_t word;
+                    std::memcpy(&word, bytes + i * 4, 4);
+                    hash = (hash ^ word) * 0x9E3779B97F4A7C15ull;
+                    hash ^= hash >> 29;
+                }
+            };
+            mix(reference.position, 3);
+            mix(reference.rotation, 3);
+            mix(&reference.scale, 1);
+            mix(&reference.baseObject, 1);
+            const std::uint32_t flags = (reference.hasLocalTransform ? 1u : 0u) | (reference.actor ? 2u : 0u);
+            mix(&flags, 1);
+            if (reference.hasLocalTransform)
+            {
+                mix(reference.localPosition, 3);
+                mix(reference.localRotation, 3);
+                mix(&reference.localScale, 1);
+            }
+            return hash | 1u;  // 0 means "not resident"
+        }
+
+        void refreshLayout(std::span<const assets::PlacedReference> references,
+            std::span<const std::uint32_t> hidden, std::uint64_t revision)
+        {
+            if (layout.built && revision != 0 && revision == layout.revision && references.data() == layout.data
+                && references.size() == layout.size && movableModels.size() == layout.movableCount)
+                return;
+            layout.cells.clear(); layout.byForm.clear(); layout.available.clear();
+            layout.hidden = std::unordered_set<std::uint32_t>(hidden.begin(), hidden.end());
+            layout.byForm.reserve(references.size()); layout.available.reserve(references.size());
+            for (std::size_t i = 0; i < references.size(); ++i)
+            {
+                const auto& reference = references[i];
+                layout.cells[reference.cell].push_back(static_cast<std::uint32_t>(i));
+                layout.byForm.emplace(reference.formId, static_cast<std::uint32_t>(i));
+                if (!movableModels.contains(reference.baseObject)) layout.available.insert(reference.formId);
+            }
+            layout.keys.assign(references.size(), std::string());
+            layout.models.assign(references.size(), nullptr);
+            layout.residents.assign(references.size(), instances.end());
+            layout.placementHashes.assign(references.size(), 0);
+            ++layout.builds;
+            layout.revision = revision; layout.data = references.data(); layout.size = references.size();
+            layout.movableCount = movableModels.size(); layout.built = true;
+        }
 
         ~Impl()
         {
@@ -4302,6 +4781,25 @@ namespace openf4::world
             return result;
         }
 
+        // Full-detail objects exist only inside the 9x9 cell window around the camera cell,
+        // whose nearest edge is 4 cells from a camera anywhere in that center cell. Without
+        // a fade the visible edge is that cell-aligned square, so flying makes the cut-off
+        // distance creep from 5 to 4 cells and snap back at every crossing (a sawtooth of
+        // pops, objects <-> static LOD). Dissolve objects out radially over 3..4 cells and
+        // static LOD in over the same band, with the renderer's complementary screen-space
+        // dither: the transition is camera-relative and never reaches the window edge.
+        static constexpr float objectFadeStart = 3.0f * cellSize;
+        static constexpr float objectFadeEnd = 4.0f * cellSize;
+        static constexpr float staticLodFadeStart = 80.0f * cellSize;
+        static constexpr float staticLodFadeEnd = 92.0f * cellSize;
+        const bool objectFade = detail::objectFadeBand().has_value();
+
+        [[nodiscard]] glm::vec4 objectLodRange() const noexcept
+        {
+            return objectFade ? glm::vec4(0.0f, 0.0f, objectFadeStart, objectFadeEnd)
+                              : render::SceneInstance{}.lodRange;
+        }
+
         void warn(const std::string& message)
         {
             std::cerr << "Object stream: " << message << '\n';
@@ -4348,8 +4846,8 @@ namespace openf4::world
 
         void updateStaticTiles(render::VulkanRenderer& renderer,
             const assets::CellCoord center,
-            const std::set<std::uint32_t>& available,
-            const std::set<std::uint32_t>& hidden)
+            const std::unordered_set<std::uint32_t>& available,
+            const std::unordered_set<std::uint32_t>& hidden)
         {
             constexpr int horizonCells = 92;
             const auto wanted = [&](assets::LodStaticTile key) {
@@ -4426,7 +4924,7 @@ namespace openf4::world
                             glm::vec3(key.origin.x * cellSize, 0.0f,
                                 key.origin.y * cellSize));
                         auto coarse = makeInstance(range, transform);
-                        coarse.lodRange = {0.0f, 0.0f, 80.0f * cellSize, 92.0f * cellSize};
+                        coarse.lodRange = {0.0f, 0.0f, staticLodFadeStart, staticLodFadeEnd};
                         const auto instance = renderer.addInstance(coarse);
                         const std::array ids{instance};
                         renderer.setInstancesActive(ids, false);
@@ -4491,9 +4989,17 @@ namespace openf4::world
                 }
                 for (const auto& [form, instance] : tile.installed)
                 {
+                    const auto full = instances.find(form);
+                    const bool fullActive = full != instances.end() && full->second.active;
+                    // With the object fade the LOD part stays on beside its resident full model
+                    // and dithers in where that model dissolves out; without a resident model
+                    // it covers all the way in (e.g. while the model still loads).
                     const bool show = desired && available.contains(form)
-                        && !hidden.contains(form)
-                        && !(instances.contains(form) && instances.at(form).active);
+                        && !hidden.contains(form) && (objectFade || !fullActive);
+                    if (show && objectFade)
+                        renderer.updateInstanceLodRange(instance, fullActive
+                            ? glm::vec4(objectFadeStart, objectFadeEnd, staticLodFadeStart, staticLodFadeEnd)
+                            : glm::vec4(0.0f, 0.0f, staticLodFadeStart, staticLodFadeEnd));
                     const std::array ids{instance};
                     renderer.setInstancesActive(ids, show);
                 }
@@ -4507,20 +5013,40 @@ namespace openf4::world
             std::span<const assets::PlacedReference> references,
             const std::map<std::uint32_t, std::string>& paths,
             const std::unordered_map<std::uint32_t, std::filesystem::path>& sources,
-            const glm::dvec3& camera, std::span<const std::uint32_t> hidden)
+            const glm::dvec3& camera, std::span<const std::uint32_t> hidden, std::uint64_t layoutRevision,
+            std::uint64_t contentRevision)
         {
+            using Clock = std::chrono::steady_clock;
+            const auto updateStart = Clock::now();
+            static const bool profileRequested = [] {
+                const char* value = std::getenv("OPENF4_EDITOR_PROFILE");
+                return value && *value && *value != '0';
+            }();
+            profile.enabled = profileRequested;
+            // Profiling-only A/B switches: force the full per-reference walk every frame (what a
+            // gizmo drag costs) and/or run the placement transforms sequentially.
+            static const bool forceWalk = [] { const char* v = std::getenv("OPENF4_OBJECTS_FORCE_WALK"); return v && *v == '1'; }();
+            static const bool serialTransforms = [] { const char* v = std::getenv("OPENF4_OBJECTS_SERIAL"); return v && *v == '1'; }();
+            if (forceWalk) contentRevision = 0;
+            refreshLayout(references, hidden, layoutRevision);
             std::size_t running = 0;
             bool installed = false;
+            std::size_t installCount = 0;
+            // Install every finished model job inside a small per-frame budget instead of exactly
+            // one per frame: a fresh 9x9 Commonwealth view has thousands of distinct models.
+            const auto installDeadline = updateStart + std::chrono::milliseconds(4);
             for (auto& [key, model] : models)
             {
                 if (!model.job.valid())
                     continue;
-                if (installed || model.job.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                if ((installed && Clock::now() >= installDeadline)
+                    || model.job.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
                 {
                     ++running;
                     continue;
                 }
                 installed = true;
+                ++installCount;
                 try
                 {
                     auto prepared = model.job.get();
@@ -4566,18 +5092,82 @@ namespace openf4::world
             const assets::CellCoord center{
                 static_cast<std::int32_t>(std::floor(-camera.x / cellSize)),
                 static_cast<std::int32_t>(std::floor(camera.z / cellSize))};
-            const std::set<std::uint32_t> hiddenSet(hidden.begin(), hidden.end());
-            std::set<std::uint32_t> visible;
+            const auto& hiddenSet = layout.hidden;
+            const auto installEnd = Clock::now();
+            // Placements may only be trusted unchanged when the caller says so (nonzero
+            // contentRevision) and the cell index was not rebuilt. Physics moves bodies every
+            // step, so a physics-attached scene always walks.
+            const bool placementsChanged = contentRevision == 0 || contentRevision != walk.contentRevision
+                || layout.builds != walk.layoutBuilds || physicsWorld != nullptr;
+            const bool needWalk = !walk.valid || placementsChanged || installed
+                || center.x != walk.center.x || center.y != walk.center.y;
+            std::size_t fastCount = 0, slowCount = 0;
+            if (needWalk)
+            {
+            const std::uint64_t epoch = ++walk.epoch;
             pending = active = 0;
             incompleteStaticCells.clear();
+            undrawnCells.clear();
+            ++coverage;
             physicsCenter = center;
             if (physicsWorld && terrain)
                 physicsWorld->setOrigin({center.x * cellSize, 0.0f, center.y * cellSize});
             const std::size_t workerLimit = std::clamp<std::size_t>(
                 std::max(1u, std::thread::hardware_concurrency()) / 2u, 2u, 16u);
-            for (const auto& reference : references)
+            // Only references authored within the 9x9 cells around the camera (the range test
+            // below), plus physics-moved movables whose authored cell is out of that range.
+            auto& candidates = layout.candidates;
+            candidates.clear();
+            for (std::int32_t dy = -4; dy <= 4; ++dy)
+                for (std::int32_t dx = -4; dx <= 4; ++dx)
+                    if (const auto cell = layout.cells.find({center.x + dx, center.y + dy}); cell != layout.cells.end())
+                        candidates.insert(candidates.end(), cell->second.begin(), cell->second.end());
+            if (physicsWorld)
+                for (const auto& [formId, instance] : instances)
+                {
+                    if (!instance.movable) continue;
+                    const auto index = layout.byForm.find(formId);
+                    if (index == layout.byForm.end()) continue;
+                    const auto authored = references[index->second].cell;
+                    if (std::abs(static_cast<std::int64_t>(authored.x) - center.x) > 4
+                        || std::abs(static_cast<std::int64_t>(authored.y) - center.y) > 4)
+                        candidates.push_back(index->second);
+                }
+            // Placement -> engine transform is pure math (Euler -> quaternion -> mat4) and is the
+            // bulk of a walk after an edit/drag; fan it out with the parallel algorithms.
+            // A brand-new candidate set (first walk, reopened world, rebuilt layout) needs every
+            // transform: fan that out over the parallel algorithms. Later walks (drags, cell
+            // crossings) mostly hit the unchanged-placement fast path and project the few
+            // remaining references on demand.
+            auto& transforms = layout.transforms;
+            const bool precomputed = !walk.valid || layout.builds != walk.layoutBuilds;
+            if (precomputed)
             {
-                auto found = instances.find(reference.formId);
+                const auto transformStart = Clock::now();
+                transforms.resize(candidates.size());
+                const auto toTransform = [&](std::uint32_t candidate) noexcept {
+                    return referenceTransform(references[candidate]);
+                };
+                if (serialTransforms)
+                    std::transform(candidates.begin(), candidates.end(), transforms.begin(), toTransform);
+                else
+                    std::transform(std::execution::par_unseq, candidates.begin(), candidates.end(),
+                        transforms.begin(), toTransform);
+                if (profile.enabled)
+                    profile.transforms += std::chrono::duration<double, std::milli>(Clock::now() - transformStart).count();
+            }
+            const auto transformFor = [&](std::size_t slot) {
+                return precomputed ? transforms[slot] : referenceTransform(references[candidates[slot]]);
+            };
+            static const std::string placeholderModel(detail::actorPlaceholderModel);
+            for (std::size_t candidateSlot = 0; candidateSlot < candidates.size(); ++candidateSlot)
+            {
+                const std::uint32_t candidate = candidates[candidateSlot];
+                const auto& reference = references[candidate];
+                auto& resident = layout.residents[candidate];
+                if (resident == instances.end())
+                    resident = instances.find(reference.formId);
+                auto found = resident;
                 auto residentCell = reference.cell;
                 if (physicsWorld && found != instances.end() && found->second.movable)
                 {
@@ -4589,16 +5179,47 @@ namespace openf4::world
                     || std::abs(static_cast<std::int64_t>(residentCell.x) - center.x) > 4
                     || std::abs(static_cast<std::int64_t>(residentCell.y) - center.y) > 4)
                     continue;
-                const auto path = paths.find(reference.baseObject);
-                if (path == paths.end())
+                // Unchanged placement already resident with its current model: nothing to do but
+                // keep it active (skips the path/source lookups, key compare and transform).
+                if (found != instances.end()
+                    && (!placementsChanged || (!physicsWorld && layout.placementHashes[candidate] != 0
+                        && layout.placementHashes[candidate] == placementHash(reference))))
+                    if (const Model* cached = layout.models[candidate]; cached && cached->range && !cached->failed
+                        && found->second.model == layout.keys[candidate])
+                    {
+                        found->second.seenWalk = epoch;
+                        ++active;
+                        ++fastCount;
+                        continue;
+                    }
+                // A model that failed to load with nothing resident: same outcome as the slow path
+                // below (skip, mark the cell incomplete) without the path/source lookups.
+                if (found == instances.end())
+                    if (const Model* cached = layout.models[candidate]; cached && cached->failed)
+                    {
+                        undrawnCells.insert(reference.cell);
+                        if (!movableModels.contains(reference.baseObject))
+                            incompleteStaticCells.insert(reference.cell);
+                        ++fastCount;
+                        continue;
+                    }
+                ++slowCount;
+                // ACHR: no skeleton/body pipeline yet, so every actor shares one stand-in model.
+                const bool actorPlaceholder = reference.actor;
+                const auto path = actorPlaceholder ? paths.end() : paths.find(reference.baseObject);
+                if (!actorPlaceholder && path == paths.end())
                     continue;
-                const auto source = sources.find(reference.baseObject);
+                const std::string& relative = actorPlaceholder ? placeholderModel : path->second;
+                const auto source = actorPlaceholder ? sources.end() : sources.find(reference.baseObject);
                 const auto& sourcePath = source == sources.end() ? master : source->second;
-                const auto key = sourcePath.generic_string() + ":" + path->second;
+                auto& cachedKey = layout.keys[candidate];
+                if (cachedKey.empty())
+                    cachedKey = actorPlaceholder ? relative : sourcePath.generic_string() + ":" + relative;
+                const std::string& key = cachedKey;
                 const auto keepPrevious = [&] {
                     if (found == instances.end()) return;
                     auto& previous = found->second;
-                    const auto placed = referenceTransform(reference);
+                    const glm::mat4 placed = transformFor(candidateSlot);
                     if (previous.authoredTransform != placed)
                     {
                         suspendPhysics(previous, false);
@@ -4610,10 +5231,13 @@ namespace openf4::world
                         previous.geometryBounds.reset();
                         previous.collisionFailed = false;
                     }
-                    visible.insert(reference.formId);
+                    previous.seenWalk = epoch;
                     ++active;
                 };
-                auto& model = models[key];
+                auto*& modelSlot = layout.models[candidate];
+                if (!modelSlot)
+                    modelSlot = &models[key];
+                auto& model = *modelSlot;
                 if (!model.resources)
                 {
                     auto& pack = resources[sourcePath];
@@ -4624,6 +5248,7 @@ namespace openf4::world
                 if (model.failed)
                 {
                     keepPrevious();
+                    undrawnCells.insert(reference.cell);
                     if (!movableModels.contains(reference.baseObject))
                         incompleteStaticCells.insert(reference.cell);
                     continue;
@@ -4632,13 +5257,14 @@ namespace openf4::world
                 {
                     ++pending;
                     keepPrevious();
+                    undrawnCells.insert(reference.cell);
                     if (!movableModels.contains(reference.baseObject))
                         incompleteStaticCells.insert(reference.cell);
                     if (!model.job.valid() && running < workerLimit)
                     {
                         ++running;
                         model.job = std::async(std::launch::async,
-                            [pack = model.resources, relative = path->second, key,
+                            [pack = model.resources, relative, key,
                                 withPhysics = physicsWorld != nullptr] {
                                 Prepared result;
                                 assets::ModelGeometry geometry;
@@ -4646,7 +5272,9 @@ namespace openf4::world
                                 std::ranges::transform(extension, extension.begin(), [](unsigned char c) {
                                     return static_cast<char>(std::tolower(c));
                                 });
-                                if (extension == ".nif" || extension == ".bto" || extension == ".btr")
+                                if (relative == detail::actorPlaceholderModel)
+                                    geometry = detail::actorPlaceholderGeometry();  // no collision: actors are not rigid bodies
+                                else if (extension == ".nif" || extension == ".bto" || extension == ".btr")
                                 {
                                     const auto nifPath = pack->archives.contains(relative) ? relative
                                         : assetPath(relative, "meshes\\", ".nif");
@@ -4694,8 +5322,9 @@ namespace openf4::world
                     }
                     continue;
                 }
-                const auto transform = referenceTransform(reference);
+                const glm::mat4 transform = transformFor(candidateSlot);
                 auto projected = makeInstance(*model.range, transform);
+                projected.lodRange = objectLodRange();
                 if (found == instances.end() || found->second.model != key)
                 {
                     auto& modelEntry = models[key];
@@ -4732,7 +5361,10 @@ namespace openf4::world
                     }
                     instance.id = renderer.addInstance(projected);
                     if (found == instances.end())
+                    {
                         found = instances.emplace(reference.formId, std::move(instance)).first;
+                        instanceList.push_back(&found->second);
+                    }
                     else
                     {
                         const std::array ids{found->second.id};
@@ -4741,6 +5373,7 @@ namespace openf4::world
                         found->second = std::move(instance);
                     }
                 }
+                resident = found;
                 auto& instance = found->second;
                 if (instance.authoredTransform != transform)
                 {
@@ -4753,9 +5386,27 @@ namespace openf4::world
                     instance.bounds = projected.bounds;
                     instance.geometryBounds.reset();
                 }
-                visible.insert(reference.formId);
+                instance.seenWalk = epoch;
+                layout.placementHashes[candidate] = placementHash(reference);
                 ++active;
             }
+            for (Instance* const entry : instanceList)
+            {
+                auto& instance = *entry;
+                const bool wanted = instance.seenWalk == epoch;
+                if (instance.active != wanted)
+                {
+                    const std::array ids{instance.id};
+                    renderer.setInstancesActive(ids, wanted);
+                    instance.active = wanted;
+                }
+            }
+            walk.valid = true;
+            walk.contentRevision = contentRevision;
+            walk.layoutBuilds = layout.builds;
+            walk.center = center;
+            }
+            const auto walkEnd = Clock::now();
             // Update skin palettes for animated models
             for (auto& [key, modelEntry] : models)
             {
@@ -4771,23 +5422,100 @@ namespace openf4::world
                     geomRef, modelEntry.animations.front(), modelEntry.animationTime);
                 renderer.updateSkinPalette(*modelEntry.skinPaletteOffset, palette);
             }
-            for (auto& [formId, instance] : instances)
+            syncPhysics();
+            updateStaticTiles(renderer, center, layout.available, hiddenSet);
+            if (profile.enabled)
             {
-                const bool wanted = visible.contains(formId);
-                if (instance.active != wanted)
+                const auto end = Clock::now();
+                const auto ms = [](auto from, auto to) { return std::chrono::duration<double, std::milli>(to - from).count(); };
+                profile.install += ms(updateStart, installEnd);
+                profile.walk += ms(installEnd, walkEnd);
+                profile.tiles += ms(walkEnd, end);
+                if (ms(updateStart, end) >= 4.0)
+                    std::printf("    objects hitch: install %.2f ms (%zu models) walk %.2f ms (%s, %zu fast + %zu slow of %zu) tiles %.2f ms | %zu pending\n",
+                        ms(updateStart, installEnd), installCount, ms(installEnd, walkEnd), needWalk ? "walked" : "skipped",
+                        fastCount, slowCount, layout.candidates.size(), ms(walkEnd, end), pending);
+                profile.walks += needWalk ? 1 : 0;
+                profile.installs += installCount;
+                profile.fast += fastCount;
+                profile.slow += slowCount;
+                if (++profile.calls == 120)
                 {
-                    const std::array ids{instance.id};
-                    renderer.setInstancesActive(ids, wanted);
-                    instance.active = wanted;
+                    const double n = profile.calls;
+                    std::printf("  objects: install %.2f ms (%zu models) walk %.2f ms incl. transforms %.2f (%zu/%d frames; %.0f fast + %.0f slow refs) "
+                        "skin+physics+tiles %.2f ms | %zu pending\n", profile.install / n, profile.installs,
+                        profile.walk / n, profile.transforms / n, profile.walks, profile.calls,
+                        profile.walks ? double(profile.fast) / double(profile.walks) : 0.0,
+                        profile.walks ? double(profile.slow) / double(profile.walks) : 0.0, profile.tiles / n, pending);
+                    profile = Profile{true};
                 }
             }
-            syncPhysics();
-            std::set<std::uint32_t> available;
-            for (const auto& ref : references)
-                if (!movableModels.contains(ref.baseObject)) available.insert(ref.formId);
-            updateStaticTiles(renderer, center, available, hiddenSet);
         }
     };
+
+    assets::ModelGeometry detail::actorPlaceholderGeometry()
+    {
+        constexpr float pi = 3.14159265358979323846f;
+        constexpr float height = 128.0f, radius = 20.0f;
+        constexpr std::uint32_t segments = 16, capRings = 4;
+        assets::ModelSurface body;
+        body.baseColor = {1.0f, 0.55f, 0.1f, 1.0f};
+        body.doubleSided = true;
+        auto& v = body.vertices; auto& i = body.indices;
+        // Latitude rings from the bottom pole to the top pole of a Y-up capsule.
+        std::vector<std::pair<float, float>> rings;  // (center y, latitude)
+        for (std::uint32_t r = 1; r <= capRings; ++r) rings.emplace_back(radius, -pi * 0.5f + pi * 0.5f * float(r) / float(capRings));
+        for (std::uint32_t r = 0; r < capRings; ++r) rings.emplace_back(height - radius, pi * 0.5f * float(r) / float(capRings));
+        v.push_back({{0.0f, 0.0f, 0.0f}, {0.0f, -1.0f, 0.0f}});
+        for (const auto& [center, latitude] : rings)
+            for (std::uint32_t s = 0; s < segments; ++s)
+            {
+                const float around = 2.0f * pi * float(s) / float(segments);
+                const glm::vec3 normal(std::cos(latitude) * std::cos(around), std::sin(latitude), std::cos(latitude) * std::sin(around));
+                render::SourceVertex vertex;
+                vertex.position = glm::vec3(0.0f, center, 0.0f) + normal * radius;
+                vertex.normal = normal;
+                vertex.uv = {float(s) / float(segments), vertex.position.y / height};
+                v.push_back(vertex);
+            }
+        const auto top = static_cast<std::uint32_t>(v.size());
+        v.push_back({{0.0f, height, 0.0f}, {0.0f, 1.0f, 0.0f}});
+        const auto ring = [&](std::size_t r) { return 1u + static_cast<std::uint32_t>(r) * segments; };
+        for (std::uint32_t s = 0; s < segments; ++s)
+        {
+            const auto n = (s + 1) % segments;
+            i.insert(i.end(), {0u, ring(0) + n, ring(0) + s});
+            for (std::size_t r = 0; r + 1 < rings.size(); ++r)
+                i.insert(i.end(), {ring(r) + s, ring(r) + n, ring(r + 1) + n, ring(r) + s, ring(r + 1) + n, ring(r + 1) + s});
+            i.insert(i.end(), {ring(rings.size() - 1) + s, ring(rings.size() - 1) + n, top});
+        }
+        // Facing marker: a small box in front of the chest (Bethesda +Y is engine +Z).
+        assets::ModelSurface nose;
+        nose.baseColor = {0.15f, 0.85f, 1.0f, 1.0f};
+        nose.doubleSided = true;
+        const glm::vec3 lo(-6.0f, 92.0f, radius - 2.0f), hi(6.0f, 104.0f, radius + 14.0f);
+        const std::array<glm::vec3, 6> normals{glm::vec3(1, 0, 0), glm::vec3(-1, 0, 0), glm::vec3(0, 1, 0),
+            glm::vec3(0, -1, 0), glm::vec3(0, 0, 1), glm::vec3(0, 0, -1)};
+        for (const auto& normal : normals)
+        {
+            const auto base = static_cast<std::uint32_t>(nose.vertices.size());
+            const int axis = normal.x != 0 ? 0 : normal.y != 0 ? 1 : 2;
+            const int a = (axis + 1) % 3, b = (axis + 2) % 3;
+            for (int corner = 0; corner < 4; ++corner)
+            {
+                glm::vec3 p;
+                p[axis] = normal[axis] > 0 ? hi[axis] : lo[axis];
+                p[a] = (corner == 1 || corner == 2) ? hi[a] : lo[a];
+                p[b] = (corner >= 2) ? hi[b] : lo[b];
+                nose.vertices.push_back({p, normal});
+            }
+            nose.indices.insert(nose.indices.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
+        }
+        assets::ModelGeometry geometry;
+        geometry.surfaces.push_back(std::move(body));
+        geometry.surfaces.push_back(std::move(nose));
+        return geometry;
+    }
 
     render::SceneTexture modelSceneTexture(const assets::ModelImage& image)
     {
@@ -4877,9 +5605,10 @@ namespace openf4::world
         std::span<const assets::PlacedReference> references,
         const std::map<std::uint32_t, std::string>& models,
         const std::unordered_map<std::uint32_t, std::filesystem::path>& sources,
-        const glm::dvec3& camera, std::span<const std::uint32_t> hidden)
+        const glm::dvec3& camera, std::span<const std::uint32_t> hidden, std::uint64_t layoutRevision,
+        std::uint64_t contentRevision)
     {
-        mImpl->update(renderer, references, models, sources, camera, hidden);
+        mImpl->update(renderer, references, models, sources, camera, hidden, layoutRevision, contentRevision);
     }
     std::optional<glm::vec4> ObjectScene::bounds(std::uint32_t formId) const
     {
@@ -4892,9 +5621,10 @@ namespace openf4::world
         double maxDistance) const
     {
         std::optional<ObjectPick> nearest;
+        const std::unordered_set<std::uint32_t> excluded(excludedForms.begin(), excludedForms.end());
         for (const auto& [formId, instance] : mImpl->instances)
         {
-            if (!instance.active || std::ranges::find(excludedForms, formId) != excludedForms.end())
+            if (!instance.active || excluded.contains(formId))
                 continue;
             const auto& picking = mImpl->models.at(instance.model).picking;
             if (picking)
@@ -4927,6 +5657,32 @@ namespace openf4::world
     }
     std::size_t ObjectScene::pending() const noexcept { return mImpl->pending; }
     std::size_t ObjectScene::loaded() const noexcept { return mImpl->active; }
+    std::uint64_t ObjectScene::coverageRevision() const noexcept { return mImpl->coverage; }
+    std::vector<assets::CellCoord> ObjectScene::coveredCells() const
+    {
+        std::vector<assets::CellCoord> result;
+        const auto& impl = *mImpl;
+        if (!impl.walk.valid)
+            return result;
+        const auto center = impl.walk.center;
+        const auto inWindow = [&](int x, int y) {
+            return std::abs(x - center.x) <= 4 && std::abs(y - center.y) <= 4;
+        };
+        result.reserve(81);
+        for (int y = center.y - 4; y <= center.y + 4; ++y)
+            for (int x = center.x - 4; x <= center.x + 4; ++x)
+            {
+                // A BTO part can stand in for a building authored in a neighbouring cell.
+                bool covered = true;
+                for (int ny = y - 1; covered && ny <= y + 1; ++ny)
+                    for (int nx = x - 1; covered && nx <= x + 1; ++nx)
+                        if (inWindow(nx, ny) && impl.undrawnCells.contains({nx, ny}))
+                            covered = false;
+                if (covered)
+                    result.push_back({x, y});
+            }
+        return result;
+    }
     const std::vector<std::string>& ObjectScene::diagnostics() const noexcept { return mImpl->messages; }
     void ObjectScene::refreshDerivedLod(render::VulkanRenderer& renderer,
         std::span<const std::filesystem::path> publishedPaths)
@@ -5492,13 +6248,21 @@ namespace openf4::world
             {
                 tile.topology = demBtrTopology(*prepared.mesh);
                 tile.coveredCells = detail::demTerrainCoverage(*prepared.mesh, prepared.key);
-                const auto range = renderer.addMesh(std::move(*prepared.mesh));
-                tile.range = range;
-                auto instance = makeDemTerrainInstance(
-                    range, demBtrTransform(prepared.key.origin), false);
-                instance.lodRange = detail::demBtrLodRange(prepared.key.level);
-                instance.active = false;
-                tile.instance = renderer.addInstance(instance);
+                try
+                {
+                    const auto range = renderer.addMesh(std::move(*prepared.mesh));
+                    tile.range = range;
+                    auto instance = makeDemTerrainInstance(
+                        range, demBtrTransform(prepared.key.origin), false);
+                    instance.lodRange = detail::demBtrLodRange(prepared.key.level);
+                    instance.active = false;
+                    tile.instance = renderer.addInstance(instance);
+                }
+                catch (const std::exception& error)
+                {
+                    tile.failed = true;
+                    std::cerr << "DEM BTR skipped: " << error.what() << '\n';
+                }
             }
             else
             {
@@ -6255,9 +7019,9 @@ namespace openf4::world
     WorldStreamer::WorldStreamer(const std::filesystem::path& dataDirectory,
         std::optional<assets::CellCoord> requestedCenter, int cellRadius,
         bool includeObjects, std::size_t maxObjects,
-        std::optional<std::filesystem::path> masterPath)
+        std::optional<std::filesystem::path> masterPath, std::optional<std::uint32_t> worldFormId)
         : mImpl(std::make_unique<Impl>(dataDirectory, requestedCenter, cellRadius,
-            includeObjects, maxObjects, masterPath))
+            includeObjects, maxObjects, masterPath, worldFormId))
     {
     }
 
@@ -6296,6 +7060,19 @@ namespace openf4::world
         mImpl->update(renderer, playerPosition);
     }
 
+    void WorldStreamer::fadeObjectLodIntoExternalObjects(render::VulkanRenderer& renderer)
+    {
+        if (!mImpl->initialTaken)
+            throw std::runtime_error("Initial scene must be installed before configuring object LOD");
+        mImpl->fadeObjectLodIntoExternalObjects(renderer);
+    }
+
+    void WorldStreamer::syncExternalObjectCoverage(render::VulkanRenderer& renderer,
+        std::span<const assets::CellCoord> coveredCells, std::uint64_t revision)
+    {
+        mImpl->syncExternalObjectCoverage(renderer, coveredCells, revision);
+    }
+
     std::size_t WorldStreamer::streamedObjects() const noexcept
     {
         return mImpl->loadedObjects;
@@ -6315,7 +7092,8 @@ namespace openf4::world
             return mImpl->terrainRequests.size() + mImpl->referenceRequests.size()
                 + mImpl->readyReferences.size() + mImpl->physicsReferences.size()
                 + mImpl->terrainPhysicsRequests.size() + mImpl->physicsRemovals.size()
-                + mImpl->jobs.size() + mImpl->lodRequests.size() + mImpl->lodJobs.size()
+                + mImpl->jobs.size() + (mImpl->installing ? 1u : 0u)
+                + mImpl->lodRequests.size() + mImpl->lodJobs.size()
                 + std::ranges::count_if(mImpl->lodTiles, [](const auto& tile) {
                     return tile.objectsState == WorldStreamer::Impl::LodLoadState::discovered;
                 });

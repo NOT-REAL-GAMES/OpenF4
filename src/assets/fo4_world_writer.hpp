@@ -64,4 +64,11 @@ namespace openf4::assets
     // build products and must be validated before a complete export is certified.
     void writeFo4WorldPlugin(const std::filesystem::path& path,
         const Fo4WorldWriteRequest& request);
+
+    // Load Order "New plugin": an empty, ordinary (non-master) Fallout 4 plugin whose MAST
+    // list is exactly `masters`, in that order (it defines the FormID slot mapping). The
+    // parent WRLD and CELL overrides are added only when the first override is saved.
+    // Existing files are never replaced.
+    void createFo4OverridePlugin(const std::filesystem::path& path,
+        const std::vector<std::string>& masters, const std::string& description = {});
 }

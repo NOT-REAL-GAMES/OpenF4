@@ -1,4 +1,5 @@
 #include "render/mesh_builder.hpp"
+#include "render/inplace_vector.hpp"
 
 #include <algorithm>
 #include <array>
@@ -58,10 +59,9 @@ namespace openf4::render
 
         constexpr std::size_t maxVertices = 64;
         constexpr std::size_t maxTriangles = 124;
-        std::vector<std::uint32_t> sourceVertices;
-        std::vector<std::uint32_t> localIndices;
-        sourceVertices.reserve(maxVertices);
-        localIndices.reserve(maxTriangles * 3);
+        // Meshlet scratch is bounded by the mesh-shader limits: keep it on the stack.
+        openf4::inplace_vector<std::uint32_t, maxVertices> sourceVertices;
+        openf4::inplace_vector<std::uint32_t, maxTriangles * 3> localIndices;
 
         const auto flush = [&]()
         {
@@ -120,6 +120,60 @@ namespace openf4::render
                 meshletRadius = std::max(meshletRadius,
                     glm::distance(meshletCenter, vertices[sourceIndex].position));
             meshlet.sphere = glm::vec4(meshletCenter, meshletRadius);
+            // Normal cone. Engine geometry is mirrored once later (renderer / NIF export), so in
+            // mesh space a triangle's front side is opposite its winding cross product. The cone is
+            // only kept when that front side agrees with the authored vertex normals for every
+            // triangle, so culling matches the fragment shader's !gl_FrontFacing discard.
+            {
+                const auto triangleFront = [&](std::size_t corner, glm::vec3& front) {
+                    const SourceVertex& a = vertices[sourceVertices[localIndices[corner]]];
+                    const SourceVertex& b = vertices[sourceVertices[localIndices[corner + 1]]];
+                    const SourceVertex& c = vertices[sourceVertices[localIndices[corner + 2]]];
+                    const glm::vec3 cross = glm::cross(b.position - a.position, c.position - a.position);
+                    const float length = glm::length(cross);
+                    if (!(length > 1e-12f))
+                        return 0;  // degenerate: never rasterised
+                    front = -cross / length;
+                    return glm::dot(front, a.normal + b.normal + c.normal) > 0.0f ? 1 : -1;
+                };
+                glm::vec3 axisSum(0.0f);
+                bool consistent = true;
+                std::size_t facing = 0;
+                for (std::size_t corner = 0; corner + 2 < localIndices.size() && consistent; corner += 3)
+                {
+                    glm::vec3 front;
+                    const int state = triangleFront(corner, front);
+                    if (state < 0) consistent = false;
+                    else if (state > 0) { axisSum += front; ++facing; }
+                }
+                const float axisLength = glm::length(axisSum);
+                if (consistent && facing != 0 && axisLength > 1e-6f)
+                {
+                    const glm::vec3 axis = axisSum / axisLength;
+                    float minimumDot = 1.0f;
+                    for (std::size_t corner = 0; corner + 2 < localIndices.size(); corner += 3)
+                    {
+                        glm::vec3 front;
+                        if (triangleFront(corner, front) > 0)
+                            minimumDot = std::min(minimumDot, glm::dot(axis, front));
+                    }
+                    // Wider than ~84 degrees: practically never back-facing, skip (meshoptimizer's limit).
+                    if (minimumDot > 0.1f)
+                    {
+                        const float sine = std::sqrt(std::max(0.0f, 1.0f - minimumDot * minimumDot));
+                        const auto snorm = [](float value, bool roundUp) {
+                            // Round the cutoff up so the quantized cone stays conservative.
+                            const float scaled = std::clamp(value, -1.0f, 1.0f) * 127.0f;
+                            return static_cast<std::uint32_t>(static_cast<std::int8_t>(
+                                roundUp ? std::ceil(scaled) : std::round(scaled))) & 0xFFu;
+                        };
+                        // Axis quantisation error (< ~0.7 degrees) is absorbed by padding the sine.
+                        meshlet.cone = snorm(axis.x, false) | (snorm(axis.y, false) << 8)
+                            | (snorm(axis.z, false) << 16) | (snorm(std::min(1.0f, sine + 0.02f), true) << 24);
+                        meshlet.coneFlags = 1u;
+                    }
+                }
+            }
             result.meshlets.push_back(meshlet);
             sourceVertices.clear();
             localIndices.clear();
@@ -152,7 +206,8 @@ namespace openf4::render
                 else
                     local[corner] = static_cast<std::uint32_t>(found - sourceVertices.begin());
             }
-            localIndices.insert(localIndices.end(), local.begin(), local.end());
+            for (const std::uint32_t index : local)
+                localIndices.push_back(index);
         }
         flush();
         return result;

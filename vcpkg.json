@@ -23,6 +23,8 @@
     "spdlog",
     "sqlite3",
     "stb",
+    { "name": "stdexec", "platform": "mingw" },
+    { "name": "tbb", "platform": "mingw", "default-features": false },
     "vulkan-memory-allocator",
     "zlib"
   ]

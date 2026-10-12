@@ -693,4 +693,12 @@ namespace openf4::assets
         world.defaultLandscapeTexture = 0x000AB07E;
         return world;
     }
+
+    ExteriorWorld loadExteriorWorld(const std::filesystem::path& esmPath, std::uint32_t worldFormId)
+    {
+        if (!worldFormId) return loadExteriorWorld(esmPath);
+        ExteriorWorld world = Parser(esmPath, worldFormId).parse();
+        world.defaultLandscapeTexture = 0x000AB07E;
+        return world;
+    }
 }

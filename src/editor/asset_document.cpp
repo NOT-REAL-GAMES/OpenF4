@@ -4,6 +4,8 @@
 #include "assets/coordinates.hpp"
 #include "assets/material_file.hpp"
 #include "assets/model_import.hpp"
+#include "editor/mesh_edit.hpp"
+#include "physics/convex_decomposition.hpp"
 #include "physics/jolt_collision.hpp"
 
 #include <algorithm>
@@ -63,9 +65,50 @@ namespace openf4::editor
             {
                 (void)physics::makeJoltCollisionShape(body);
                 auto validation = body; validation.bodyIndex = 0;
-                (void)assets::serializeHavokPhysicsSystem({{std::move(validation)}, {}});
+                // Vertex-edited non-convex parts are previewed through their hull and refused
+                // at save (see requireConvexParts); validate everything else for export now.
+                std::erase_if(validation.parts, [](const assets::HavokConvexPart& part) {
+                    return !physics::polytopeIsConvex(part.polytope.vertices, part.polytope.indices); });
+                if (hasShape(validation))
+                    (void)assets::serializeHavokPhysicsSystem({{std::move(validation)}, {}});
             }
             else if (body.dynamic) throw std::runtime_error("Generate collision before making the asset movable");
+        }
+
+        glm::mat4 partMatrix(const assets::HavokConvexPart& part)
+        {
+            return glm::scale(part.transform, part.scale);
+        }
+
+        void requireConvexParts(const std::vector<AssetCollisionSystem>& systems)
+        {
+            for (std::size_t s = 0; s < systems.size(); ++s)
+                for (std::size_t b = 0; b < systems[s].physics.bodies.size(); ++b)
+                {
+                    const auto& parts = systems[s].physics.bodies[b].parts;
+                    for (std::size_t i = 0; i < parts.size(); ++i)
+                        if (!physics::polytopeIsConvex(parts[i].polytope.vertices, parts[i].polytope.indices))
+                            throw std::runtime_error("Convex collision part " + std::to_string(i) + " (body "
+                                + std::to_string(s) + ":" + std::to_string(b) + ") is not convex. Use Split optimally"
+                                " or Re-hull in collision edit (C) before saving; Fallout 4 requires convex parts.");
+                }
+        }
+
+        // Body-local engine-space triangles of the given surfaces.
+        void gatherSurfaces(const assets::ModelGeometry& geometry, std::span<const std::size_t> surfaces,
+            const glm::mat4& local, std::vector<glm::vec3>& vertices, std::vector<std::uint32_t>& indices)
+        {
+            for (auto index : surfaces)
+            {
+                const auto& surface = geometry.surfaces.at(index);
+                const auto base = static_cast<std::uint32_t>(vertices.size());
+                for (const auto& vertex : surface.vertices) vertices.push_back(glm::vec3(local * glm::vec4(vertex.position, 1)));
+                for (const auto vertex : surface.indices)
+                {
+                    if (vertex >= surface.vertices.size()) throw std::runtime_error("Surface has invalid triangle indices");
+                    indices.push_back(base + vertex);
+                }
+            }
         }
 
         glm::mat4 toPartMatrix(const glm::mat4& transform, glm::vec3& scale)
@@ -92,12 +135,13 @@ namespace openf4::editor
         {
             std::vector<AssetMaterial> materials;
             std::vector<AssetCollisionSystem> collision;
+            // Copy-on-write: unchanged by material/collision edits, replaced by mesh edits.
+            std::shared_ptr<const assets::ModelGeometry> geometry;
             std::uint64_t serial = 0;
         };
         std::filesystem::path sourceEsm;
         std::string modelPath;
         std::optional<std::filesystem::path> dataDirectory;
-        std::shared_ptr<const assets::ModelGeometry> source;
         std::vector<std::byte> bytes;
         AssetCapabilities capabilities;
         std::vector<std::string> diagnostics;
@@ -108,9 +152,9 @@ namespace openf4::editor
         unsigned transactionDepth = 0;
         std::uint64_t revision = 0, serial = 0, savedSerial = 0;
 
-        void initialize(assets::ModelGeometry geometry)
+        void initialize(assets::ModelGeometry geometry, bool allowEmpty = false)
         {
-            if (geometry.surfaces.empty()) throw std::runtime_error("Asset contains no renderable surfaces");
+            if (geometry.surfaces.empty() && !allowEmpty) throw std::runtime_error("Asset contains no renderable surfaces");
             for (auto& surface : geometry.surfaces)
             {
                 AssetMaterial material{surface.baseColor, surface.alphaCutoff, surface.alphaBlend,
@@ -128,9 +172,15 @@ namespace openf4::editor
                 capabilities = {false, false, false,
                     "Animated, skinned, or attachment-bearing imports cannot be converted losslessly"};
             }
-            source = std::make_shared<const assets::ModelGeometry>(std::move(geometry));
+            state.geometry = std::make_shared<const assets::ModelGeometry>(std::move(geometry));
             if (state.collision.empty())
                 state.collision.push_back({std::nullopt, {{assets::HavokRigidBody{}}, {}}});
+        }
+
+        void requireMesh() const
+        {
+            if (!capabilities.materials)
+                throw std::runtime_error(capabilities.reason.empty() ? "This asset's geometry is read-only" : capabilities.reason);
         }
 
         void requireCollision() const
@@ -163,10 +213,11 @@ namespace openf4::editor
         }
     };
 
-    AssetDocument::AssetDocument(assets::ModelGeometry geometry) : mImpl(std::make_unique<Impl>())
+    AssetDocument::AssetDocument(assets::ModelGeometry geometry, bool allowEmpty) : mImpl(std::make_unique<Impl>())
     {
-        mImpl->initialize(std::move(geometry));
+        mImpl->initialize(std::move(geometry), allowEmpty);
     }
+    AssetDocument AssetDocument::createEmpty() { return AssetDocument(assets::ModelGeometry{}, true); }
 
     AssetDocument::AssetDocument(std::filesystem::path sourceEsm, std::string modelPath,
         std::optional<std::filesystem::path> dataDirectory, std::optional<bool> movableRecordHint)
@@ -282,7 +333,9 @@ namespace openf4::editor
     AssetDocument::~AssetDocument() = default;
     AssetDocument::AssetDocument(AssetDocument&&) noexcept = default;
     AssetDocument& AssetDocument::operator=(AssetDocument&&) noexcept = default;
-    const assets::ModelGeometry& AssetDocument::sourceGeometry() const noexcept { return *mImpl->source; }
+    const assets::ModelGeometry& AssetDocument::sourceGeometry() const noexcept { return *mImpl->state.geometry; }
+    std::shared_ptr<const assets::ModelGeometry> AssetDocument::geometryHandle() const noexcept { return mImpl->state.geometry; }
+    bool AssetDocument::meshEditable() const noexcept { return mImpl->capabilities.materials; }
     const std::vector<AssetMaterial>& AssetDocument::materials() const noexcept { return mImpl->state.materials; }
     const std::vector<AssetCollisionSystem>& AssetDocument::collisionSystems() const noexcept { return mImpl->state.collision; }
     const AssetCapabilities& AssetDocument::capabilities() const noexcept { return mImpl->capabilities; }
@@ -409,18 +462,7 @@ namespace openf4::editor
         if (!convex && body.dynamic) throw std::runtime_error("Triangle collision requires a static body");
         std::vector<glm::vec3> vertices;
         std::vector<std::uint32_t> indices;
-        const auto local = glm::inverse(physics::havokBodyLocalTransform(body));
-        for (auto index : surfaces)
-        {
-            const auto& surface = mImpl->source->surfaces.at(index);
-            const auto base = static_cast<std::uint32_t>(vertices.size());
-            for (const auto& vertex : surface.vertices) vertices.push_back(glm::vec3(local * glm::vec4(vertex.position, 1)));
-            for (const auto vertex : surface.indices)
-            {
-                if (vertex >= surface.vertices.size()) throw std::runtime_error("Surface has invalid triangle indices");
-                indices.push_back(base + vertex);
-            }
-        }
+        gatherSurfaces(*mImpl->state.geometry, surfaces, glm::inverse(physics::havokBodyLocalTransform(body)), vertices, indices);
         body.parts.clear(); body.capsules.clear(); body.triangleMesh.reset();
         if (convex) body.parts.push_back({glm::mat4(1), glm::vec3(1), physics::makeHavokConvexHull(vertices)});
         else
@@ -530,9 +572,173 @@ namespace openf4::editor
         mImpl->replaceBody(system, bodyIndex, std::move(body), true);
     }
 
+    std::vector<glm::vec3> AssetDocument::convexPartPositions(std::size_t part, std::size_t system, std::size_t bodyIndex) const
+    {
+        const auto& shape = mImpl->state.collision.at(system).physics.bodies.at(bodyIndex).parts.at(part);
+        const auto matrix = partMatrix(shape);
+        std::vector<glm::vec3> result;
+        result.reserve(shape.polytope.vertices.size());
+        for (const auto v : shape.polytope.vertices)
+            result.push_back(assets::havokToEnginePosition(glm::vec3(matrix * glm::vec4(v, 1))));
+        return result;
+    }
+    std::vector<std::uint32_t> AssetDocument::convexPartIndices(std::size_t part, std::size_t system, std::size_t bodyIndex) const
+    {
+        return mImpl->state.collision.at(system).physics.bodies.at(bodyIndex).parts.at(part).polytope.indices;
+    }
+    void AssetDocument::setConvexPartPositions(std::size_t part, std::span<const glm::vec3> positions,
+        std::size_t system, std::size_t bodyIndex)
+    {
+        mImpl->requireCollision();
+        const auto current = convexPartPositions(part, system, bodyIndex);
+        if (positions.size() != current.size()) throw std::runtime_error("Convex vertex count mismatch");
+        bool changed = false;
+        for (std::size_t i = 0; i < positions.size(); ++i)
+        {
+            if (!finite(positions[i]) || glm::any(glm::greaterThan(glm::abs(positions[i]), glm::vec3(1e7f))))
+                throw std::runtime_error("Collision vertices must be finite and within 1e7 units");
+            changed |= positions[i] != current[i];
+        }
+        if (!changed) return;
+        auto body = mImpl->state.collision.at(system).physics.bodies.at(bodyIndex);
+        auto& shape = body.parts.at(part);
+        const auto inverse = glm::inverse(partMatrix(shape));
+        // Untouched vertices keep their exact stored value (no float round-trip drift).
+        for (std::size_t i = 0; i < positions.size(); ++i)
+            if (positions[i] != current[i])
+                shape.polytope.vertices[i] = glm::vec3(inverse * glm::vec4(assets::engineToHavokPosition(positions[i]), 1));
+        mImpl->replaceBody(system, bodyIndex, std::move(body), true);
+    }
+    bool AssetDocument::convexPartIsConvex(std::size_t part, std::size_t system, std::size_t bodyIndex) const
+    {
+        const auto& polytope = mImpl->state.collision.at(system).physics.bodies.at(bodyIndex).parts.at(part).polytope;
+        return physics::polytopeIsConvex(polytope.vertices, polytope.indices);
+    }
+    physics::ConvexityReport AssetDocument::convexPartConvexity(std::size_t part, std::size_t system, std::size_t bodyIndex) const
+    {
+        const auto positions = convexPartPositions(part, system, bodyIndex);
+        const auto& polytope = mImpl->state.collision.at(system).physics.bodies.at(bodyIndex).parts.at(part).polytope;
+        auto report = physics::measureConvexity(positions, polytope.indices, 0.0f);
+        report.convex = physics::polytopeIsConvex(polytope.vertices, polytope.indices);
+        if (report.convex) report.depth = 0;
+        return report;
+    }
+    bool AssetDocument::collisionConvex() const
+    {
+        try { requireConvexParts(mImpl->state.collision); return true; }
+        catch (const std::runtime_error&) { return false; }
+    }
+    void AssetDocument::rehullConvexPart(std::size_t part, std::size_t system, std::size_t bodyIndex)
+    {
+        mImpl->requireCollision();
+        auto body = mImpl->state.collision.at(system).physics.bodies.at(bodyIndex);
+        auto& shape = body.parts.at(part);
+        std::vector<glm::vec3> local;
+        for (const auto v : shape.polytope.vertices) local.push_back(assets::havokToEnginePosition(v));
+        const float radius = shape.polytope.convexRadius;
+        shape.polytope = physics::makeHavokConvexHull(local);
+        shape.polytope.convexRadius = radius;
+        mImpl->replaceBody(system, bodyIndex, std::move(body), true);
+    }
+    std::size_t AssetDocument::splitConvexPart(std::size_t part, const physics::ConvexDecompositionSettings& settings,
+        std::size_t system, std::size_t bodyIndex)
+    {
+        mImpl->requireCollision();
+        auto body = mImpl->state.collision.at(system).physics.bodies.at(bodyIndex);
+        const auto source = body.parts.at(part);
+        if (source.polytope.indices.empty()) throw std::runtime_error("Part has no faces; it is already its own convex hull");
+        // Decompose in the polytope's own frame so every piece keeps the part transform.
+        std::vector<glm::vec3> local;
+        for (const auto v : source.polytope.vertices) local.push_back(assets::havokToEnginePosition(v));
+        const auto pieces = physics::decomposeConvex(local, source.polytope.indices, settings);
+        std::vector<assets::HavokConvexPart> parts;
+        for (const auto& piece : pieces)
+        {
+            assets::HavokConvexPart next{source.transform, source.scale, physics::makeHavokConvexHull(piece)};
+            next.polytope.convexRadius = source.polytope.convexRadius;
+            parts.push_back(std::move(next));
+        }
+        body.parts.erase(body.parts.begin() + static_cast<std::ptrdiff_t>(part));
+        body.parts.insert(body.parts.begin() + static_cast<std::ptrdiff_t>(part), parts.begin(), parts.end());
+        mImpl->replaceBody(system, bodyIndex, std::move(body), true);
+        return parts.size();
+    }
+    physics::ConvexityReport AssetDocument::surfaceConvexity(std::span<const std::size_t> surfaces) const
+    {
+        std::vector<glm::vec3> vertices; std::vector<std::uint32_t> indices;
+        gatherSurfaces(*mImpl->state.geometry, surfaces, glm::mat4(1), vertices, indices);
+        return physics::measureConvexity(vertices, indices);
+    }
+    std::size_t AssetDocument::generateConvexDecomposition(std::span<const std::size_t> surfaces,
+        const physics::ConvexDecompositionSettings& settings, std::size_t system, std::size_t bodyIndex)
+    {
+        mImpl->requireCollision();
+        if (surfaces.empty()) throw std::runtime_error("Select at least one surface");
+        auto body = mImpl->state.collision.at(system).physics.bodies.at(bodyIndex);
+        std::vector<glm::vec3> vertices; std::vector<std::uint32_t> indices;
+        gatherSurfaces(*mImpl->state.geometry, surfaces, glm::inverse(physics::havokBodyLocalTransform(body)), vertices, indices);
+        const auto pieces = physics::decomposeConvex(vertices, indices, settings);
+        body.parts.clear(); body.capsules.clear(); body.triangleMesh.reset();
+        for (const auto& piece : pieces) body.parts.push_back({glm::mat4(1), glm::vec3(1), physics::makeHavokConvexHull(piece)});
+        mImpl->replaceBody(system, bodyIndex, std::move(body), true);
+        return pieces.size();
+    }
+
+    std::size_t AssetDocument::addSurface(assets::ModelSurface surface, AssetMaterial material)
+    {
+        mImpl->requireMesh();
+        if (surface.vertices.empty() || surface.indices.empty() || surface.indices.size() % 3)
+            throw std::runtime_error("New surface requires indexed triangles");
+        for (const auto index : surface.indices)
+            if (index >= surface.vertices.size()) throw std::runtime_error("New surface has invalid triangle indices");
+        for (const auto& vertex : surface.vertices)
+            if (!finite(vertex.position) || !finite(vertex.normal)) throw std::runtime_error("New surface has non-finite vertices");
+        surface.diffuseImage.reset(); surface.normalImage.reset();
+        auto next = mImpl->state;
+        auto geometry = std::make_shared<assets::ModelGeometry>(*next.geometry);
+        geometry->surfaces.push_back(std::move(surface));
+        next.geometry = std::move(geometry);
+        next.materials.push_back(std::move(material));
+        const auto index = next.materials.size() - 1;
+        mImpl->commit(std::move(next));
+        return index;
+    }
+    void AssetDocument::setSurfacePositions(std::size_t surface, std::span<const glm::vec3> positions)
+    {
+        mImpl->requireMesh();
+        const auto& current = mImpl->state.geometry->surfaces.at(surface);
+        if (positions.size() != current.vertices.size()) throw std::runtime_error("Vertex count mismatch");
+        bool changed = false;
+        for (std::size_t i = 0; i < positions.size(); ++i)
+        {
+            if (!finite(positions[i]) || glm::any(glm::greaterThan(glm::abs(positions[i]), glm::vec3(1e7f))))
+                throw std::runtime_error("Vertex positions must be finite and within 1e7 units");
+            changed |= positions[i] != current.vertices[i].position;
+        }
+        if (!changed) return;
+        auto next = mImpl->state;
+        auto geometry = std::make_shared<assets::ModelGeometry>(*next.geometry);
+        mesh::applyPositions(geometry->surfaces[surface], positions);
+        next.geometry = std::move(geometry);
+        mImpl->commit(std::move(next));
+    }
+
+    void AssetDocument::eraseSurface(std::size_t surface)
+    {
+        mImpl->requireMesh();
+        if (surface >= mImpl->state.geometry->surfaces.size() || surface >= mImpl->state.materials.size())
+            throw std::runtime_error("Surface no longer exists");
+        auto next = mImpl->state;
+        auto geometry = std::make_shared<assets::ModelGeometry>(*next.geometry);
+        geometry->surfaces.erase(geometry->surfaces.begin() + static_cast<std::ptrdiff_t>(surface));
+        next.geometry = std::move(geometry);
+        next.materials.erase(next.materials.begin() + static_cast<std::ptrdiff_t>(surface));
+        mImpl->commit(std::move(next));
+    }
+
     assets::ModelGeometry AssetDocument::geometryForExport() const
     {
-        auto result = *mImpl->source;
+        auto result = *mImpl->state.geometry;
         for (std::size_t i = 0; i < result.surfaces.size(); ++i)
         {
             auto& surface = result.surfaces[i]; const auto& material = mImpl->state.materials[i];
@@ -551,6 +757,7 @@ namespace openf4::editor
         if (mImpl->transaction) throw std::runtime_error("Finish the asset gesture before saving");
         if (!mImpl->capabilities.materials && !mImpl->capabilities.collision)
             throw std::runtime_error(mImpl->capabilities.reason);
+        requireConvexParts(mImpl->state.collision);
         if (mImpl->preserveNative)
         {
             std::vector<assets::NativeCollisionBlock> blocks;
@@ -562,6 +769,8 @@ namespace openf4::editor
             return assets::exportNativeCollisionAsset(worldEsm, formId, mImpl->bytes, blocks,
                 mImpl->sourceEsm, mImpl->dataDirectory);
         }
+        if (mImpl->state.geometry->surfaces.empty())
+            throw std::runtime_error("Asset has no surfaces; add a cube (Mesh > Add cube) before saving");
         const auto& collision = mImpl->state.collision.front().physics;
         const bool anyShape = std::ranges::any_of(collision.bodies, hasShape);
         if (movable() && !anyShape) throw std::runtime_error("Generate collision before saving a movable asset");

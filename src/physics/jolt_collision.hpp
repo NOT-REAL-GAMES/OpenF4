@@ -17,6 +17,9 @@ namespace openf4::physics
 {
     inline constexpr float BethesdaUnitsPerMeter = assets::bethesdaUnitsPerMeter;
 
+    // Registers Jolt's allocator/factory once; needed before using Jolt geometry helpers directly.
+    void ensureJoltRuntime();
+
     // Engine-space input in Bethesda units; result is Havok Z-up meters.
     [[nodiscard]] assets::HavokConvexPolytope makeHavokConvexHull(
         std::span<const glm::vec3> positions, float convexRadiusUnits = 0.0f);
